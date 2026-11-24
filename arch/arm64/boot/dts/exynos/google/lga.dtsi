@@ -44,45 +44,13 @@
 		serial2 = &uart9;
 	};
 
-	/* Verified 16 GiB RAM across 8 x 2 GiB banks (identical on mustang & rango) */
+	/*
+	 * Stock pre-ABL placeholder; ABL populates the full 16 GiB across 8 banks
+	 * (0x80000000 + 0x880000000..0xb80000000) dynamically via fdt_add_subnode.
+	 */
 	memory@80000000 {
 		device_type = "memory";
-		reg = <0x0 0x80000000 0x0 0x80000000>;
-	};
-
-	memory@880000000 {
-		device_type = "memory";
-		reg = <0x8 0x80000000 0x0 0x80000000>;
-	};
-
-	memory@900000000 {
-		device_type = "memory";
-		reg = <0x9 0x00000000 0x0 0x80000000>;
-	};
-
-	memory@980000000 {
-		device_type = "memory";
-		reg = <0x9 0x80000000 0x0 0x80000000>;
-	};
-
-	memory@a00000000 {
-		device_type = "memory";
-		reg = <0xa 0x00000000 0x0 0x80000000>;
-	};
-
-	memory@a80000000 {
-		device_type = "memory";
-		reg = <0xa 0x80000000 0x0 0x80000000>;
-	};
-
-	memory@b00000000 {
-		device_type = "memory";
-		reg = <0xb 0x00000000 0x0 0x80000000>;
-	};
-
-	memory@b80000000 {
-		device_type = "memory";
-		reg = <0xb 0x80000000 0x0 0x80000000>;
+		reg = <0x0 0x80000000 0x0 0x10000000>;
 	};
 
 	/*
@@ -124,12 +92,11 @@
 			no-map;
 		};
 
-		pkvm_guest_firmware: pkvm_guest_firmware@8af00000 {
-			compatible = "linux,pkvm-guest-firmware-memory";
-			reg = <0x0 0x8af00000 0x0 0xc4000>;
-			no-map;
-		};
-
+		/*
+		 * Note: pkvm_guest_firmware@8af00000, sec_dram@f7000000, and
+		 * bl31_dram@ffe00000 are injected dynamically by ABL via fdt_add_subnode
+		 * and abort with -FDT_ERR_EXISTS (-2) if pre-declared here.
+		 */
 		cpu_stats_carveout@8b20f000 {
 			compatible = "cpu-stats-carveout";
 			reg = <0x0 0x8b20f000 0x0 0x1000>;
@@ -275,16 +242,6 @@
 
 		gc_rmem@f6fce000 {
 			reg = <0x0 0xf6fce000 0x0 0x32000>;
-			no-map;
-		};
-
-		sec_dram@f7000000 {
-			reg = <0x0 0xf7000000 0x0 0x8e00000>;
-			no-map;
-		};
-
-		bl31_dram@ffe00000 {
-			reg = <0x0 0xffe00000 0x0 0x127000>;
 			no-map;
 		};
 	};
