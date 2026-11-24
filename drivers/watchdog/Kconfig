@@ -2392,4 +2392,12 @@ config GUNYAH_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called gunyah_wdt.
 
+config GOOGLE_WDT
+	tristate "Google Laguna watchdog timer"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on WATCHDOG_CORE
+	help
+	  Support for the Google Tensor G5 (Laguna) cluster watchdog timer
+	  blocks (google,wdt).
+
 endif # WATCHDOG

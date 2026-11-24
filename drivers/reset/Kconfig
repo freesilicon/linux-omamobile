@@ -440,6 +440,14 @@ config RESET_ZYNQMP
 	help
 	  This enables the reset controller driver for Xilinx ZynqMP SoCs.
 
+config GOOGLE_CPM_RST
+	tristate "Google CPM reset driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on GOOGLE_MBA_CPM_INTERFACE
+	help
+	  Enables reset controller support for Google Tensor G5 (Laguna)
+	  LPCM resets managed through the Central Power Manager (CPM).
+
 source "drivers/reset/amlogic/Kconfig"
 source "drivers/reset/hisilicon/Kconfig"
 source "drivers/reset/spacemit/Kconfig"

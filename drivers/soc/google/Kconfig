@@ -4,6 +4,14 @@ if ARCH_EXYNOS || COMPILE_TEST
 
 menu "Google SoC drivers"
 
+config GOOGLE_MBA_CPM_INTERFACE
+	tristate "Google CPM mailbox interface"
+	depends on MAILBOX && GOOGLE_MBA_CTRL
+	help
+	  Enable the Google MailBox Array (MBA) CPM transport interface used
+	  on Google Tensor G5 (Laguna) SoCs for clock, reset, and power
+	  controller messaging with the Central Power Manager (CPM).
+
 config GOOGLE_GSA
 	tristate "Google GSA mailbox"
 	depends on DEBUG_FS

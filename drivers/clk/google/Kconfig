@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config GOOGLE_CPM_CLK
+	tristate "Google CPM clock driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on GOOGLE_MBA_CPM_INTERFACE
+	help
+	  Enables configuration of Google Tensor G5 (Laguna) LPCM clocks via
+	  the Central Power Manager (CPM) over the common clock framework.

@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Pixel 10 Pro XL (mustang) Stage 1 clean-room DTS draft.
+ *
+ * Verified stock DTBO identity (non-PII):
+ *   dtbo_idx = 30 (lga-mustang-mp.dtbo), board_id = 0x70506, board_rev = 0x010000
+ *   Stock panel@0: google-mtea, mode 1344x2992@60 (no bootloader simple-framebuffer)
+ *
+ * Do NOT add device serials, IMEIs, MACs, BT addresses, PSN, or /chosen/config.
+ */
+
+/dts-v1/;
+
+#include "lga.dtsi"
+
+/ {
+	model = "Google Pixel 10 Pro XL (mustang) Stage 1";
+	compatible = "google,lga-mustang", "google,lga";
+	board_id = <0x70506>;
+	board_rev = <0x010000>;
+
+	chosen {
+		/* keep_bootcon retains earlycon if ttyS0 defers pending clk-cpm */
+		bootargs = "earlycon=uart8250,mmio32,0xdb62000 console=ttyS0,115200n8 keep_bootcon google_8250.nr_uarts=4 clk_ignore_unused pd_ignore_unused panic=10 rdinit=/init";
+	};
+};
+
+&uart16 {
+	status = "okay";
+};
+
+&watchdog_cl0 {
+	status = "okay";
+};
+
+&watchdog_cl1 {
+	status = "okay";
+};
+
+/*
+ * Stage 1B USB2 gadget (requires CPM power/clock/reset drivers or Stage 1A stubs
+ * because dwc3-google enforces dev_pm_domain_attach_by_name("psw"/"top")).
+ */
+&usb_phy {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+};

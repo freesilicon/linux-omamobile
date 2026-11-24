@@ -59,13 +59,14 @@ struct google_usb_phy {
 	struct mutex phy_mutex;
 	struct typec_switch_dev *sw;
 	enum typec_orientation orientation;
+	bool orientation_known;
 };
 
 static void set_vbus_valid(struct google_usb_phy *gphy)
 {
 	u32 reg;
 
-	if (gphy->orientation == TYPEC_ORIENTATION_NONE) {
+	if (gphy->orientation_known && gphy->orientation == TYPEC_ORIENTATION_NONE) {
 		reg = readl(gphy->usbdp_top_base + USBCS_PHY_CFG1_OFFSET);
 		reg &= ~USBCS_PHY_CFG1_SYS_VBUSVALID;
 		writel(reg, gphy->usbdp_top_base + USBCS_PHY_CFG1_OFFSET);
@@ -84,6 +85,7 @@ static int google_usb_set_orientation(struct typec_switch_dev *sw,
 	dev_dbg(gphy->dev, "set orientation %d\n", orientation);
 
 	gphy->orientation = orientation;
+	gphy->orientation_known = true;
 
 	if (pm_runtime_suspended(gphy->dev))
 		return 0;
@@ -132,6 +134,9 @@ static int google_usb2_phy_init(struct phy *_phy)
 	regmap_read(gphy->usb_cfg_regmap, gphy->usb2_cfg_offset + USBCS_USB2PHY_CFG21_OFFSET, &reg);
 	reg |= USBCS_USB2PHY_CFG21_PHY_ENABLE;
 	regmap_write(gphy->usb_cfg_regmap, gphy->usb2_cfg_offset + USBCS_USB2PHY_CFG21_OFFSET, reg);
+
+	dev_info(gphy->dev, "usb2 phy initialized (vbus_valid=%d)\n",
+		 !gphy->orientation_known || gphy->orientation != TYPEC_ORIENTATION_NONE);
 
 	return 0;
 }

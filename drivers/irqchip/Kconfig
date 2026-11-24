@@ -840,4 +840,20 @@ config SUNPLUS_SP7021_INTC
 	  chained controller, routing all interrupt source in P-Chip to
 	  the primary controller on C-Chip.
 
+config GIA_LIB
+	tristate "Generic Interrupt Aggregator Library"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Generic Interrupt Aggregator (GIA) library supporting Google SoC
+	  N:M level, wide-level, and pulse interrupt aggregators.
+
+config GOOGLE_GIA_IRQ
+	tristate "Google GIA interrupt controller"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	select GENERIC_IRQ_CHIP
+	select GIA_LIB
+	help
+	  Interrupt controller driver for Google Tensor G5 (Laguna) GIA
+	  aggregator instances.
+
 endmenu
