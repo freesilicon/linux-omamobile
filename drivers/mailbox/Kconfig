@@ -409,4 +409,13 @@ config AXIADO_MAILBOX
 	  Axiado SoCs.
 	  If unsure, say N.
 
+config GOOGLE_MBA_CTRL
+	tristate "Google MBA controller driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	help
+	  Enable support for the Google MailBox Array (MBA) controller IP
+	  used on Google Tensor G5 (Laguna) SoCs to communicate with the
+	  CPM and GSA subsystems.
+
 endif
