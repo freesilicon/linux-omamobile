@@ -42,6 +42,7 @@
 	aliases {
 		serial0 = &uart16;
 		serial2 = &uart9;
+		ufs0 = &ufs0;
 	};
 
 	/*
@@ -912,7 +913,7 @@
 			};
 		};
 
-		ufs@3c400000 {
+		ufs0: ufs@3c400000 {
 			compatible = "google,ufshc";
 			reg = <0x0 0x3c400000 0x0 0x1000>,
 			      <0x0 0x3c410000 0x0 0x504>,
