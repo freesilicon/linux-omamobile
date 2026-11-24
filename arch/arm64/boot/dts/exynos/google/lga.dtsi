@@ -419,6 +419,7 @@
 			#power-domain-cells = <0>;
 			sswrp-id = <0x1e>;
 			on-at-init;
+			rpm-always-on;
 		};
 
 		sswrp_lsio_e_pd: sswrp_lsio_e_pd {
@@ -432,6 +433,7 @@
 			#power-domain-cells = <0>;
 			sswrp-id = <0x1d>;
 			on-at-init;
+			rpm-always-on;
 		};
 
 		lsio_n_cli_gpio_pd: lsio_n_cli_gpio_pd {
@@ -440,12 +442,14 @@
 			power-domains = <&sswrp_lsio_n_pd>;
 			subdomain-id = <0x0>;
 			on-at-init;
+			rpm-always-on;
 		};
 
 		sswrp_hsio_n_pd: sswrp_hsio_n_pd {
 			#power-domain-cells = <0>;
 			sswrp-id = <0x17>;
 			on-at-init;
+			rpm-always-on;
 		};
 
 		hsio_n_usb_pd: hsio_n_usb_pd {
@@ -484,9 +488,7 @@
 	cpm_clk: clock-controller {
 		compatible = "google,cpm-clk";
 		mboxes = <&goog_mba_cpm_iface>;
-		power-domains = <&sswrp_dpu_pd>, <&sswrp_lsio_s_pd>,
-				<&sswrp_lsio_e_pd>, <&sswrp_lsio_n_pd>,
-				<&sswrp_hsio_n_pd>, <&sswrp_hsio_s_pd>;
+		power-domains = <&sswrp_lsio_n_pd>, <&sswrp_hsio_n_pd>;
 
 		lsion_cli16_cfg_clk: lsion_cli16_cfg_clk {
 			#clock-cells = <0>;
