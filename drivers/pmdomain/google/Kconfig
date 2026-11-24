@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config GOOGLE_POWER_CONTROLLER
+	tristate "Google CPM power controller driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on GOOGLE_MBA_CPM_INTERFACE
+	select PM_GENERIC_DOMAINS
+	help
+	  Enables generic power domain (genpd) support for Google Tensor G5
+	  (Laguna) SoC power domains controlled via CPM LPB/LPCM mailboxes.

@@ -134,6 +134,7 @@ obj-$(CONFIG_ARCH_BERLIN)		+= berlin/
 obj-y					+= cix/
 obj-$(CONFIG_ARCH_DAVINCI)		+= davinci/
 obj-$(CONFIG_COMMON_CLK_ESWIN)		+= eswin/
+obj-$(CONFIG_GOOGLE_CPM_CLK)		+= google/
 obj-$(CONFIG_COMMON_CLK_HISI)		+= hisilicon/
 obj-y					+= imgtec/
 obj-y					+= imx/
