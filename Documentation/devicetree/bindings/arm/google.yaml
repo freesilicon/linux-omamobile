@@ -60,6 +60,12 @@ properties:
           - enum:
               - google,zumapro-tegu
           - const: google,zumapro
+      - description: Google Tensor G5 (laguna) boards
+        items:
+          - enum:
+              - google,lga-mustang
+              - google,lga-rango
+          - const: google,lga
 
   # Bootloader requires an ect node to be present: empty on gs101 and gs201,
   # with the location of the ECT blob on zuma
