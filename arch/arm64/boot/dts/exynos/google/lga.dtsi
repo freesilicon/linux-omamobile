@@ -1,0 +1,1003 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Tensor G5 (Laguna / google,lga) Stage 1 clean-room SoC description.
+ *
+ * Derived cleanly from live Pixel 10 (mustang/rango) FDT / /proc/iomem captures,
+ * stock CP3A.261005.005 module interfaces, and mainline v7.3-rc6 bindings
+ * (derekross/linux-omamobile).
+ *
+ * Notice:
+ * - No proprietary firmware blobs, serial numbers, IMEIs, or MAC addresses.
+ * - Stage 1 targets (CPM MBA, clk-cpm, rst-cpm, power_controller, WDT, UART0,
+ *   USB2 DWC3/PHY) are enabled or wired; Stage 2 blocks (GIA, pinctrl, SMMUv3,
+ *   GSA, EdgeTPU, UFS, DPU) are included as disabled stubs for address/IRQ/SID
+ *   reference.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "google,lga";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gic>;
+
+	/* Required by Documentation/devicetree/bindings/arm/google.yaml & OmaMobile §5.3 */
+	ect { };
+
+	dpm: dpm { };
+
+	/* Verified on live mustang & rango B0 hardware (A0 sibling optional) */
+	soc_compatible {
+		B0 {
+			description = "LGA B0";
+			product_id = <0x5>;
+			major = <0x1>;
+			minor = <0x0>;
+			pkg_mode = <0x0>;
+		};
+	};
+
+	aliases {
+		serial0 = &uart16;
+		serial2 = &uart9;
+	};
+
+	/* Verified 16 GiB RAM across 8 x 2 GiB banks (identical on mustang & rango) */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x80000000>;
+	};
+
+	memory@880000000 {
+		device_type = "memory";
+		reg = <0x8 0x80000000 0x0 0x80000000>;
+	};
+
+	memory@900000000 {
+		device_type = "memory";
+		reg = <0x9 0x00000000 0x0 0x80000000>;
+	};
+
+	memory@980000000 {
+		device_type = "memory";
+		reg = <0x9 0x80000000 0x0 0x80000000>;
+	};
+
+	memory@a00000000 {
+		device_type = "memory";
+		reg = <0xa 0x00000000 0x0 0x80000000>;
+	};
+
+	memory@a80000000 {
+		device_type = "memory";
+		reg = <0xa 0x80000000 0x0 0x80000000>;
+	};
+
+	memory@b00000000 {
+		device_type = "memory";
+		reg = <0xb 0x00000000 0x0 0x80000000>;
+	};
+
+	memory@b80000000 {
+		device_type = "memory";
+		reg = <0xb 0x80000000 0x0 0x80000000>;
+	};
+
+	/*
+	 * Reserved regions cross-checked against live mustang/rango /proc/iomem.
+	 * Note: live /proc/iomem also shows 0x880000000-0x880ffffff and
+	 * 0xbbe380000-0xbd55fffff reserved dynamically by firmware/EL2.
+	 * Note: NO cont_splash / simple-framebuffer region exists on stock ABL.
+	 */
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		nvmem@53d1000 {
+			compatible = "nvmem-rmem";
+			reg = <0x0 0x053d1000 0x0 0x480>;
+			no-map;
+		};
+
+		boot_metadata@543e000 {
+			reg = <0x0 0x0543e000 0x0 0x2000>;
+			no-map;
+		};
+
+		cp_aoc_rmem@900c000 {
+			compatible = "exynos,modem_if";
+			reg = <0x0 0x0900c000 0x0 0x3000>;
+		};
+
+		xhci_dma@9010000 {
+			compatible = "xhci-dma-pool";
+			reg = <0x0 0x09010000 0x0 0x40000>;
+			no-map;
+		};
+
+		xhci_dma_buffer@9050000 {
+			compatible = "xhci-dma-pool";
+			reg = <0x0 0x09050000 0x0 0xc000>;
+			no-map;
+		};
+
+		pkvm_guest_firmware: pkvm_guest_firmware@8af00000 {
+			compatible = "linux,pkvm-guest-firmware-memory";
+			reg = <0x0 0x8af00000 0x0 0xc4000>;
+			no-map;
+		};
+
+		cpu_stats_carveout@8b20f000 {
+			compatible = "cpu-stats-carveout";
+			reg = <0x0 0x8b20f000 0x0 0x1000>;
+			no-map;
+		};
+
+		gdmc_tracepoint_dma_buff@8b400000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x8b400000 0x0 0x20000>;
+			no-map;
+		};
+
+		goog_mba_gdmc_iface_dma_region@8b420000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x8b420000 0x0 0x4000>;
+			no-map;
+		};
+
+		goog_bl31_mem_log_buff@8b600000 {
+			reg = <0x0 0x8b600000 0x0 0x200000>;
+			no-map;
+		};
+
+		aoc_rmem: aoc@8d200000 {
+			reg = <0x0 0x8d200000 0x0 0x3000000>;
+			no-map;
+		};
+
+		cdd_log_reserved@90700000 {
+			reg = <0x0 0x90700000 0x0 0x10000>;
+			no-map;
+		};
+
+		debug_kinfo_reserved@90714000 {
+			reg = <0x0 0x90714000 0x0 0x4000>;
+			no-map;
+		};
+
+		cdd@91200000 {
+			reg = <0x0 0x91200000 0x0 0x400000>;
+			no-map;
+		};
+
+		cdd_header@951f8000 {
+			reg = <0x0 0x951f8000 0x0 0x8000>;
+			no-map;
+		};
+
+		ramoops@95200000 {
+			compatible = "ramoops";
+			reg = <0x0 0x95200000 0x0 0x400000>;
+			console-size = <0x200000>;
+			pmsg-size = <0x200000>;
+		};
+
+		bldr_log_reserved@95600000 {
+			reg = <0x0 0x95600000 0x0 0x100000>;
+			no-map;
+		};
+
+		xhci_dma_dram@97000000 {
+			compatible = "xhci-dma-pool";
+			reg = <0x0 0x97000000 0x0 0x400000>;
+			no-map;
+		};
+
+		tpu_fw_rmem: tpu_fw@9fc00000 {
+			reg = <0x0 0x9fc00000 0x0 0x1400000>;
+			no-map;
+		};
+
+		vpu_fw@a1000000 {
+			reg = <0x0 0xa1000000 0x0 0x200000>;
+		};
+
+		iif_wait_table@a1360000 {
+			reg = <0x0 0xa1360000 0x0 0x20000>;
+			no-map;
+		};
+
+		iif_signal_table@a1380000 {
+			reg = <0x0 0xa1380000 0x0 0x20000>;
+			no-map;
+		};
+
+		gxp_secure_data@a1400000 {
+			reg = <0x0 0xa1400000 0x0 0x900000>;
+			no-map;
+		};
+
+		gxp_fw@a1d00000 {
+			reg = <0x0 0xa1d00000 0x0 0x300000>;
+			no-map;
+		};
+
+		gxp_mcu_fw@a2000000 {
+			reg = <0x0 0xa2000000 0x0 0x400000>;
+			no-map;
+		};
+
+		gsa_gme: gsa-gme@a2400000 {
+			reg = <0x0 0xa2400000 0x0 0x3db0000>;
+			no-map;
+		};
+
+		gsa_reserved_log: gsa_reserved_log@a61b0000 {
+			reg = <0x0 0xa61b0000 0x0 0x4000>;
+			no-map;
+		};
+
+		gpu_fw@b9f00000 {
+			reg = <0x0 0xb9f00000 0x0 0x2100000>;
+			no-map;
+		};
+
+		abl@be000000 {
+			reg = <0x0 0xbe000000 0x0 0x1000000>;
+			no-map;
+		};
+
+		famodel@c0000000 {
+			reg = <0x0 0xc0000000 0x0 0x4b00000>;
+		};
+
+		farawimg@c4b00000 {
+			reg = <0x0 0xc4b00000 0x0 0x5000000>;
+		};
+
+		cp_rmem_1@e8000000 {
+			compatible = "exynos,modem_if";
+			reg = <0x0 0xe8000000 0x0 0x2000000>;
+		};
+
+		cp_rmem@ea400000 {
+			compatible = "exynos,modem_if";
+			reg = <0x0 0xea400000 0x0 0xc00000>;
+		};
+
+		cp_msi_rmem@f6200000 {
+			compatible = "exynos,modem_if";
+			reg = <0x0 0xf6200000 0x0 0x1000>;
+		};
+
+		gc_rmem@f6fce000 {
+			reg = <0x0 0xf6fce000 0x0 0x32000>;
+			no-map;
+		};
+
+		sec_dram@f7000000 {
+			reg = <0x0 0xf7000000 0x0 0x8e00000>;
+			no-map;
+		};
+
+		bl31_dram@ffe00000 {
+			reg = <0x0 0xffe00000 0x0 0x127000>;
+			no-map;
+		};
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+				core1 {
+					cpu = <&cpu1>;
+				};
+				core2 {
+					cpu = <&cpu2>;
+				};
+				core3 {
+					cpu = <&cpu3>;
+				};
+				core4 {
+					cpu = <&cpu4>;
+				};
+				core5 {
+					cpu = <&cpu5>;
+				};
+				core6 {
+					cpu = <&cpu6>;
+				};
+				core7 {
+					cpu = <&cpu7>;
+				};
+			};
+		};
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x102>;
+		};
+
+		cpu1: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x100>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x102>;
+		};
+
+		cpu2: cpu@200 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x200>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x37b>;
+		};
+
+		cpu3: cpu@300 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x300>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x37b>;
+		};
+
+		cpu4: cpu@400 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x400>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x37b>;
+		};
+
+		cpu5: cpu@500 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x500>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x37c>;
+		};
+
+		cpu6: cpu@600 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x600>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x37c>;
+		};
+
+		cpu7: cpu@700 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x700>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <0x400>;
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	/* Note: stock FDT uses 0x108 ((1 << 8) | IRQ_TYPE_LEVEL_LOW); 4th cell = 0 */
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW 0>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW 0>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW 0>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW 0>;
+	};
+
+	oscillator: oscillator {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <38400000>;
+	};
+
+	/* Fixed USB leaf clocks present in stock FDT (used by 6.6 snps,dwc3, not mainline google,lga-dwc3) */
+	usb_ref_clk: usb-ref-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <19200000>;
+	};
+
+	usb_bus_clk: usb-bus-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <250000000>;
+	};
+
+	usb_suspend_clk: usb-suspend-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000>;
+	};
+
+
+	goog_mba_cpm_iface: cpm-iface {
+		compatible = "google,mba-cpm-iface";
+	#mbox-cells = <0>;
+		mboxes = <&cpm_ap_ns_req_mba_client_0 0>,
+			 <&cpm_ap_ns_req_mba_client_0 1>,
+			 <&cpm_ap_ns_req_mba_client_0 2>,
+			 <&cpm_ap_ns_req_mba_client_0 3>,
+			 <&cpm_ap_ns_req_mba_client_0 4>,
+			 <&cpm_ap_ns_req_mba_client_0 5>,
+			 <&cpm_ap_ns_req_mba_client_0 6>,
+			 <&cpm_ap_ns_req_mba_client_0 7>,
+			 <&cpm_ap_ns_resp_mba_client_1 0>,
+			 <&cpm_ap_ns_resp_mba_client_1 1>,
+			 <&cpm_ap_ns_resp_mba_client_1 2>,
+			 <&cpm_ap_ns_resp_mba_client_1 3>;
+		req-mboxes-idx = <0 1 2 3 4 5 6 7>;
+		resp-mboxes-idx = <8 9 10 11>;
+		payload-size = <4>;
+		status = "okay";
+	};
+
+	power_controller: power-controller {
+		compatible = "google,lga-power-controller";
+		mboxes = <&goog_mba_cpm_iface>;
+
+		sswrp_dpu_pd: sswrp_dpu_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x5>;
+		};
+
+		sswrp_lsio_s_pd: sswrp_lsio_s_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1e>;
+			on-at-init;
+		};
+
+		sswrp_lsio_e_pd: sswrp_lsio_e_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1c>;
+			on-at-init;
+			rpm-always-on;
+		};
+
+		sswrp_lsio_n_pd: sswrp_lsio_n_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1d>;
+			on-at-init;
+		};
+
+		lsio_n_cli_gpio_pd: lsio_n_cli_gpio_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1d>;
+			power-domains = <&sswrp_lsio_n_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+		};
+
+		sswrp_hsio_n_pd: sswrp_hsio_n_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x17>;
+			on-at-init;
+		};
+
+		hsio_n_usb_pd: hsio_n_usb_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x17>;
+			power-domains = <&sswrp_hsio_n_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+			active-wakeup;
+		};
+
+		hsio_n_usb_psw_pd: hsio_n_usb_psw_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x17>;
+			power-domains = <&hsio_n_usb_pd>;
+			subdomain-id = <0x5>;
+			on-at-init;
+			active-wakeup;
+		};
+
+		sswrp_hsio_s_pd: sswrp_hsio_s_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x18>;
+			on-at-init;
+			rpm-always-on;
+		};
+
+		sswrp_tpu_pd: sswrp_tpu_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x20>;
+			active-wakeup;
+			no-auto-resume;
+		};
+	};
+
+	cpm_clk: clock-controller {
+		compatible = "google,cpm-clk";
+		mboxes = <&goog_mba_cpm_iface>;
+		power-domains = <&sswrp_dpu_pd>, <&sswrp_lsio_s_pd>,
+				<&sswrp_lsio_e_pd>, <&sswrp_lsio_n_pd>,
+				<&sswrp_hsio_n_pd>, <&sswrp_hsio_s_pd>;
+
+		lsion_cli16_cfg_clk: lsion_cli16_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0x1b>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
+
+		lsion_cli16_uart_clk: lsion_cli16_uart_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0x21>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
+		};
+
+		hsion_phy_fw_clk: hsion_phy_fw_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0x3>;
+			rates = <0x0 0x17d78400>; /* 400 MHz */
+		};
+
+		hsion_usbc_non_sticky_clk: hsion_usbc_non_sticky_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0x7>;
+		};
+
+		hsion_usbc_sticky_clk: hsion_usbc_sticky_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0x8>;
+		};
+
+		hsion_u2phy_apb_clk: hsion_u2phy_apb_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0xe>;
+		};
+
+		hsion_usb2_phy_reset_clk: hsion_usb2_phy_reset_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0x11>;
+		};
+
+		hsion_usb3dp_phy_reset_clk: hsion_usb3dp_phy_reset_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x5>;
+			clock-id = <0x12>;
+		};
+	};
+
+	cpm_rst: reset-controller {
+		compatible = "google,cpm-rst";
+		mboxes = <&goog_mba_cpm_iface>;
+
+		lsion_resets: lsion_resets {
+			#reset-cells = <1>;
+			lpcm-id = <0x3>;
+			reset-num = <0x2b>;
+		};
+
+		hsion_resets: hsion_resets {
+			#reset-cells = <1>;
+			lpcm-id = <0x5>;
+			reset-num = <0x10>;
+		};
+
+		hsios_resets: hsios_resets {
+			#reset-cells = <1>;
+			lpcm-id = <0x6>;
+			reset-num = <0x5>;
+		};
+	};
+
+	tpu_iovas_resv: tpu_iovas_resv {
+		iommu-addresses = <&buenos 0x0 0x18000000>;
+	};
+	soc: soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Stock FDT includes trailing zeroed GICC/GICH/GICV ranges; omitted here per arm,gic-v3.yaml */
+		gic: interrupt-controller@5880000 {
+			compatible = "arm,gic-v3";
+			interrupt-controller;
+			#interrupt-cells = <4>;
+			reg = <0x0 0x05880000 0x0 0x10000>,
+			      <0x0 0x05900000 0x0 0x200000>;
+			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH 0>;
+
+			ppi-partitions {
+				ppi_part0: interrupt-partition-0 {
+					affinity = <&cpu0 &cpu1 &cpu2 &cpu3 &cpu4 &cpu5 &cpu6>;
+				};
+				ppi_part1: interrupt-partition-1 {
+					affinity = <&cpu7>;
+				};
+			};
+		};
+
+		/* === CPM Mailbox & Control Plane (Stage 1B) === */
+		cpm_mba_syscon: syscon@5250000 {
+			compatible = "google,cpm-mba-global", "syscon";
+			reg = <0x0 0x05250000 0x0 0x50>;
+		};
+
+		cpm_ap_ns_req_mba_client_0: mailbox@5260000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x05260000 0x0 0x1000>;
+			interrupts = <GIC_SPI 250 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&cpm_mba_syscon 0>;
+			queue-mode;
+			payload-size = <4>;
+			mba-ip-version = <2 0>;
+			status = "okay";
+		};
+
+		cpm_ap_ns_resp_mba_client_1: mailbox@5261000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x05261000 0x0 0x1000>;
+			interrupts = <GIC_SPI 251 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&cpm_mba_syscon 1>;
+			queue-mode;
+			payload-size = <4>;
+			mba-ip-version = <2 0>;
+			status = "okay";
+		};
+
+
+		/* === Stage 1 Watchdogs (port google_wdt.c or disarm early) === */
+		watchdog_cl0: watchdog@200c4000 {
+			compatible = "google,wdt";
+			reg = <0x0 0x200c4000 0x0 0x1000>;
+			clocks = <&oscillator>;
+			timeout-sec = <24>;
+			expiry-action = [00];
+			key-unlock = <0xc0ffee>;
+			key-lock = <0x0>;
+			use-syscore-pm;
+			status = "disabled";
+		};
+
+		watchdog_cl1: watchdog@200c5000 {
+			compatible = "google,wdt";
+			reg = <0x0 0x200c5000 0x0 0x1000>;
+			clocks = <&oscillator>;
+			timeout-sec = <30>;
+			expiry-action = [01];
+			key-unlock = <0xc0ffee>;
+			key-lock = <0x0>;
+			status = "disabled";
+		};
+
+		/* === Stage 1A Debug UART (direct GICv3 SPI 688, bypasses GIA) === */
+		uart16: serial@db62000 {
+			/* snps,dw-apb-uart fallback lets mainline 8250_dw bind before google_8250_dw */
+			compatible = "goog,goog-dw-apb-uart", "snps,dw-apb-uart";
+			reg = <0x0 0x0db62000 0x0 0x100>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			interrupts = <GIC_SPI 688 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&lsion_cli16_uart_clk>, <&lsion_cli16_cfg_clk>;
+			clock-names = "baudclk", "apb_pclk";
+			resets = <&lsion_resets 0x6>;
+			reset-names = "s_rst_n";
+			power-domains = <&lsio_n_cli_gpio_pd>;
+			status = "disabled";
+		};
+
+		/* === Stage 1B USB2-Only Gadget (uses existing mainline v7.3-rc6 drivers) === */
+		usb_cfg_csr: syscon@c450000 {
+			compatible = "syscon";
+			/* 0x30 covers 0x0..0x2f (note: dwc3-google accesses 0x2c vs stock 0x28 usb_top_cfg_csr) */
+			reg = <0x0 0x0c450000 0x0 0x30>;
+		};
+
+		usb_phy: phy@c410000 {
+			compatible = "google,lga-usb-phy";
+			reg = <0x0 0x0c410000 0x0 0x20000>,
+			      <0x0 0x0c430000 0x0 0x1000>,
+			      <0x0 0x0c440000 0x0 0x10000>,
+			      <0x0 0x0c637000 0x0 0xa0>;
+			reg-names = "usb3_core", "usb3_tca", "usb2_core", "usbdp_top";
+			#phy-cells = <1>;
+			clocks = <&hsion_usb2_phy_reset_clk>, <&hsion_u2phy_apb_clk>,
+				 <&hsion_usb3dp_phy_reset_clk>, <&hsion_phy_fw_clk>;
+			clock-names = "usb2", "usb2_apb", "usb3", "usb3_fw";
+			resets = <&hsion_resets 0xd>, <&hsion_resets 0x9>, <&hsion_resets 0xe>;
+			reset-names = "usb2", "usb2_apb", "usb3";
+			power-domains = <&hsio_n_usb_pd>;
+			orientation-switch;
+			google,usb-cfg-csr = <&usb_cfg_csr 0x14>;
+			status = "disabled";
+		};
+
+		usb: usb@c400000 {
+			compatible = "google,lga-dwc3";
+			reg = <0x0 0x0c400000 0x0 0xd060>;
+			interrupts = <GIC_SPI 580 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 597 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 598 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "core", "hs_pme", "ss_pme";
+			clocks = <&hsion_usbc_non_sticky_clk>, <&hsion_usbc_sticky_clk>;
+			clock-names = "non_sticky", "sticky";
+			resets = <&hsion_resets 0xa>, <&hsion_resets 0xb>,
+				 <&hsion_resets 0xc>, <&hsion_resets 0x6>;
+			reset-names = "non_sticky", "sticky", "drd_bus", "top";
+			power-domains = <&hsio_n_usb_psw_pd>, <&hsio_n_usb_pd>;
+			power-domain-names = "psw", "top";
+			/* Omit usb3-phy so dwc3-google enters USB2ONLY_MODE without usb_phy_fw */
+			phys = <&usb_phy 0>;
+			phy-names = "usb2-phy";
+			dr_mode = "peripheral";
+			maximum-speed = "high-speed";
+			snps,quirk-frame-length-adjustment = <0x20>;
+			snps,gfladj-refclk-lpm-sel-quirk;
+			snps,incr-burst-type-adjustment = <4>;
+			google,usb-cfg-csr = <&usb_cfg_csr 0x0 0x20>;
+			status = "disabled";
+		};
+
+		/* === Stage 2 Stubs (disabled; reference addresses / GIAs / IOMMUs) === */
+		cpuacc_level_gia: interrupt-controller@5cd2028 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x05cd2028 0x0 0x10>;
+			reg-names = "cpuacc_ap_ns_intr";
+			interrupts = <GIC_SPI 151 IRQ_TYPE_LEVEL_HIGH 0>;
+			status = "disabled";
+		};
+
+		cpuacc_pulse_gia: interrupt-controller@5cd2000 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x05cd2000 0x0 0x14>;
+			interrupts-extended = <&cpuacc_level_gia 10>, <&cpuacc_level_gia 9>,
+					      <&cpuacc_level_gia 8>, <&cpuacc_level_gia 7>,
+					      <&cpuacc_level_gia 6>, <&cpuacc_level_gia 5>,
+					      <&cpuacc_level_gia 4>, <&cpuacc_level_gia 3>,
+					      <&cpuacc_level_gia 2>, <&cpuacc_level_gia 1>,
+					      <&cpuacc_level_gia 0>;
+			status = "disabled";
+		};
+
+		lsioe_level_gia_4: interrupt-controller@3a160400 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3a160400 0x0 0x10>;
+			interrupts = <GIC_SPI 704 IRQ_TYPE_LEVEL_HIGH 0>;
+			status = "disabled";
+		};
+
+		uart9: serial@3a322000 {
+			compatible = "goog,goog-dw-apb-uart", "snps,dw-apb-uart";
+			reg = <0x0 0x3a322000 0x0 0x100>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			interrupts-extended = <&lsioe_level_gia_4 2>;
+			status = "disabled";
+		};
+
+		pinctrl_cpm: pinctrl@5280000 {
+			compatible = "google,lga-cpm-pinctrl";
+			reg = <0x0 0x05280000 0x0 0x39000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			status = "disabled";
+		};
+
+		pinctrl_hsion: pinctrl@c580000 {
+			compatible = "google,lga-hsion-pinctrl";
+			reg = <0x0 0x0c580000 0x0 0xc000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			power-domains = <&sswrp_hsio_n_pd>;
+			power-domain-names = "csr_access_pd";
+			status = "disabled";
+		};
+
+		pinctrl_lsion: pinctrl@da00000 {
+			compatible = "google,lga-lsion-pinctrl";
+			reg = <0x0 0x0da00000 0x0 0x8000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			power-domains = <&lsio_n_cli_gpio_pd>;
+			power-domain-names = "csr_access_pd";
+			status = "disabled";
+		};
+
+		amb_smmu: iommu@5b80000 {
+			compatible = "arm,smmu-v3";
+			reg = <0x0 0x05b80000 0x0 0x40000>;
+			dma-coherent;
+			interrupts-extended = <&cpuacc_pulse_gia 10>,
+					      <&cpuacc_pulse_gia 8>,
+					      <&cpuacc_pulse_gia 3>;
+			interrupt-names = "eventq", "gerror", "priq";
+			#iommu-cells = <1>;
+			arm,instdata-override;
+			arm,max-sid-bits = <16>;
+			status = "disabled";
+		};
+
+		gsa_mba_syscon: syscon@e000000 {
+			compatible = "google,gsa-mba-global", "syscon";
+			reg = <0x0 0x0e000000 0x0 0x30>;
+			status = "disabled";
+		};
+
+		gsa_ap_0_mba: mailbox@e010000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0e010000 0x0 0x1000>;
+			interrupts = <GIC_SPI 950 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&gsa_mba_syscon 0>;
+			mba-ip-version = <2 0>;
+			status = "disabled";
+		};
+
+		gsa: gsa@e010000 {
+			compatible = "google,gs101-gsa-v1";
+			reg = <0x0 0x0e010000 0x0 0x1000>;
+			log-region = <&gsa_reserved_log>;
+			iommus = <&amb_smmu 0x8201>;
+			mboxes = <&gsa_ap_0_mba 0>;
+			mbox-channels = <1>;
+			channel-max-pending-msgs = <1>;
+			status = "disabled";
+		};
+
+		tpu_level_gia: interrupt-controller@36310300 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x36310300 0x0 0x10>;
+			interrupts = <GIC_SPI 160 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_tpu_pd>;
+			status = "disabled";
+		};
+
+		tpu_pulse_gia: interrupt-controller@36310000 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			interrupt-parent = <&tpu_level_gia>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x36310000 0x0 0x14>;
+			interrupts = <11>;
+			power-domains = <&sswrp_tpu_pd>;
+			status = "disabled";
+		};
+
+		tpu_smmu: iommu@36200000 {
+			compatible = "arm,smmu-v3";
+			reg = <0x0 0x36200000 0x0 0x40000>;
+			dma-coherent;
+			interrupts-extended = <&tpu_pulse_gia 23>,
+					      <&tpu_pulse_gia 21>,
+					      <&tpu_pulse_gia 20>;
+			interrupt-names = "eventq", "gerror", "priq";
+			power-domains = <&sswrp_tpu_pd>;
+			#iommu-cells = <1>;
+			arm,instdata-override;
+			arm,max-sid-bits = <16>;
+			non-coherent-ttw;
+			status = "disabled";
+		};
+
+		sswrp_tpu@36000000 {
+			compatible = "simple-bus";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0x0 0x0 0x36000000 0xac1000>;
+			status = "disabled";
+
+
+			buenos: edgetpu@500000 {
+				compatible = "google,edgetpu-laguna";
+				reg = <0x500000 0x541000>, <0x9000 0xb2e4>;
+				reg-names = "top", "lpcm";
+				#dma-address-cells = <1>;
+				#dma-size-cells = <2>;
+				pasid-num-bits = <4>;
+				gcip-dma-window = <0x84000000 0xf 0x7bf00000>;
+				iommus = <&tpu_smmu 0x00>, <&tpu_smmu 0x10>,
+					 <&tpu_smmu 0x20>, <&tpu_smmu 0x30>,
+					 <&tpu_smmu 0x40>, <&tpu_smmu 0x50>,
+					 <&tpu_smmu 0x60>, <&tpu_smmu 0x70>,
+					 <&tpu_smmu 0x80>, <&tpu_smmu 0x90>;
+				interrupts = <GIC_SPI 169 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 170 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 171 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 173 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 175 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 177 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 178 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 179 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 180 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 181 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 182 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 214 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 215 IRQ_TYPE_LEVEL_HIGH 0>;
+				interrupt-names = "mbox_0", "mbox_1", "mbox_2", "mbox_3",
+						  "mbox_4", "mbox_5", "mbox_6", "mbox_7",
+						  "mbox_8", "mbox_9", "mbox_10", "mbox_11",
+						  "mbox_12", "mbox_13", "wdt_0", "wdt_1";
+				power-domains = <&sswrp_tpu_pd>;
+				gsa-device = <&gsa>;
+				memory-region = <&tpu_fw_rmem>, <&tpu_iovas_resv>;
+				status = "disabled";
+			};
+		};
+
+		ufs@3c400000 {
+			compatible = "google,ufshc";
+			reg = <0x0 0x3c400000 0x0 0x1000>,
+			      <0x0 0x3c410000 0x0 0x504>,
+			      <0x0 0x3c700000 0x0 0x14000>,
+			      <0x0 0x3c00b108 0x0 0x4>,
+			      <0x0 0x3c00d210 0x0 0x4>,
+			      <0x0 0x3c00e108 0x0 0x4>;
+			reg-names = "ufs_hc", "ufs_top", "ufs_phy_sram",
+				    "psm_status_hsios", "psm_status_ufs_hc", "psm_status_ufs_phy";
+			resets = <&hsios_resets 0x3>;
+			reset-names = "phy_rst";
+			gsa-device = <&gsa>;
+			dma-coherent;
+			status = "disabled";
+		};
+
+		dpu_level_gia: interrupt-controller@ef88000 {
+			compatible = "google,wide-level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x0ef88000 0x0 0x50>;
+			nr-irq-chips = <5>;
+			next-bank-offset = <4>;
+			interrupts = <GIC_SPI 820 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_dpu_pd>;
+			status = "disabled";
+		};
+
+		sswrp_dpu@ec00000 {
+			compatible = "simple-bus";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0x0 0x0 0x0ec00000 0x400000>;
+			status = "disabled";
+
+			dc9x00@200000 {
+				compatible = "verisilicon,dc9x00";
+				reg = <0x200000 0x120000>, <0x390000 0x10000>;
+				reg-names = "dpu-fe-be", "dpu-gpcsr";
+				interrupt-parent = <&dpu_level_gia>;
+				status = "disabled";
+			};
+		};
+	};
+};
