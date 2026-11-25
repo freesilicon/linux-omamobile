@@ -461,8 +461,9 @@ config BATTERY_MAX17042
 
 config BATTERY_MAX77779
 	tristate "Maxim MAX77779 read-only Fuel Gauge"
-	depends on I2C
-	select REGMAP_I2C
+	depends on I2C || SPMI
+	select REGMAP
+	select REGMAP_I2C if I2C
 	help
 	  Report battery measurements from a MAX77779 with a retained,
 	  initialized firmware model. Probe refuses an uninitialized gauge.
