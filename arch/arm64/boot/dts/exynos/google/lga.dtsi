@@ -819,17 +819,6 @@
 			status = "disabled";
 		};
 
-		gsa: gsa@e010000 {
-			compatible = "google,gs101-gsa-v1";
-			reg = <0x0 0x0e010000 0x0 0x1000>;
-			log-region = <&gsa_reserved_log>;
-			iommus = <&amb_smmu 0x8201>;
-			mboxes = <&gsa_ap_0_mba 0>;
-			mbox-channels = <1>;
-			channel-max-pending-msgs = <1>;
-			status = "disabled";
-		};
-
 		tpu_level_gia: interrupt-controller@36310300 {
 			compatible = "google,level-gia";
 			interrupt-controller;
@@ -867,7 +856,7 @@
 			status = "disabled";
 		};
 
-		sswrp_tpu@36000000 {
+		sswrp_tpu: sswrp_tpu@36000000 {
 			compatible = "simple-bus";
 			#address-cells = <1>;
 			#size-cells = <1>;
@@ -958,6 +947,33 @@
 				interrupt-parent = <&dpu_level_gia>;
 				status = "disabled";
 			};
+		};
+	};
+
+	gsa: gsa {
+		compatible = "google,gs101-gsa-v1";
+		log-region = <&gsa_reserved_log>;
+		iommus = <&amb_smmu 0x8201>;
+		mboxes = <&gsa_ap_0_mba 0>;
+		mbox-channels = <1>;
+		channel-max-pending-msgs = <1>;
+		status = "disabled";
+	};
+
+	trusty: trusty {
+		compatible = "android,trusty-smc-v1";
+
+		irq {
+			compatible = "android,trusty-irq-v1";
+			ipi-range = <0x8 0xf 0x8>;
+		};
+
+		log {
+			compatible = "android,trusty-log-v1";
+		};
+
+		virtio {
+			compatible = "android,trusty-virtio-v1";
 		};
 	};
 };
