@@ -235,6 +235,9 @@
 	panel0: panel@0 {
 		compatible = "google,gs-rgeb";
 		reg = <0>;
+		vci-supply = <&ldo_18s_reg>;
+		vddd-supply = <&s2dos07x02_outer>;
+		reset-gpios = <&da9188_gpio 0xb GPIO_ACTIVE_HIGH>;
 
 		port {
 			panel0_in: endpoint {
@@ -257,6 +260,8 @@
 	panel1: panel@0 {
 		compatible = "google,gs-rgea";
 		reg = <0>;
+		vci-supply = <&ldo_14m_reg>;
+		vddd-supply = <&s2dos07x02_inner>;
 
 		port {
 			panel1_in: endpoint {
