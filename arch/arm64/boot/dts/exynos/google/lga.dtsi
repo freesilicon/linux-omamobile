@@ -760,7 +760,6 @@
 						regulator-name = "ldo_4m";
 						regulator-min-microvolt = <1200000>;
 						regulator-max-microvolt = <1200000>;
-						google,monitor-only;
 					};
 
 					ldo_10m_reg: ldo_10m {
@@ -1158,7 +1157,8 @@
 			bt_bcm4390: bluetooth {
 				compatible = "brcm,bcm4390-bt";
 				pinctrl-names = "default";
-				pinctrl-0 = <&bt_dev_wake &bt_host_wake>;
+				pinctrl-0 = <&bt_dev_wake &bt_host_wake
+					     &bt_aoc_uart0_hiz>;
 				shutdown-gpios = <&da9188_vgpio 0x13 GPIO_ACTIVE_HIGH>;
 				brcm,ble-dbo-gpios = <&da9188_vgpio 0x14 GPIO_ACTIVE_HIGH>;
 				device-wakeup-gpios = <&pinctrl_aoc 0xd GPIO_ACTIVE_HIGH>;
@@ -1296,12 +1296,28 @@
 
 			bt_dev_wake: bt-dev-wake {
 				pins = "XAOC_GPIO1";
+				bias-disable;
+				drive-strength = <0x0>;
+				input-enable;
+				output-enable;
 				function = "aoc_cpm_eint";
 			};
 
 			bt_host_wake: bt-host-wake {
 				pins = "XAOC_GPIO2";
+				bias-pull-down;
+				input-enable;
+				output-disable;
 				function = "aoc_cpm_eint";
+			};
+
+			bt_aoc_uart0_hiz: bt-aoc-uart0-hiz {
+				pins = "XAOC_UART0_RXD", "XAOC_UART0_TXD",
+				       "XAOC_UART0_RTSn", "XAOC_UART0_CTSn";
+				bias-disable;
+				input-enable;
+				output-disable;
+				function = "aoc_int_gpio";
 			};
 
 			ts0_2_aoc_int_l_1v2: ts0_2_aoc_int_l_1v2 {
