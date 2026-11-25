@@ -7,6 +7,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
@@ -115,6 +116,7 @@ struct ufs_google_host {
 	/* Serializes indirect M-PHY register accesses and IE masking */
 	struct mutex mphy_lock;
 	bool pd_on;
+	bool need_phy_init;
 
 	bool enable_cal;
 	u32 *phy_cal_data;
@@ -363,6 +365,8 @@ static int ufs_google_power_up(struct ufs_google_host *ufs, bool reset_hw)
 	}
 
 	if (reset_hw) {
+		ufs->need_phy_init = true;
+
 		ufs_google_rmwl_top(ufs, UFS_TOP_PHY_PATCH_MODE_MASK,
 				    FIELD_PREP(UFS_TOP_PHY_PATCH_MODE_MASK,
 					       UFS_TOP_PHY_PATCH_MODE_ROM),
@@ -475,7 +479,9 @@ static int ufs_google_pd_notifier(struct notifier_block *nb,
 	struct ufs_google_host *ufs = container_of(nb, struct ufs_google_host,
 						   pd_nb);
 
-	if (action == GENPD_NOTIFY_ON)
+	if (action == GENPD_NOTIFY_PRE_ON)
+		ufs->need_phy_init = true;
+	else if (action == GENPD_NOTIFY_ON)
 		ufs_google_power_up(ufs, true);
 	else if (action == GENPD_NOTIFY_OFF)
 		ufs_google_pd_off(ufs);
@@ -630,6 +636,8 @@ static int ufs_google_init(struct ufs_hba *hba)
 			!(readl(ufs->ufs_top + UFS_TOP_PM_CTRL) &
 			  UFS_TOP_PM_CTRL_ISOLATE);
 
+		ufs->need_phy_init = !boot_active;
+
 		/*
 		 * Preserve ABL's initialized PHY/UFS state when the domain had
 		 * on-at-init, only taking Linux clock/regulator references.
@@ -639,8 +647,8 @@ static int ufs_google_init(struct ufs_hba *hba)
 			goto err_put_pd;
 	}
 
-	hba->quirks |= UFSHCD_QUIRK_BROKEN_PA_RXHSUNTERMCAP |
-		       UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8 |
+		       UFSHCD_QUIRK_SET_IID_TO_ONE;
 
 	return 0;
 
@@ -692,6 +700,11 @@ static int ufs_google_phy_initialization(struct ufs_hba *hba)
 	ret = ufshcd_dme_set(hba, UIC_ARG_MIB(0xd085), 1);
 	if (ret)
 		return ret;
+
+	if (!ufs->need_phy_init) {
+		dev_info(hba->dev, "phy init skipped\n");
+		return 0;
+	}
 
 	if (device_property_read_bool(hba->dev, "google,skip-ufs-phy-init"))
 		return ufshcd_dme_set(hba, UIC_ARG_MIB(0xd0c1), 0);
@@ -751,6 +764,8 @@ static int ufs_google_phy_initialization(struct ufs_hba *hba)
 	if (ret || !(val & 0x7))
 		return ret ? ret : -ETIMEDOUT;
 
+	ufs->need_phy_init = false;
+
 	return 0;
 }
 
@@ -770,6 +785,9 @@ static int ufs_google_link_startup_notify(struct ufs_hba *hba,
 
 	if (status != POST_CHANGE)
 		return 0;
+
+	/* Allow link and peer UniPro stack to settle before CPORT setup. */
+	usleep_range(500, 600);
 
 	ret = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_TACTIVATE), &val);
 	if (!ret) {
@@ -809,11 +827,16 @@ static int ufs_google_pwr_change_notify(struct ufs_hba *hba,
 {
 	u32 val;
 
-	if (status != POST_CHANGE || !final_params)
+	if (status != PRE_CHANGE || !final_params)
 		return 0;
 
+	dev_info(hba->dev, "hs_gear=%u hs_series=%u hs_rate=%u\n",
+		 final_params->gear_rx, final_params->pwr_rx,
+		 final_params->hs_rate);
+
 	val = (ufshcd_is_hs_mode(final_params) &&
-	       final_params->gear_rx >= UFS_HS_G4) ? 1 : 3;
+	       final_params->gear_rx >= UFS_HS_G4) ?
+		PA_INITIAL_ADAPT : PA_NO_ADAPT;
 
 	return ufshcd_dme_set(hba, UIC_ARG_MIB(UFS_GOOGLE_DME_GEAR_TUNE), val);
 }
@@ -977,10 +1000,16 @@ static int ufs_google_config_esi(struct ufs_hba *hba)
 	return 0;
 }
 
+static int ufs_google_set_dma_mask(struct ufs_hba *hba)
+{
+	return dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(36));
+}
+
 static const struct ufs_hba_variant_ops ufs_hba_google_vops = {
 	.name			= "google-ufshc",
 	.init			= ufs_google_init,
 	.exit			= ufs_google_exit,
+	.set_dma_mask		= ufs_google_set_dma_mask,
 	.phy_initialization	= ufs_google_phy_initialization,
 	.link_startup_notify	= ufs_google_link_startup_notify,
 	.negotiate_pwr_mode	= ufs_google_negotiate_pwr_mode,
