@@ -59,7 +59,10 @@ pvr_cccb_init(struct pvr_device *pvr_dev, struct pvr_cccb *pvr_cccb,
 	 * Map CCCB and control structure as uncached, so we don't have to flush
 	 * CPU cache repeatedly when polling for space.
 	 */
-	pvr_cccb->ctrl = pvr_fw_object_create_and_map(pvr_dev, sizeof(*pvr_cccb->ctrl),
+	pvr_cccb->ctrl = pvr_fw_object_create_and_map(pvr_dev,
+						      pvr_dev->laguna ?
+						      PVR_LAGUNA_FWIF_CCCB_CTL_SIZE :
+						      sizeof(*pvr_cccb->ctrl),
 						      PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 						      cccb_ctrl_init, pvr_cccb,
 						      &pvr_cccb->ctrl_obj);
@@ -121,7 +124,7 @@ bool pvr_cccb_cmdseq_fits(struct pvr_cccb *pvr_cccb, size_t size)
 	 * If our command sequence does not fit, reserve the remaining space for a padding
 	 * command.
 	 */
-	if (size + PADDING_COMMAND_SIZE > remaining)
+	if (size + pvr_cccb_hdr_size(pvr_cccb) > remaining)
 		size += remaining;
 
 	if (get_ccb_space(pvr_cccb->write_offset, read_offset, pvr_cccb->size) >= size)
@@ -151,15 +154,9 @@ void
 pvr_cccb_write_command_with_header(struct pvr_cccb *pvr_cccb, u32 cmd_type, u32 cmd_size,
 				   void *cmd_data, u32 ext_job_ref, u32 int_job_ref)
 {
-	u32 sz_with_hdr = pvr_cccb_get_size_of_cmd_with_hdr(cmd_size);
-	struct rogue_fwif_ccb_cmd_header cmd_header = {
-		.cmd_type = pvr_cccb->laguna ?
-			    pvr_laguna_translate_cccb_cmd_type(cmd_type) :
-			    cmd_type,
-		.cmd_size = ALIGN(cmd_size, 8),
-		.ext_job_ref = ext_job_ref,
-		.int_job_ref = int_job_ref,
-	};
+	u32 hdr_sz = pvr_cccb_hdr_size(pvr_cccb);
+	u32 sz_with_hdr = pvr_cccb_get_size_of_cmd_with_hdr_for(pvr_cccb, cmd_size);
+	u32 aligned_size = ALIGN(cmd_size, 8);
 	struct rogue_fwif_cccb_ctl *ctrl = pvr_cccb->ctrl;
 	u32 remaining = pvr_cccb->size - pvr_cccb->write_offset;
 	u32 required_size, cccb_space, read_offset;
@@ -168,7 +165,7 @@ pvr_cccb_write_command_with_header(struct pvr_cccb *pvr_cccb, u32 cmd_type, u32 
 	 * Always ensure we have enough room for a padding command at the end of
 	 * the CCCB.
 	 */
-	if (remaining < sz_with_hdr + PADDING_COMMAND_SIZE) {
+	if (remaining < sz_with_hdr + hdr_sz) {
 		/*
 		 * Command would need to wrap, so we need to pad the remainder
 		 * of the CCCB.
@@ -185,19 +182,48 @@ pvr_cccb_write_command_with_header(struct pvr_cccb *pvr_cccb, u32 cmd_type, u32 
 
 	if (required_size != sz_with_hdr) {
 		/* Add padding command */
-		struct rogue_fwif_ccb_cmd_header pad_cmd = {
-			.cmd_type = pvr_cccb->laguna ?
-				    PVR_LAGUNA_CCB_CMD_TYPE_PADDING :
-				    ROGUE_FWIF_CCB_CMD_TYPE_PADDING,
-			.cmd_size = remaining - sizeof(pad_cmd),
-		};
+		if (pvr_cccb->laguna) {
+			struct pvr_laguna_fwif_ccb_cmd_header pad_cmd = {
+				.cmd_type = PVR_LAGUNA_CCB_CMD_TYPE_PADDING,
+				.cmd_size = remaining - sizeof(pad_cmd),
+			};
 
-		memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset], &pad_cmd, sizeof(pad_cmd));
+			memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset],
+			       &pad_cmd, sizeof(pad_cmd));
+		} else {
+			struct rogue_fwif_ccb_cmd_header pad_cmd = {
+				.cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_PADDING,
+				.cmd_size = remaining - sizeof(pad_cmd),
+			};
+
+			memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset],
+			       &pad_cmd, sizeof(pad_cmd));
+		}
 		pvr_cccb->write_offset = 0;
 	}
 
-	memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset], &cmd_header, sizeof(cmd_header));
-	memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset + sizeof(cmd_header)], cmd_data, cmd_size);
+	if (pvr_cccb->laguna) {
+		struct pvr_laguna_fwif_ccb_cmd_header cmd_header = {
+			.cmd_type = pvr_laguna_translate_cccb_cmd_type(cmd_type),
+			.cmd_size = aligned_size,
+			.ext_job_ref = ext_job_ref,
+			.int_job_ref = int_job_ref,
+		};
+
+		memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset],
+		       &cmd_header, sizeof(cmd_header));
+	} else {
+		struct rogue_fwif_ccb_cmd_header cmd_header = {
+			.cmd_type = cmd_type,
+			.cmd_size = aligned_size,
+			.ext_job_ref = ext_job_ref,
+			.int_job_ref = int_job_ref,
+		};
+
+		memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset],
+		       &cmd_header, sizeof(cmd_header));
+	}
+	memcpy(&pvr_cccb->cccb[pvr_cccb->write_offset + hdr_sz], cmd_data, cmd_size);
 	pvr_cccb->write_offset += sz_with_hdr;
 }
 

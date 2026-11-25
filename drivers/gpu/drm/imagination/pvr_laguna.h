@@ -167,6 +167,7 @@ struct pvr_laguna_data {
 	bool fw_authenticated;
 	bool fw_running;
 	bool fw_kccb_ready;
+	bool fw_wedged;
 
 	/* Shared FW heap (gpu_fw@b9f00000 + 2 MiB, 30 MiB pre-mapped by Trusty). */
 	void *fw_shared_cpu;
@@ -238,6 +239,7 @@ void *pvr_laguna_fw_shared_vaddr(struct pvr_device *pvr_dev, u32 fw_offset);
 phys_addr_t pvr_laguna_fw_shared_paddr(struct pvr_device *pvr_dev, u32 fw_offset);
 bool pvr_laguna_fw_ready(const struct pvr_device *pvr_dev);
 bool pvr_laguna_kccb_ready(const struct pvr_device *pvr_dev);
+bool pvr_laguna_is_wedged(const struct pvr_device *pvr_dev);
 bool pvr_laguna_power_is_idle(struct pvr_device *pvr_dev);
 bool pvr_laguna_needs_reset(const struct pvr_device *pvr_dev);
 void pvr_laguna_clear_hwr_flags(struct pvr_device *pvr_dev);

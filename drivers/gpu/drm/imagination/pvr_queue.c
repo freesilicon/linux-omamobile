@@ -377,33 +377,35 @@ pvr_queue_fence_ctx_init(struct pvr_queue_fence_ctx *fence_ctx)
 	atomic_set(&fence_ctx->seqno, 0);
 }
 
-static u32 ufo_cmds_size(u32 elem_count)
+static u32 ufo_cmds_size(const struct pvr_cccb *cccb, u32 elem_count)
 {
 	/* We can pass at most ROGUE_FWIF_CCB_CMD_MAX_UFOS per UFO-related command. */
 	u32 full_cmd_count = elem_count / ROGUE_FWIF_CCB_CMD_MAX_UFOS;
 	u32 remaining_elems = elem_count % ROGUE_FWIF_CCB_CMD_MAX_UFOS;
 	u32 size = full_cmd_count *
-		   pvr_cccb_get_size_of_cmd_with_hdr(ROGUE_FWIF_CCB_CMD_MAX_UFOS *
-						     sizeof(struct rogue_fwif_ufo));
+		   pvr_cccb_get_size_of_cmd_with_hdr_for(cccb,
+							 ROGUE_FWIF_CCB_CMD_MAX_UFOS *
+							 sizeof(struct rogue_fwif_ufo));
 
 	if (remaining_elems) {
-		size += pvr_cccb_get_size_of_cmd_with_hdr(remaining_elems *
-							  sizeof(struct rogue_fwif_ufo));
+		size += pvr_cccb_get_size_of_cmd_with_hdr_for(cccb,
+							      remaining_elems *
+							      sizeof(struct rogue_fwif_ufo));
 	}
 
 	return size;
 }
 
-static u32 job_cmds_size(struct pvr_job *job, u32 ufo_wait_count)
+static u32 job_cmds_size(const struct pvr_cccb *cccb, struct pvr_job *job, u32 ufo_wait_count)
 {
 	/*
 	 * One UFO command per native fence this job will be waiting on (unless any are
 	 * signaled by the time the job is submitted), plus a command for the job itself,
 	 * plus one UFO command for the fence signaling.
 	 */
-	return ufo_cmds_size(ufo_wait_count) +
-	       pvr_cccb_get_size_of_cmd_with_hdr(job->cmd_len) +
-	       ufo_cmds_size(1);
+	return ufo_cmds_size(cccb, ufo_wait_count) +
+	       pvr_cccb_get_size_of_cmd_with_hdr_for(cccb, job->cmd_len) +
+	       ufo_cmds_size(cccb, 1);
 }
 
 static bool
@@ -480,7 +482,8 @@ pvr_queue_get_job_cccb_fence(struct pvr_queue *queue, struct pvr_job *job)
 
 	/* Count remaining native dependencies and check if the job fits in the CCCB. */
 	native_deps_remaining = job_count_remaining_native_deps(job);
-	if (pvr_cccb_cmdseq_fits(&queue->cccb, job_cmds_size(job, native_deps_remaining))) {
+	if (pvr_cccb_cmdseq_fits(&queue->cccb,
+				 job_cmds_size(&queue->cccb, job, native_deps_remaining))) {
 		pvr_queue_fence_put(job->cccb_fence);
 		job->cccb_fence = NULL;
 		goto out_unlock;
@@ -1076,7 +1079,8 @@ pvr_queue_check_job_waiting_for_cccb_space(struct pvr_queue *queue)
 	 * the drm_sched_entity.
 	 */
 	native_deps_remaining = job_count_remaining_native_deps(job);
-	if (!pvr_cccb_cmdseq_fits(&queue->cccb, job_cmds_size(job, native_deps_remaining))) {
+	if (!pvr_cccb_cmdseq_fits(&queue->cccb,
+				  job_cmds_size(&queue->cccb, job, native_deps_remaining))) {
 		job = NULL;
 		goto out_unlock;
 	}
@@ -1204,7 +1208,8 @@ int pvr_queue_job_init(struct pvr_job *job, u64 drm_client_id)
 	if (!queue)
 		return -EINVAL;
 
-	if (!pvr_cccb_cmdseq_can_fit(&queue->cccb, job_cmds_size(job, min_native_dep_count)))
+	if (!pvr_cccb_cmdseq_can_fit(&queue->cccb,
+				     job_cmds_size(&queue->cccb, job, min_native_dep_count)))
 		return -E2BIG;
 
 	err = drm_sched_job_init(&job->base, &queue->entity, 1, THIS_MODULE, drm_client_id);

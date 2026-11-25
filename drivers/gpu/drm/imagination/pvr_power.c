@@ -131,7 +131,7 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 	}
 
 	err = pvr_fw_stop(pvr_dev);
-	if (err && rpm_suspend)
+	if (err && rpm_suspend && !pvr_laguna_is_wedged(pvr_dev))
 		enable_irq(pvr_dev->irq);
 
 	return err;
@@ -455,7 +455,8 @@ pvr_power_device_resume(struct device *dev)
 	return 0;
 
 err_power_off:
-	pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
+	if (!pvr_laguna_is_wedged(pvr_dev))
+		pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
 
 err_drm_dev_exit:
 	drm_dev_exit(idx);
@@ -515,8 +516,14 @@ pvr_power_get_clear(struct pvr_device *pvr_dev)
 {
 	int err;
 
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev))
+		return -EIO;
+
 	err = pvr_power_get(pvr_dev);
 	if (err == 0)
+		return err;
+
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev))
 		return err;
 
 	drm_warn(from_pvr_device(pvr_dev),
@@ -550,15 +557,20 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 	bool queues_disabled = false;
 	int err;
 
+	if (pvr_laguna_is_wedged(pvr_dev))
+		return -EIO;
+
 	/*
 	 * Take a power reference during the reset. This should prevent any interference with the
 	 * power state during reset.
 	 */
-	WARN_ON(pvr_power_get_clear(pvr_dev));
+	err = pvr_power_get_clear(pvr_dev);
+	if (err)
+		return err;
 
 	down_write(&pvr_dev->reset_sem);
 
-	if (pvr_dev->lost) {
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev)) {
 		err = -EIO;
 		goto err_up_write;
 	}
@@ -582,6 +594,8 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 		}
 
 		err = pvr_power_fw_disable(pvr_dev, hard_reset, false);
+		if (err && pvr_laguna_is_wedged(pvr_dev))
+			goto err_device_lost;
 		if (!err) {
 			if (hard_reset) {
 				WRITE_ONCE(pvr_dev->fw_dev.initialised, false);

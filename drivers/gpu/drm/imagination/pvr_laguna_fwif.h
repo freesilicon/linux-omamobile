@@ -77,6 +77,23 @@
 #define PVR_LAGUNA_CCB_CMD_TYPE_FENCE_PR	(215U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_CCB_CMD_TYPE_PADDING		(221U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 
+/* DDK 25.3 Client CCB command header (16 bytes; no Rogue workest trailer). */
+struct pvr_laguna_fwif_ccb_cmd_header {
+	u32 cmd_type;
+	u32 cmd_size;
+	u32 ext_job_ref;
+	u32 int_job_ref;
+};
+
+static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
+
+/* DDK 25.3 Client CCB control structure size (32 bytes, RGXCreateCCB). */
+#define PVR_LAGUNA_FWIF_CCCB_CTL_SIZE		32U
+
+/* DDK 25.3 default init config flags (HWR_EN | CTXSWITCH_PROFILE_MEDIUM). */
+#define PVR_LAGUNA_FWIF_INICFG_DEFAULT		(BIT(2) | (2U << 16))
+#define PVR_LAGUNA_FWIF_OS_INICFG_DEFAULT	0x1fU
+
 /* DDK 25.3 OS-FW connection states in RGXFWIF_CONNECTION_CTL. */
 #define PVR_LAGUNA_FW_CONN_OS_OFFLINE		0U
 #define PVR_LAGUNA_FW_CONN_OS_READY		1U
@@ -189,6 +206,31 @@ struct pvr_laguna_fwif_dma_addr {
 static_assert(sizeof(struct pvr_laguna_fwif_dma_addr) == 16);
 static_assert(offsetof(struct pvr_laguna_fwif_dma_addr, fw_addr) == 8);
 
+/* DDK 25.3 FW HWPerf data header (40 bytes, RGXSetupFirmware). */
+struct pvr_laguna_fwif_hwperf_data {
+	u32 ridx;
+	u32 widx;
+	u32 wrap_count;
+	u32 buf_size;
+	u32 drop_count;
+	u32 reserved_14[3];
+	u64 filter;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_hwperf_data) == PVR_LAGUNA_FWIF_HWPERFDATA_SIZE);
+static_assert(offsetof(struct pvr_laguna_fwif_hwperf_data, buf_size) == 0x0c);
+static_assert(offsetof(struct pvr_laguna_fwif_hwperf_data, filter) == 0x20);
+
+/* DDK 25.3 FW HWPerf runtime config (40 bytes, META DMA addr at +0x18). */
+struct pvr_laguna_fwif_hwperf_rtcfg {
+	u64 reserved_00;
+	struct pvr_laguna_fwif_dma_addr l1_buf_dma_addr;
+	struct pvr_laguna_fwif_dma_addr hwperf_ctl_dma_addr;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_hwperf_rtcfg) ==
+	      PVR_LAGUNA_FWIF_RUNTIME_HWPERFCFG_SIZE);
+static_assert(offsetof(struct pvr_laguna_fwif_hwperf_rtcfg, l1_buf_dma_addr) == 0x08);
+static_assert(offsetof(struct pvr_laguna_fwif_hwperf_rtcfg, hwperf_ctl_dma_addr) == 0x18);
+
 struct pvr_laguna_fwif_sysinit {
 	u64 fault_phys_addr;
 	u64 pds_exec_base;
@@ -264,14 +306,14 @@ struct pvr_laguna_fwif_fault_info {
 	u64 cr_timer;
 	u64 os_timer;
 	u64 data;
-	char assert_info[200];
 	char assert_path[200];
+	char assert_info[200];
 	u32 line_num;
 	u32 pad_1ac;
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_fault_info) == 0x1b0);
-static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_info) == 0x18);
-static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_path) == 0xe0);
+static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_path) == 0x18);
+static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_info) == 0xe0);
 static_assert(offsetof(struct pvr_laguna_fwif_fault_info, line_num) == 0x1a8);
 
 struct pvr_laguna_fwif_sysdata {

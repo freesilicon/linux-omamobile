@@ -4,6 +4,7 @@
 #ifndef PVR_CCCB_H
 #define PVR_CCCB_H
 
+#include "pvr_laguna_fwif.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_fwif_shared.h"
 
@@ -74,6 +75,14 @@ void pvr_cccb_send_kccb_combined_kick(struct pvr_device *pvr_dev,
 				      bool frag_is_pr);
 bool pvr_cccb_cmdseq_fits(struct pvr_cccb *pvr_cccb, size_t size);
 
+static __always_inline u32
+pvr_cccb_hdr_size(const struct pvr_cccb *pvr_cccb)
+{
+	return pvr_cccb->laguna ?
+	       sizeof(struct pvr_laguna_fwif_ccb_cmd_header) :
+	       sizeof(struct rogue_fwif_ccb_cmd_header);
+}
+
 /**
  * pvr_cccb_get_size_of_cmd_with_hdr() - Get the size of a command and its header.
  * @cmd_size: Command size.
@@ -85,6 +94,13 @@ pvr_cccb_get_size_of_cmd_with_hdr(u32 cmd_size)
 {
 	WARN_ON(!IS_ALIGNED(cmd_size, 8));
 	return sizeof(struct rogue_fwif_ccb_cmd_header) + ALIGN(cmd_size, 8);
+}
+
+static __always_inline u32
+pvr_cccb_get_size_of_cmd_with_hdr_for(const struct pvr_cccb *pvr_cccb, u32 cmd_size)
+{
+	WARN_ON(!IS_ALIGNED(cmd_size, 8));
+	return pvr_cccb_hdr_size(pvr_cccb) + ALIGN(cmd_size, 8);
 }
 
 /**
@@ -107,7 +123,7 @@ pvr_cccb_cmdseq_can_fit(struct pvr_cccb *pvr_cccb, size_t size)
 	 * CCCB capacity, we'd have to queue the padding command and make sure
 	 * the FW is done processing it before queueing our command sequence.
 	 */
-	return size + PADDING_COMMAND_SIZE <= pvr_cccb->size / 2;
+	return size + pvr_cccb_hdr_size(pvr_cccb) <= pvr_cccb->size / 2;
 }
 
 #endif /* PVR_CCCB_H */
