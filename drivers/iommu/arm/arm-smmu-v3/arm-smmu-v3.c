@@ -4411,6 +4411,10 @@ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
 	if (ret)
 		goto err_disable_pasid;
 
+	if (dev != smmu->dev && pm_runtime_enabled(smmu->dev))
+		device_link_add(dev, smmu->dev,
+				DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER);
+
 	arm_smmu_rpm_put(smmu);
 	return &smmu->iommu;
 
