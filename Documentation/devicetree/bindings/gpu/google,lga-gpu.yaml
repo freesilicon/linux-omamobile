@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/google,lga-gpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor G5 (Laguna) Imagination PowerVR Volcanic GPU
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+properties:
+  compatible:
+    items:
+      - const: google,lga-gpu
+      - const: img,img-volcanic
+
+  reg:
+    minItems: 8
+    maxItems: 12
+
+  reg-names:
+    minItems: 8
+    items:
+      - const: rgx
+      - const: pfsm
+      - const: req_pbha_lut
+      - const: ra_lut_0
+      - const: ra_lut_1
+      - const: ra_lut_2
+      - const: mba_glue
+      - const: mba_client
+      - const: gpu_control
+      - const: pvtc
+      - const: pvtc_pwroff
+      - const: dts
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    items:
+      - const: gpu_pf_state
+
+  iommus:
+    minItems: 1
+    maxItems: 2
+
+  iommu-idmapped:
+    type: boolean
+    description:
+      Request an identity (stage-1 bypass) IOMMU domain on gpu_smmu so the
+      PowerVR MMUv4 handles GPU virtual-to-physical translation directly.
+
+  dma-coherent: true
+
+  memory-region:
+    maxItems: 1
+    description:
+      Phandle to the reserved no-map firmware carveout (gpu_fw@b9f00000).
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - power-domains
+  - memory-region
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    gpu@34f00000 {
+        compatible = "google,lga-gpu", "img,img-volcanic";
+        reg = <0x0 0x34f00000 0x0 0x100000>,
+              <0x0 0x34813000 0x0 0xc>,
+              <0x0 0x34e08000 0x0 0x1000>,
+              <0x0 0x34900200 0x0 0x200>,
+              <0x0 0x34901200 0x0 0x200>,
+              <0x0 0x34902200 0x0 0x200>,
+              <0x0 0x34e40000 0x0 0x48>,
+              <0x0 0x34ea0000 0x0 0x4000>;
+        reg-names = "rgx", "pfsm", "req_pbha_lut",
+                    "ra_lut_0", "ra_lut_1", "ra_lut_2",
+                    "mba_glue", "mba_client";
+        interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_HIGH 0>;
+        power-domains = <&sswrp_gpu_pd>;
+        iommus = <&gpu_smmu 0>, <&gpu_smmu 1>;
+        iommu-idmapped;
+        dma-coherent;
+        memory-region = <&gpu_fw_rmem>;
+    };
