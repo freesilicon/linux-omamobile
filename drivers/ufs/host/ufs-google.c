@@ -338,7 +338,7 @@ static int ufs_google_apply_calibration(struct ufs_hba *hba)
 	return 0;
 }
 
-static int ufs_google_pd_on(struct ufs_google_host *ufs)
+static int ufs_google_power_up(struct ufs_google_host *ufs, bool reset_hw)
 {
 	struct ufs_hba *hba = ufs->hba;
 	u32 val;
@@ -362,21 +362,24 @@ static int ufs_google_pd_on(struct ufs_google_host *ufs)
 			goto err_dis_vdd1p2;
 	}
 
-	ufs_google_rmwl_top(ufs, UFS_TOP_PHY_PATCH_MODE_MASK,
-			    FIELD_PREP(UFS_TOP_PHY_PATCH_MODE_MASK,
-				       UFS_TOP_PHY_PATCH_MODE_ROM),
-			    UFS_TOP_PHY_CTRL);
-	ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_0);
-	ufs_google_rmwl_top(ufs, BIT(0), BIT(0), UFS_TOP_CFG_2);
-	ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_1);
-	ufs_google_rmwl_top(ufs, UFS_TOP_PM_CTRL_ISOLATE, 0, UFS_TOP_PM_CTRL);
+	if (reset_hw) {
+		ufs_google_rmwl_top(ufs, UFS_TOP_PHY_PATCH_MODE_MASK,
+				    FIELD_PREP(UFS_TOP_PHY_PATCH_MODE_MASK,
+					       UFS_TOP_PHY_PATCH_MODE_ROM),
+				    UFS_TOP_PHY_CTRL);
+		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_0);
+		ufs_google_rmwl_top(ufs, BIT(0), BIT(0), UFS_TOP_CFG_2);
+		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_1);
+		ufs_google_rmwl_top(ufs, UFS_TOP_PM_CTRL_ISOLATE, 0,
+				    UFS_TOP_PM_CTRL);
 
-	ret = readl_poll_timeout(ufs->ufs_top + UFS_TOP_STATUS, val,
-				 val & UFS_TOP_STATUS_READY, 10,
-				 UFS_GOOGLE_TOP_TIMEOUT_US);
-	if (ret) {
-		dev_err(hba->dev, "ufs_top ready timeout (0x%x)\n", val);
-		goto err_dis_vdd0p75;
+		ret = readl_poll_timeout(ufs->ufs_top + UFS_TOP_STATUS, val,
+					 val & UFS_TOP_STATUS_READY, 10,
+					 UFS_GOOGLE_TOP_TIMEOUT_US);
+		if (ret) {
+			dev_err(hba->dev, "ufs_top ready timeout (0x%x)\n", val);
+			goto err_dis_vdd0p75;
+		}
 	}
 
 	if (ufs->refclk_on) {
@@ -385,12 +388,14 @@ static int ufs_google_pd_on(struct ufs_google_host *ufs)
 			goto err_dis_vdd0p75;
 	}
 
-	if (ufs->reset_gpio)
-		gpiod_set_value_cansleep(ufs->reset_gpio, 0);
-	if (ufs->power_gpio)
-		gpiod_set_value_cansleep(ufs->power_gpio, 1);
+	if (reset_hw) {
+		if (ufs->reset_gpio)
+			gpiod_set_value_cansleep(ufs->reset_gpio, 0);
+		if (ufs->power_gpio)
+			gpiod_set_value_cansleep(ufs->power_gpio, 1);
 
-	usleep_range(1500, 2000);
+		usleep_range(1500, 2000);
+	}
 
 	ret = clk_prepare_enable(ufs->ref_clk);
 	if (ret)
@@ -404,11 +409,14 @@ static int ufs_google_pd_on(struct ufs_google_host *ufs)
 
 	usleep_range(300, 310);
 
-	if (ufs->reset_gpio)
-		gpiod_set_value_cansleep(ufs->reset_gpio, 1);
+	if (reset_hw) {
+		if (ufs->reset_gpio)
+			gpiod_set_value_cansleep(ufs->reset_gpio, 1);
 
-	ufshcd_writel(hba, ufshcd_readl(hba, REG_INTERRUPT_STATUS) & 0xe0000000U,
-		      REG_INTERRUPT_STATUS);
+		ufshcd_writel(hba,
+			      ufshcd_readl(hba, REG_INTERRUPT_STATUS) & 0xe0000000U,
+			      REG_INTERRUPT_STATUS);
+	}
 
 	ufs->pd_on = true;
 	mutex_unlock(&ufs->pd_lock);
@@ -468,7 +476,7 @@ static int ufs_google_pd_notifier(struct notifier_block *nb,
 						   pd_nb);
 
 	if (action == GENPD_NOTIFY_ON)
-		ufs_google_pd_on(ufs);
+		ufs_google_power_up(ufs, true);
 	else if (action == GENPD_NOTIFY_OFF)
 		ufs_google_pd_off(ufs);
 
@@ -597,10 +605,9 @@ static int ufs_google_init(struct ufs_hba *hba)
 	}
 
 	if (ufs->ufs_prep_pd_dev) {
-		pm_runtime_enable(ufs->ufs_prep_pd_dev);
 		ret = pm_runtime_resume_and_get(ufs->ufs_prep_pd_dev);
 		if (ret)
-			goto err_disable_prep_pd;
+			goto err_detach_prep_pd;
 	}
 
 	if (ufs->ufs_pd_dev) {
@@ -609,16 +616,28 @@ static int ufs_google_init(struct ufs_hba *hba)
 		if (ret)
 			goto err_put_prep_pd;
 
-		pm_runtime_enable(ufs->ufs_pd_dev);
 		ret = pm_runtime_resume_and_get(ufs->ufs_pd_dev);
 		if (ret)
 			goto err_rm_notifier;
 	}
 
-	/* Run power-up explicitly if genpd had on-at-init and emitted no transition. */
-	ret = ufs_google_pd_on(ufs);
-	if (ret)
-		goto err_put_pd;
+	if (!ufs->pd_on) {
+		bool boot_active =
+			(readl(ufs->ufs_top + UFS_TOP_STATUS) &
+			 UFS_TOP_STATUS_READY) &&
+			(readl(ufs->ufs_top + UFS_TOP_PHY_CTRL) &
+			 UFS_TOP_PHY_SRAM_INIT_DONE) &&
+			!(readl(ufs->ufs_top + UFS_TOP_PM_CTRL) &
+			  UFS_TOP_PM_CTRL_ISOLATE);
+
+		/*
+		 * Preserve ABL's initialized PHY/UFS state when the domain had
+		 * on-at-init, only taking Linux clock/regulator references.
+		 */
+		ret = ufs_google_power_up(ufs, !boot_active);
+		if (ret)
+			goto err_put_pd;
+	}
 
 	hba->quirks |= UFSHCD_QUIRK_BROKEN_PA_RXHSUNTERMCAP |
 		       UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
@@ -630,16 +649,12 @@ err_put_pd:
 		pm_runtime_put_sync(ufs->ufs_pd_dev);
 err_rm_notifier:
 	if (ufs->ufs_pd_dev) {
-		pm_runtime_disable(ufs->ufs_pd_dev);
 		dev_pm_genpd_remove_notifier(ufs->ufs_pd_dev);
 		dev_pm_domain_detach(ufs->ufs_pd_dev, true);
 	}
 err_put_prep_pd:
 	if (ufs->ufs_prep_pd_dev)
 		pm_runtime_put_sync(ufs->ufs_prep_pd_dev);
-err_disable_prep_pd:
-	if (ufs->ufs_prep_pd_dev)
-		pm_runtime_disable(ufs->ufs_prep_pd_dev);
 err_detach_prep_pd:
 	if (ufs->ufs_prep_pd_dev)
 		dev_pm_domain_detach(ufs->ufs_prep_pd_dev, true);
@@ -655,13 +670,11 @@ static void ufs_google_exit(struct ufs_hba *hba)
 	if (ufs->ufs_pd_dev) {
 		pm_runtime_put_sync(ufs->ufs_pd_dev);
 		dev_pm_genpd_remove_notifier(ufs->ufs_pd_dev);
-		pm_runtime_disable(ufs->ufs_pd_dev);
 		dev_pm_domain_detach(ufs->ufs_pd_dev, true);
 	}
 
 	if (ufs->ufs_prep_pd_dev) {
 		pm_runtime_put_sync(ufs->ufs_prep_pd_dev);
-		pm_runtime_disable(ufs->ufs_prep_pd_dev);
 		dev_pm_domain_detach(ufs->ufs_prep_pd_dev, true);
 	}
 }
@@ -809,12 +822,13 @@ static int ufs_google_device_reset(struct ufs_hba *hba)
 {
 	struct ufs_google_host *ufs = ufshcd_get_variant(hba);
 
-	if (!ufs->reset_gpio)
+	if (!ufs->reset_gpio || hba->dev_info.wmanufacturerid != UFS_VENDOR_MICRON)
 		return 0;
 
 	gpiod_set_value_cansleep(ufs->reset_gpio, 0);
 	usleep_range(200, 300);
 	gpiod_set_value_cansleep(ufs->reset_gpio, 1);
+	usleep_range(10000, 15000);
 
 	return 0;
 }
@@ -895,7 +909,12 @@ static irqreturn_t ufs_google_mcq_intr(int irq, void *data)
 	if (events)
 		ufshcd_mcq_write_cqis(hba, events, m->qid);
 
-	ufshcd_mcq_poll_cqe_lock(hba, hwq);
+	writel(UFS_GOOGLE_MCQIACR_CFG,
+	       hba->mcq_opr[OPR_CQIS].base +
+	       hba->mcq_opr[OPR_CQIS].stride * m->qid + REG_MCQIACR);
+
+	if (events & UFSHCD_MCQ_CQIS_TAIL_ENT_PUSH_STS)
+		ufshcd_mcq_poll_cqe_lock(hba, hwq);
 
 	return IRQ_HANDLED;
 }
