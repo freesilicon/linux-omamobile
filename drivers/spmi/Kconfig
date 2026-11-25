@@ -54,6 +54,16 @@ config SPMI_MTK_PMIF
 	  This is required for communicating with Mediatek PMICs and
 	  other devices that have the SPMI interface.
 
+config SPMI_BITBANG
+	tristate "GPIO bit-banged SPMI controller"
+	depends on GPIOLIB || COMPILE_TEST
+	depends on OF || COMPILE_TEST
+	help
+	  This enables a GPIO bit-banged SPMI master controller used on
+	  Google Tensor platforms to access sideband SPMI peripherals such
+	  as modem reference clock buffers and companion PMIC registers
+	  over dedicated clock and data GPIOs.
+
 config SPMI_SMARTDV
 	tristate "SmartDV SPMI Controller"
 	depends on HAS_IOMEM
