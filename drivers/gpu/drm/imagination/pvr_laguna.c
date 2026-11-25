@@ -304,6 +304,7 @@ static void pvr_laguna_tz_handle_event(void *data, int event)
 {
 	struct pvr_laguna_tz *tz = data;
 
+	WRITE_ONCE(tz->last_event, event);
 	complete(&tz->reply);
 }
 
@@ -330,6 +331,7 @@ static int pvr_laguna_tz_connect(struct pvr_laguna_tz *tz)
 	if (IS_ERR(chan))
 		return PTR_ERR(chan);
 
+	WRITE_ONCE(tz->last_event, 0);
 	reinit_completion(&tz->reply);
 	ret = tipc_chan_connect(chan, tz->port);
 	if (ret < 0)
@@ -338,6 +340,12 @@ static int pvr_laguna_tz_connect(struct pvr_laguna_tz *tz)
 	if (!wait_for_completion_timeout(&tz->reply,
 					 msecs_to_jiffies(PVR_LAGUNA_TZ_CON_TIMEOUT_MS))) {
 		ret = -ETIMEDOUT;
+		tipc_chan_shutdown(chan);
+		goto err_destroy;
+	}
+
+	if (READ_ONCE(tz->last_event) != TIPC_CHANNEL_CONNECTED) {
+		ret = -ECONNREFUSED;
 		tipc_chan_shutdown(chan);
 		goto err_destroy;
 	}
@@ -407,6 +415,11 @@ detach:
 	tz->rsp_buf = NULL;
 	tz->rsp_size = 0;
 	mutex_unlock(&tz->rsp_lock);
+	if (READ_ONCE(tz->last_event) != TIPC_CHANNEL_CONNECTED) {
+		pvr_laguna_tz_close(tz);
+		if (ret == -ENOMSG)
+			ret = -ECONNRESET;
+	}
 out_unlock:
 	mutex_unlock(&tz->req_lock);
 	return ret;
@@ -699,6 +712,7 @@ static int pvr_laguna_parse_fw_carveout(struct device *dev,
 {
 	struct device_node *rmem_np;
 	struct resource rmem_res;
+	resource_size_t size;
 	int err;
 
 	rmem_np = of_parse_phandle(dev->of_node, "memory-region", 0);
@@ -712,14 +726,14 @@ static int pvr_laguna_parse_fw_carveout(struct device *dev,
 		return dev_err_probe(dev, err,
 				     "failed to resolve gpu_fw reserved memory\n");
 
-	if (resource_size(&rmem_res) < PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE)
+	size = resource_size(&rmem_res);
+	if (size < PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE)
 		return dev_err_probe(dev, -EINVAL,
 				     "gpu_fw carveout too small (%pap < %llu)\n",
-				     &rmem_res.end,
-				     PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE);
+				     &size, PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE);
 
 	laguna->fw_carveout_phys = rmem_res.start;
-	laguna->fw_carveout_size = resource_size(&rmem_res);
+	laguna->fw_carveout_size = size;
 	return 0;
 }
 

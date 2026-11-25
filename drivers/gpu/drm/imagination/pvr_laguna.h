@@ -80,6 +80,7 @@ struct pvr_laguna_tz {
 	void *rsp_buf;
 	size_t rsp_size;
 	int rsp_res;
+	int last_event;
 };
 
 /**
