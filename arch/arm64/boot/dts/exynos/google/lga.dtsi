@@ -210,7 +210,7 @@
 			no-map;
 		};
 
-		gpu_fw@b9f00000 {
+		gpu_fw_rmem: gpu_fw@b9f00000 {
 			reg = <0x0 0xb9f00000 0x0 0x2100000>;
 			no-map;
 		};
@@ -1865,6 +1865,44 @@
 			      <0x0 0x34f00000 0x0 0x100>;
 			reg-names = "gpu_control", "pvtc", "pvtc_pwroff", "dts", "rgx";
 			power-domains = <&sswrp_gpu_pd>;
+			status = "disabled";
+		};
+
+		gpu_smmu: iommu@34c00000 {
+			compatible = "arm,smmu-v3";
+			reg = <0x0 0x34c00000 0x0 0x40000>;
+			dma-coherent;
+			power-domains = <&sswrp_gpu_pd>;
+			#iommu-cells = <1>;
+			arm,instdata-override;
+			arm,max-sid-bits = <8>;
+			status = "disabled";
+		};
+
+		gpu0: gpu@34f00000 {
+			compatible = "google,lga-gpu", "img,img-volcanic";
+			reg = <0x0 0x34f00000 0x0 0x100000>,
+			      <0x0 0x34813000 0x0 0xc>,
+			      <0x0 0x34e08000 0x0 0x1000>,
+			      <0x0 0x34900200 0x0 0x200>,
+			      <0x0 0x34901200 0x0 0x200>,
+			      <0x0 0x34902200 0x0 0x200>,
+			      <0x0 0x34e40000 0x0 0x48>,
+			      <0x0 0x34ea0000 0x0 0x4000>,
+			      <0x0 0x3480a000 0x0 0x4>,
+			      <0x0 0x34826000 0x0 0x400>,
+			      <0x0 0x34820a30 0x0 0x10>,
+			      <0x0 0x34855c40 0x0 0x10>;
+			reg-names = "rgx", "pfsm", "req_pbha_lut",
+				    "ra_lut_0", "ra_lut_1", "ra_lut_2",
+				    "mba_glue", "mba_client",
+				    "gpu_control", "pvtc", "pvtc_pwroff", "dts";
+			interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_gpu_pd>;
+			iommus = <&gpu_smmu 0>, <&gpu_smmu 1>;
+			iommu-idmapped;
+			dma-coherent;
+			memory-region = <&gpu_fw_rmem>;
 			status = "disabled";
 		};
 	};
