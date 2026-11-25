@@ -4,6 +4,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -115,6 +116,7 @@ struct dw_cdphy_g301 {
 	u32 lanes;
 	bool configured;
 	bool clk_enabled;
+	bool pll_boot_on;
 	struct g301_pll_cfg pll;
 	struct g301_dphy_timings timings;
 };
@@ -125,6 +127,75 @@ static inline void cdphy_rmw(void __iomem *reg, u32 mask, u32 val)
 
 	cur = (cur & ~mask) | (val & mask);
 	writel(cur, reg);
+}
+
+static void cdphy_rmw_lanes(void __iomem *base, u32 reg0, unsigned int count,
+			    u32 mask, u32 val)
+{
+	unsigned int n;
+
+	for (n = 0; n < count; n++)
+		cdphy_rmw(base + reg0 + n * 0x800, mask, val);
+}
+
+static void cdphy_set_lane_din(struct dw_cdphy_g301 *ctx, bool dp, bool dn)
+{
+	u32 val = (dp ? CDPHY_LANE_2_3_LPTX_DIN_DP_VAL : 0) |
+		  (dn ? CDPHY_LANE_2_3_LPTX_DIN_DN_VAL : 0);
+
+	cdphy_rmw_lanes(ctx->base, CDPHY_AFE_LANE_CTRL_2_3(0), 5,
+			CDPHY_LANE_2_3_LPTX_DIN_MASK, val);
+}
+
+static void cdphy_prepare_lp11_ovr(struct dw_cdphy_g301 *ctx)
+{
+	void __iomem *b = ctx->base;
+
+	/* Drive LP00 -> LP10 -> LP11 on the AFE before releasing reset. */
+	cdphy_set_lane_din(ctx, false, false);
+	cdphy_rmw_lanes(b, CDPHY_AFE_LANE_CTRL_2_4(0), 5,
+			CDPHY_LANE_2_4_LPTX_DIN_OVR_EN_MASK,
+			CDPHY_LANE_2_4_LPTX_DIN_OVR_EN_MASK);
+	cdphy_rmw_lanes(b, CDPHY_AFE_LANE_CTRL_2_7(0), 5,
+			CDPHY_LANE_2_7_LPTX_EN_PON_VAL_MASK,
+			CDPHY_LANE_2_7_LPTX_EN_PON_VAL_MASK);
+	cdphy_rmw_lanes(b, CDPHY_AFE_LANE_CTRL_2_8(0), 5,
+			CDPHY_LANE_2_8_LPTX_EN_PON_OVR_MASK,
+			CDPHY_LANE_2_8_LPTX_EN_PON_OVR_MASK);
+	udelay(1);
+	cdphy_set_lane_din(ctx, true, false);
+	udelay(1);
+	cdphy_set_lane_din(ctx, true, true);
+	udelay(1);
+	cdphy_rmw_lanes(b, CDPHY_DPHY_PPI_LANE_OVR_0_8(0), 4,
+			CDPHY_PPI_LANE_TURN_OVR_MASK,
+			CDPHY_PPI_LANE_TURN_OVR_MASK);
+}
+
+static void cdphy_clear_lane_ovr(struct dw_cdphy_g301 *ctx)
+{
+	void __iomem *b = ctx->base;
+
+	cdphy_rmw_lanes(b, CDPHY_AFE_LANE_CTRL_2_4(0), 5,
+			CDPHY_LANE_2_4_LPTX_DIN_OVR_EN_MASK, 0);
+	cdphy_rmw_lanes(b, CDPHY_AFE_LANE_CTRL_2_8(0), 5,
+			CDPHY_LANE_2_8_LPTX_EN_PON_OVR_MASK, 0);
+	cdphy_rmw_lanes(b, CDPHY_DPHY_PPI_LANE_OVR_0_8(0), 4,
+			CDPHY_PPI_LANE_TURN_OVR_MASK, 0);
+}
+
+static void cdphy_dump_diag(struct dw_cdphy_g301 *ctx, const char *ctx_str)
+{
+	dev_err(ctx->dev,
+		"CDPHY %s: sts=%#x c0=%#x e0=%#x e1=%#x ppi=%#x c9=%#x a2=%#x\n",
+		ctx_str,
+		readl(ctx->apb + CDPHY_PHY_STS),
+		readl(ctx->apb + CDPHY_PHY_CTRL0),
+		readl(ctx->apb + CDPHY_PHY_EXT_CTRL0),
+		readl(ctx->apb + CDPHY_PHY_EXT_CTRL1),
+		readl(ctx->base + CDPHY_COMMON_PPI_OVR_0_12),
+		readl(ctx->base + CDPHY_COMMON_9),
+		readl(ctx->base + CDPHY_ANACTRL_2));
 }
 
 static int cdphy_calc_pll(u32 datarate_mbps, u32 clkin_khz, struct g301_pll_cfg *out)
@@ -294,8 +365,12 @@ static void cdphy_program_dphy(struct dw_cdphy_g301 *ctx)
 
 	for (n = 0; n < 5; n++) {
 		cdphy_rmw(b + CDPHY_AFE_LANE_CTRL_2_2(n), BIT(0), (n == 2) ? BIT(0) : 0);
-		cdphy_rmw(b + CDPHY_AFE_LANE_CTRL_2_3(n), BIT(4), (n == 2) ? 0 : BIT(4));
+		cdphy_rmw(b + CDPHY_AFE_LANE_CTRL_2_3(n),
+			  CDPHY_LANE_2_3_HSTX_SEL_CLKLB | BIT(4),
+			  (n == 2) ? 0 : BIT(4));
 	}
+	cdphy_rmw(b + CDPHY_AFE_CB_CTRL_2_4, CDPHY_CB_2_4_VCOMM_PROG_MASK,
+		  FIELD_PREP(CDPHY_CB_2_4_VCOMM_PROG_MASK, 3));
 }
 
 static void cdphy_program_extra(struct dw_cdphy_g301 *ctx)
@@ -312,6 +387,7 @@ static void cdphy_program_extra(struct dw_cdphy_g301 *ctx)
 	cdphy_rmw(b + CDPHY_AFE_CB_CTRL_2_6, BIT(13) | BIT(14), BIT(13) | BIT(14));
 	cdphy_rmw(b + CDPHY_AFE_CB_CTRL_2_7, BIT(9) | BIT(10), 0);
 	cdphy_rmw(b + CDPHY_AFE_CB_CTRL_2_4, BIT(15), 0);
+	cdphy_rmw_lanes(b, CDPHY_CLANE_LP_0(0), 3, GENMASK(15, 8), (6U << 8) | (1U << 12));
 
 	cdphy_rmw(b + CDPHY_ANACTRL_2, GENMASK(13, 12), 0);
 }
@@ -368,6 +444,8 @@ static int dw_cdphy_g301_init(struct phy *phy)
 		ctx->clk_enabled = true;
 	}
 
+	ctx->pll_boot_on = !!(readl(ctx->base + CDPHY_COMMON_9) & CDPHY_COMMON9_PLL_ENABLED);
+
 	return 0;
 }
 
@@ -412,13 +490,19 @@ static int dw_cdphy_g301_configure(struct phy *phy, union phy_configure_opts *op
 	cdphy_calc_dphy_timings(ctx->datarate_mbps, &ctx->timings);
 
 	cdphy_rmw(ctx->apb + CDPHY_PHY_CTRL0,
-		  CDPHY_CTRL0_PHY_RST_N | CDPHY_CTRL0_SHUTDOWN_N, 0);
+		  CDPHY_CTRL0_PHY_RST_N | CDPHY_CTRL0_SHUTDOWN_N |
+		  CDPHY_CTRL0_PHY_MODE_CPHY | CDPHY_CTRL0_TEST_STOP_CLK_EN |
+		  CDPHY_CTRL0_BIST_EN, 0);
+	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL0, CDPHY_EXT0_CLEAR_MASK, 0);
 	cdphy_rmw(ctx->base + CDPHY_HSTX_FIFO_CFG, BIT(0), 0);
 
 	stop_mask = CDPHY_EXT1_FORCETXSTOP_DCK | CDPHY_EXT1_FORCETXSTOP_0 |
 		    CDPHY_EXT1_FORCETXSTOP_1 | CDPHY_EXT1_FORCETXSTOP_2 |
 		    CDPHY_EXT1_FORCETXSTOP_3;
-	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1, stop_mask, stop_mask);
+	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1,
+		  CDPHY_EXT1_ENABLE_MASK | CDPHY_EXT1_CONT_EN_MASK | stop_mask,
+		  stop_mask);
+	cdphy_rmw(ctx->base + CDPHY_ANACTRL_2, GENMASK(13, 12), 0);
 
 	cdphy_program_common(ctx);
 	cdphy_program_dphy(ctx);
@@ -428,30 +512,35 @@ static int dw_cdphy_g301_configure(struct phy *phy, union phy_configure_opts *op
 	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1, GENMASK(23, 16),
 		  CDPHY_EXT1_TXDATAWIDTHHS_ALL_16B);
 
+	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1, stop_mask, 0);
+	cdphy_prepare_lp11_ovr(ctx);
+
 	cdphy_rmw(ctx->apb + CDPHY_PHY_CTRL0,
 		  CDPHY_CTRL0_PHY_MODE_CPHY | CDPHY_CTRL0_SHUTDOWN_N | CDPHY_CTRL0_PHY_RST_N,
 		  CDPHY_CTRL0_SHUTDOWN_N | CDPHY_CTRL0_PHY_RST_N);
+	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1, stop_mask, stop_mask);
 
 	ret = readl_poll_timeout(ctx->apb + CDPHY_PHY_STS, sts,
 				 sts & CDPHY_STS_PHY_READY, 50, G301_PHY_STATUS_TIMEOUT_US);
 	if (ret) {
-		dev_err(ctx->dev, "CDPHY ready timeout (sts=%#x)\n", sts);
+		cdphy_dump_diag(ctx, "ready_timeout");
 		return ret;
 	}
 
 	ret = readl_poll_timeout(ctx->apb + CDPHY_PHY_STS, sts,
 				 sts & CDPHY_STS_PLL_LOCK, 50, G301_PHY_STATUS_TIMEOUT_US);
 	if (ret) {
-		dev_err(ctx->dev, "CDPHY PLL lock timeout (sts=%#x)\n", sts);
+		cdphy_dump_diag(ctx, "pll_lock_timeout");
 		return ret;
 	}
 
 	cdphy_rmw(ctx->apb + CDPHY_PLL_CFG0, GENMASK(2, 1), FIELD_PREP(GENMASK(2, 1), 1));
 	ctx->configured = true;
 
-	dev_info(ctx->dev, "CDPHY G301 locked at %u Mbps (ref=%u kHz, ppi=%#x)\n",
+	dev_info(ctx->dev, "CDPHY G301 locked at %u Mbps (ref=%u kHz, ppi=%#x, boot=%u)\n",
 		 ctx->datarate_mbps, clkin_khz,
-		 readl(ctx->base + CDPHY_COMMON_PPI_OVR_0_12) & 0x1f);
+		 readl(ctx->base + CDPHY_COMMON_PPI_OVR_0_12) & 0x1f,
+		 ctx->pll_boot_on);
 
 	return 0;
 }
@@ -463,6 +552,7 @@ static int dw_cdphy_g301_power_on(struct phy *phy)
 			CDPHY_EXT1_FORCETXSTOP_1 | CDPHY_EXT1_FORCETXSTOP_2 |
 			CDPHY_EXT1_FORCETXSTOP_3;
 
+	cdphy_clear_lane_ovr(ctx);
 	cdphy_rmw(ctx->apb + CDPHY_PHY_EXT_CTRL1, stop_mask, 0);
 	return 0;
 }
@@ -471,6 +561,7 @@ static int dw_cdphy_g301_power_off(struct phy *phy)
 {
 	struct dw_cdphy_g301 *ctx = phy_get_drvdata(phy);
 
+	cdphy_clear_lane_ovr(ctx);
 	cdphy_rmw(ctx->apb + CDPHY_PHY_CTRL0,
 		  CDPHY_CTRL0_SHUTDOWN_N | CDPHY_CTRL0_PHY_RST_N, 0);
 	return 0;

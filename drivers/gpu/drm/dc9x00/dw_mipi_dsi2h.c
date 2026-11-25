@@ -420,8 +420,10 @@ static void dw_dsi2h_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 
 	if (readl_poll_timeout(ctx->regs + DSI2H_PHY_STATUS, phy_sts,
 			       (phy_sts & DSI2H_PHY_STOPSTATE_ALL) == DSI2H_PHY_STOPSTATE_ALL,
-			       DSI2H_POLL_INTERVAL_US, 10000))
+			       DSI2H_POLL_INTERVAL_US, 10000)) {
 		dev_warn(ctx->dev, "DSI2H PHY stopstate incomplete (phy=%#x)\n", phy_sts);
+		dw_dsi2h_dump_diag(ctx, "phy_stopstate_timeout");
+	}
 
 	dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_DATA_STREAM);
 	ctx->host_ready = true;
