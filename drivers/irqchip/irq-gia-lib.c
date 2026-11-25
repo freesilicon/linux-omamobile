@@ -801,6 +801,28 @@ static int gia_irq_get_irqchip_state(struct irq_data *d,
 	return 0;
 }
 
+static int gia_irq_set_irqchip_state(struct irq_data *d,
+				     enum irqchip_irq_state which, bool state)
+{
+	struct gia_device_data *gdd = d->domain->host_data;
+	unsigned int chip_number = d->hwirq / IRQS_PER_REG;
+	u32 mask = 1U << (d->hwirq % IRQS_PER_REG);
+	unsigned long flags;
+
+	if (which != IRQCHIP_STATE_PENDING || state ||
+	    !gdd->type_data->clear_status_reg)
+		return -EINVAL;
+
+	gia_lock_process_context(&gdd->lock, &flags);
+	writel_relaxed(mask, gia_reg_addr(gdd, gdd->type_data->status_offset, chip_number));
+	if (gdd->type_data->check_overflow_reg)
+		writel_relaxed(mask, gia_reg_addr(gdd, gdd->type_data->status_overflow_offset,
+						  chip_number));
+	gia_unlock_process_context(&gdd->lock, &flags);
+
+	return 0;
+}
+
 /*
  * gia_irq_update_affinity_downstream: This function updates 'effective_affinity' for all child
  *				     irq sources under the GIA.
@@ -944,6 +966,7 @@ static struct irq_chip gia_irq_chip = {
 	.irq_ack = gia_irq_ack,
 	.irq_eoi = gia_irq_eoi,
 	.irq_get_irqchip_state  = gia_irq_get_irqchip_state,
+	.irq_set_irqchip_state  = gia_irq_set_irqchip_state,
 	.irq_bus_lock = gia_irq_bus_lock,
 	.irq_bus_sync_unlock = gia_irq_bus_sync_unlock,
 	.irq_set_affinity = gia_irq_set_affinity,
