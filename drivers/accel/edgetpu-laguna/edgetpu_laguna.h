@@ -57,6 +57,7 @@ struct sg_table;
 #define LAGUNA_REG_IREMAP_AXIUSER_CORE0	0x1900b0
 
 #define LAGUNA_REG_LPM_CONTROL		0x1e0028
+#define LAGUNA_REG_LPM_STATUS		0x1e0030
 #define LAGUNA_LPM_CTL_PWR_STATE	BIT(0)
 
 /* CPM LPB status CSR for TPU SSWRP power check */
@@ -629,6 +630,7 @@ struct edgetpu_laguna_dev {
 
 	struct mutex fw_lock;
 	bool fw_loaded;
+	bool fw_running;
 	bool fw_is_ns;
 	phys_addr_t fw_paddr;
 	size_t fw_region_size;
@@ -689,10 +691,13 @@ void edgetpu_laguna_iremap_free(struct edgetpu_laguna_dev *etdev,
 				struct laguna_iremap_mem *mem);
 int edgetpu_laguna_pm_get(struct edgetpu_laguna_dev *etdev);
 void edgetpu_laguna_pm_put(struct edgetpu_laguna_dev *etdev);
+int edgetpu_laguna_runtime_suspend(struct edgetpu_laguna_dev *etdev);
+int edgetpu_laguna_runtime_resume(struct edgetpu_laguna_dev *etdev);
 
 /* Mailbox, KCI & IKV */
 int edgetpu_laguna_kci_init(struct edgetpu_laguna_dev *etdev);
 int edgetpu_laguna_kci_reinit(struct edgetpu_laguna_dev *etdev);
+void edgetpu_laguna_kci_cancel_work(struct edgetpu_laguna_dev *etdev);
 void edgetpu_laguna_kci_exit(struct edgetpu_laguna_dev *etdev);
 int edgetpu_laguna_kci_exchange_info(struct edgetpu_laguna_dev *etdev,
 				     struct laguna_fw_info *info);

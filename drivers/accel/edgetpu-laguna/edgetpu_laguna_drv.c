@@ -98,6 +98,9 @@ static int laguna_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_iommu;
 
+	pm_runtime_set_suspended(dev);
+	pm_runtime_set_autosuspend_delay(dev, 2000);
+	pm_runtime_use_autosuspend(dev);
 	pm_runtime_enable(dev);
 
 	ret = edgetpu_laguna_fs_register(etdev);
@@ -109,6 +112,7 @@ static int laguna_probe(struct platform_device *pdev)
 	return 0;
 
 err_pm:
+	pm_runtime_dont_use_autosuspend(dev);
 	pm_runtime_disable(dev);
 	edgetpu_laguna_fw_exit(etdev);
 err_iommu:
@@ -121,6 +125,8 @@ static void laguna_remove(struct platform_device *pdev)
 	struct edgetpu_laguna_dev *etdev = platform_get_drvdata(pdev);
 
 	edgetpu_laguna_fs_unregister(etdev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_suspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	edgetpu_laguna_fw_exit(etdev);
 	edgetpu_laguna_iommu_exit(etdev);
@@ -128,12 +134,16 @@ static void laguna_remove(struct platform_device *pdev)
 
 static int laguna_runtime_suspend(struct device *dev)
 {
-	return 0;
+	struct edgetpu_laguna_dev *etdev = dev_get_drvdata(dev);
+
+	return edgetpu_laguna_runtime_suspend(etdev);
 }
 
 static int laguna_runtime_resume(struct device *dev)
 {
-	return 0;
+	struct edgetpu_laguna_dev *etdev = dev_get_drvdata(dev);
+
+	return edgetpu_laguna_runtime_resume(etdev);
 }
 
 static DEFINE_RUNTIME_DEV_PM_OPS(laguna_pm_ops, laguna_runtime_suspend,

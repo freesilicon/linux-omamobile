@@ -68,6 +68,7 @@ static int laguna_mbox_program_queues(struct laguna_mailbox *mbox,
 	if ((cmd_hi & ~0xfU) || (rsp_hi & ~0xfU))
 		return -EINVAL;
 
+	mbox_write32(mbox, LAGUNA_MBOX_CTX_ENABLE, 0);
 	mbox_write32(mbox, LAGUNA_MBOX_CTX_CMD_DB_EN, 0);
 	mbox_write32(mbox, LAGUNA_MBOX_CTX_RSP_DB_EN, 0);
 	mbox_write32(mbox, LAGUNA_MBOX_RSPQ_DB_CLR, 1);
@@ -399,6 +400,7 @@ err_wq:
 int edgetpu_laguna_kci_reinit(struct edgetpu_laguna_dev *etdev)
 {
 	struct laguna_kci *kci = &etdev->kci;
+	unsigned long flags;
 
 	if (!kci->mbox)
 		return -ENODEV;
@@ -407,11 +409,25 @@ int edgetpu_laguna_kci_reinit(struct edgetpu_laguna_dev *etdev)
 	memset(kci->rspq_mem.vaddr, 0, kci->rspq_mem.size);
 	dma_wmb();
 
+	atomic64_set(&kci->seq, 0);
+	spin_lock_irqsave(&kci->rkci_lock, flags);
+	kci->rkci_head = 0;
+	kci->rkci_tail = 0;
+	spin_unlock_irqrestore(&kci->rkci_lock, flags);
+
 	mbox_write32(kci->mbox, LAGUNA_MBOX_CTX_SPARE_0,
 		     LAGUNA_DRIVER_FW_IFACE_VERSION);
 	return laguna_mbox_program_queues(kci->mbox,
 					  kci->cmdq_mem.daddr, LAGUNA_KCI_QUEUE_SIZE,
 					  kci->rspq_mem.daddr, LAGUNA_KCI_QUEUE_SIZE);
+}
+
+void edgetpu_laguna_kci_cancel_work(struct edgetpu_laguna_dev *etdev)
+{
+	struct laguna_kci *kci = &etdev->kci;
+
+	if (kci->rkci_wq)
+		cancel_work_sync(&kci->rkci_work);
 }
 
 void edgetpu_laguna_kci_exit(struct edgetpu_laguna_dev *etdev)
@@ -664,6 +680,7 @@ err_mbox:
 int edgetpu_laguna_ikv_reinit(struct edgetpu_laguna_dev *etdev)
 {
 	struct laguna_ikv *ikv = &etdev->ikv;
+	unsigned long flags;
 
 	if (!ikv->mbox)
 		return -ENODEV;
@@ -671,6 +688,11 @@ int edgetpu_laguna_ikv_reinit(struct edgetpu_laguna_dev *etdev)
 	memset(ikv->cmdq_mem.vaddr, 0, ikv->cmdq_mem.size);
 	memset(ikv->rspq_mem.vaddr, 0, ikv->rspq_mem.size);
 	dma_wmb();
+
+	spin_lock_irqsave(&ikv->inflight_lock, flags);
+	if (list_empty(&ikv->inflight))
+		atomic_set(&ikv->seq, 0);
+	spin_unlock_irqrestore(&ikv->inflight_lock, flags);
 
 	return laguna_mbox_program_queues(ikv->mbox,
 					  ikv->cmdq_mem.daddr, LAGUNA_IKV_QUEUE_SIZE,

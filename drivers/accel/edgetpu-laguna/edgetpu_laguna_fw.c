@@ -641,6 +641,7 @@ int edgetpu_laguna_fw_boot(struct edgetpu_laguna_dev *etdev)
 		dev_warn(etdev->dev, "KCI telemetry setup warning: %d\n", ret);
 
 	etdev->fw_loaded = true;
+	etdev->fw_running = true;
 	dev_info(etdev->dev, "EdgeTPU firmware ready (version %u.%u, cl=%u)\n",
 		 etdev->fw_versions[0], etdev->fw_versions[1],
 		 etdev->fw_info.fw_changelist);
@@ -652,6 +653,27 @@ out_stop:
 out_rel:
 	release_firmware(fw);
 	return ret;
+}
+
+static int laguna_wait_block_off(struct edgetpu_laguna_dev *etdev)
+{
+	int tries;
+	u32 val = 0;
+
+	if (!etdev->lpb_regs)
+		return 0;
+
+	for (tries = 0; tries < 1000; tries++) {
+		val = readl(etdev->lpb_regs + LAGUNA_LPB_TPU_INT_STATUS);
+		if ((val & LAGUNA_LPB_TPU_INT_MASK) == LAGUNA_LPB_TPU_INT_OFF)
+			return 0;
+		usleep_range(1000, 1500);
+	}
+
+	dev_err(etdev->dev,
+		"TPU SSWRP block did not power off before resume (LPB=%#x)\n",
+		val);
+	return -EAGAIN;
 }
 
 int edgetpu_laguna_fw_restart(struct edgetpu_laguna_dev *etdev)
@@ -666,36 +688,74 @@ int edgetpu_laguna_fw_restart(struct edgetpu_laguna_dev *etdev)
 		return ret;
 
 	ret = laguna_reset_cpu(etdev, false);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(etdev->dev, "TPU CPU start on restart failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = edgetpu_laguna_kci_exchange_info(etdev, &etdev->fw_info);
 	if (ret) {
+		dev_err(etdev->dev, "KCI restart handshake failed: %d\n", ret);
 		laguna_reset_cpu(etdev, true);
 		return ret;
 	}
 
-	edgetpu_laguna_kci_map_telemetry(etdev);
+	ret = edgetpu_laguna_kci_map_telemetry(etdev);
+	if (ret)
+		dev_warn(etdev->dev, "KCI restart telemetry setup warning: %d\n", ret);
+
+	etdev->fw_running = true;
 	return 0;
 }
 
 void edgetpu_laguna_fw_stop(struct edgetpu_laguna_dev *etdev)
 {
-	int tries;
+	int tries, ret;
+	u32 lpm_ctl = 0;
 
-	if (!etdev->fw_loaded)
+	if (!etdev->fw_loaded || !etdev->fw_running)
 		return;
 
-	edgetpu_laguna_kci_shutdown(etdev);
+	ret = edgetpu_laguna_kci_shutdown(etdev);
+	if (ret)
+		dev_warn(etdev->dev, "KCI shutdown failed: %d\n", ret);
 
 	for (tries = 0; tries < 100; tries++) {
-		if (!(laguna_read32(etdev, LAGUNA_REG_LPM_CONTROL) &
-		      LAGUNA_LPM_CTL_PWR_STATE))
-			break;
 		usleep_range(200, 250);
+		lpm_ctl = laguna_read32(etdev, LAGUNA_REG_LPM_CONTROL);
+		if (!(lpm_ctl & LAGUNA_LPM_CTL_PWR_STATE))
+			break;
 	}
+	if (lpm_ctl & LAGUNA_LPM_CTL_PWR_STATE)
+		dev_warn(etdev->dev,
+			 "TPU LPM did not power down (ctl=%#x status=%#x)\n",
+			 lpm_ctl, laguna_read32(etdev, LAGUNA_REG_LPM_STATUS));
 
 	laguna_reset_cpu(etdev, true);
+	edgetpu_laguna_kci_cancel_work(etdev);
+	etdev->fw_running = false;
+}
+
+int edgetpu_laguna_runtime_suspend(struct edgetpu_laguna_dev *etdev)
+{
+	mutex_lock(&etdev->fw_lock);
+	edgetpu_laguna_fw_stop(etdev);
+	mutex_unlock(&etdev->fw_lock);
+	return 0;
+}
+
+int edgetpu_laguna_runtime_resume(struct edgetpu_laguna_dev *etdev)
+{
+	int ret = 0;
+
+	mutex_lock(&etdev->fw_lock);
+	if (!etdev->fw_loaded)
+		ret = edgetpu_laguna_fw_boot(etdev);
+	else if (!etdev->fw_running)
+		ret = edgetpu_laguna_fw_restart(etdev);
+	mutex_unlock(&etdev->fw_lock);
+
+	return ret;
 }
 
 int edgetpu_laguna_pm_get(struct edgetpu_laguna_dev *etdev)
@@ -708,28 +768,40 @@ int edgetpu_laguna_pm_get(struct edgetpu_laguna_dev *etdev)
 		return 0;
 	}
 
+	if (pm_runtime_get_if_active(etdev->dev) > 0) {
+		etdev->powered = true;
+		mutex_unlock(&etdev->pm_lock);
+		return 0;
+	}
+
+	pm_runtime_barrier(etdev->dev);
+
+	if (pm_runtime_get_if_active(etdev->dev) > 0) {
+		etdev->powered = true;
+		mutex_unlock(&etdev->pm_lock);
+		return 0;
+	}
+
+	if (etdev->fw_loaded) {
+		ret = laguna_wait_block_off(etdev);
+		if (ret) {
+			etdev->power_ref--;
+			mutex_unlock(&etdev->pm_lock);
+			return ret;
+		}
+	}
+
 	ret = pm_runtime_resume_and_get(etdev->dev);
 	if (ret < 0) {
+		pm_runtime_set_suspended(etdev->dev);
 		etdev->power_ref--;
 		mutex_unlock(&etdev->pm_lock);
 		return ret;
 	}
 
-	mutex_lock(&etdev->fw_lock);
-	if (!etdev->fw_loaded)
-		ret = edgetpu_laguna_fw_boot(etdev);
-	else
-		ret = edgetpu_laguna_fw_restart(etdev);
-	mutex_unlock(&etdev->fw_lock);
-
-	if (ret) {
-		pm_runtime_put_sync(etdev->dev);
-		etdev->power_ref--;
-	} else {
-		etdev->powered = true;
-	}
+	etdev->powered = true;
 	mutex_unlock(&etdev->pm_lock);
-	return ret;
+	return 0;
 }
 
 void edgetpu_laguna_pm_put(struct edgetpu_laguna_dev *etdev)
@@ -740,11 +812,8 @@ void edgetpu_laguna_pm_put(struct edgetpu_laguna_dev *etdev)
 		return;
 	}
 
-	mutex_lock(&etdev->fw_lock);
-	edgetpu_laguna_fw_stop(etdev);
-	mutex_unlock(&etdev->fw_lock);
-
 	etdev->powered = false;
-	pm_runtime_put_sync(etdev->dev);
+	pm_runtime_mark_last_busy(etdev->dev);
+	pm_runtime_put_autosuspend(etdev->dev);
 	mutex_unlock(&etdev->pm_lock);
 }
