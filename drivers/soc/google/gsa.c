@@ -841,6 +841,76 @@ int gsa_unload_aoc_fw_image(struct device *dev)
 EXPORT_SYMBOL_GPL(gsa_unload_aoc_fw_image);
 
 /**
+ * gsa_aoc_start() - start an authenticated AoC firmware image
+ * @dev: the GSA device, from gsa_get_device()
+ *
+ * Mirrors the Laguna EdgeTPU Trusty/MBA lifecycle: verifies the AoC is in the
+ * loaded state, issues GSA_AOC_START via Trusty (com.android.trusty.gsa.hwmgr.aoc)
+ * or the mailbox fallback when aoc_cmd_mbox is set, and confirms RUNNING.
+ *
+ * Return: 0 on success, negative error otherwise.
+ */
+int gsa_aoc_start(struct device *dev)
+{
+	int state;
+
+	state = gsa_send_aoc_cmd(dev, GSA_AOC_GET_STATE);
+	if (state < 0)
+		return state;
+
+	if (state == GSA_AOC_STATE_RUNNING)
+		return 0;
+
+	if (state != GSA_AOC_STATE_LOADED) {
+		dev_err(dev, "AoC cannot start from state %d\n", state);
+		return -EINVAL;
+	}
+
+	state = gsa_send_aoc_cmd(dev, GSA_AOC_START);
+	if (state < 0)
+		return state;
+
+	if (state != GSA_AOC_STATE_RUNNING) {
+		dev_err(dev, "AoC start ended in unexpected state %d\n", state);
+		return -EIO;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gsa_aoc_start);
+
+/**
+ * gsa_aoc_stop() - shut down and unload an AoC firmware image
+ * @dev: the GSA device, from gsa_get_device()
+ *
+ * Transitions a running/suspended AoC through GSA_AOC_SHUTDOWN and unlocks the
+ * carve-out via gsa_unload_aoc_fw_image(). Safe to call when already inactive.
+ *
+ * Return: 0 on success, negative error otherwise.
+ */
+int gsa_aoc_stop(struct device *dev)
+{
+	int state, ret;
+
+	state = gsa_send_aoc_cmd(dev, GSA_AOC_GET_STATE);
+	if (state < 0)
+		return state;
+
+	if (state == GSA_AOC_STATE_INACTIVE)
+		return 0;
+
+	if (state == GSA_AOC_STATE_RUNNING ||
+	    state == GSA_AOC_STATE_SUSPENDED) {
+		ret = gsa_send_aoc_cmd(dev, GSA_AOC_SHUTDOWN);
+		if (ret < 0)
+			return ret;
+	}
+
+	return gsa_unload_aoc_fw_image(dev);
+}
+EXPORT_SYMBOL_GPL(gsa_aoc_stop);
+
+/**
  * gsa_send_tpu_cmd() - run a TPU management command (enum gsa_tpu_cmd)
  * @dev: the GSA device, from gsa_get_device()
  * @cmd: the command
@@ -932,7 +1002,9 @@ DEFINE_SHOW_ATTRIBUTE(gsa_sjtag_status);
 
 static const char *gsa_aoc_state_name(int state)
 {
-	static const char * const names[] = { "inactive", "loaded", "running" };
+	static const char * const names[] = {
+		"inactive", "loaded", "running", "suspended"
+	};
 
 	return state >= 0 && state < ARRAY_SIZE(names) ? names[state] : "?";
 }
