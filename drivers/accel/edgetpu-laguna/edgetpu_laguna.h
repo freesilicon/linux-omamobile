@@ -491,6 +491,8 @@ struct edgetpu_interface_version_ioctl {
 	_IO(EDGETPU_IOCTL_BASE, 26)
 #define EDGETPU_FIRMWARE_VERSION \
 	_IOR(EDGETPU_IOCTL_BASE, 27, struct edgetpu_fw_version)
+#define EDGETPU_GET_FATAL_ERRORS \
+	_IOR(EDGETPU_IOCTL_BASE, 32, __u32)
 #define EDGETPU_ACQUIRE_WAKE_LOCK_FLAGS \
 	_IOR(EDGETPU_IOCTL_BASE, 33, __u32)
 #define EDGETPU_VII_LITEBUF_COMMAND \

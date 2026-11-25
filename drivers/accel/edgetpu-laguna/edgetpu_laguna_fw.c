@@ -544,6 +544,11 @@ int edgetpu_laguna_fw_boot(struct edgetpu_laguna_dev *etdev)
 	else
 		etdev->fw_region_size = LAGUNA_FW_DEFAULT_CODE_LIMIT;
 
+	if (body_size > etdev->fw_region_size) {
+		ret = -ERANGE;
+		goto out_rel;
+	}
+
 	memcpy(etdev->fw_versions, cfg->firmware_versions, sizeof(etdev->fw_versions));
 
 	fw_va = memremap(etdev->fw_paddr, etdev->fw_region_size, MEMREMAP_WC);

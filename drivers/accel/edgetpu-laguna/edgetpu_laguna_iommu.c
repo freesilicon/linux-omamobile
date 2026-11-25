@@ -266,6 +266,10 @@ static void laguna_destroy_mapping(struct laguna_domain *etdom,
 		dma_buf_detach(map->dmabuf, map->attach);
 		dma_buf_put(map->dmabuf);
 	} else {
+		if (!(map->flags & EDGETPU_MAP_SKIP_CPU_SYNC) &&
+		    map->dir != DMA_TO_DEVICE)
+			dma_sync_sgtable_for_cpu(etdom->etdev->dev,
+						 map->sgt, map->dir);
 		sg_free_table(map->sgt);
 		kfree(map->sgt);
 		unpin_user_pages_dirty_lock(map->pages, map->nr_pages,
@@ -468,6 +472,9 @@ int edgetpu_laguna_map_user(struct laguna_client *client,
 		goto err_free_sgt;
 	}
 
+	if (!(req->flags & EDGETPU_MAP_SKIP_CPU_SYNC))
+		dma_sync_sgtable_for_device(etdev->dev, sgt, dir);
+
 	prot = laguna_prot_from_dir(etdev->dev, dir, false, false);
 	mapped = iommu_map_sgtable(etdom->domain, base_iova, sgt, prot);
 	if (mapped < 0 || (size_t)mapped < aligned_size) {
@@ -543,8 +550,12 @@ int edgetpu_laguna_unmap_user(struct laguna_client *client,
 int edgetpu_laguna_sync_buffer(struct laguna_client *client,
 			       const struct edgetpu_sync_ioctl *req)
 {
+	struct edgetpu_laguna_dev *etdev = client->etdev;
 	struct laguna_buf_mapping *cur;
 	bool found = false;
+	bool for_cpu = (req->flags & EDGETPU_SYNC_FOR_CPU) != 0;
+	struct dma_buf *dmabuf = NULL;
+	enum dma_data_direction dir = DMA_BIDIRECTIONAL;
 
 	mutex_lock(&client->map_lock);
 	list_for_each_entry(cur, &client->mappings, node) {
@@ -552,6 +563,17 @@ int edgetpu_laguna_sync_buffer(struct laguna_client *client,
 		    req->size <= cur->size &&
 		    req->device_address - cur->iova <= cur->size - req->size) {
 			found = true;
+			dir = cur->dir;
+			if (cur->is_dmabuf) {
+				get_dma_buf(cur->dmabuf);
+				dmabuf = cur->dmabuf;
+			} else if (for_cpu) {
+				dma_sync_sgtable_for_cpu(etdev->dev, cur->sgt,
+							 dir);
+			} else {
+				dma_sync_sgtable_for_device(etdev->dev,
+							    cur->sgt, dir);
+			}
 			break;
 		}
 	}
@@ -560,7 +582,14 @@ int edgetpu_laguna_sync_buffer(struct laguna_client *client,
 	if (!found)
 		return -EINVAL;
 
-	/* Hardware is dma-coherent; explicit memory barrier suffices. */
+	if (dmabuf) {
+		int ret = for_cpu ? dma_buf_begin_cpu_access(dmabuf, dir)
+				  : dma_buf_end_cpu_access(dmabuf, dir);
+
+		dma_buf_put(dmabuf);
+		return ret;
+	}
+
 	dma_mb();
 	return 0;
 }

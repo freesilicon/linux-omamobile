@@ -352,6 +352,18 @@ static long laguna_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 		break;
 	}
+	case EDGETPU_GET_FATAL_ERRORS: {
+		unsigned long flags;
+		__u32 fatal_errors;
+
+		spin_lock_irqsave(&client->resp_lock, flags);
+		fatal_errors = client->fatal_errors;
+		spin_unlock_irqrestore(&client->resp_lock, flags);
+
+		if (copy_to_user(argp, &fatal_errors, sizeof(fatal_errors)))
+			ret = -EFAULT;
+		break;
+	}
 	case EDGETPU_GET_INTERFACE_VERSION: {
 		struct edgetpu_interface_version_ioctl iface = {
 			.version_major = LAGUNA_IFACE_VER_MAJOR,
