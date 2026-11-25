@@ -386,7 +386,7 @@ void ufshcd_mcq_make_queues_operational(struct ufs_hba *hba)
 	/* Enable required interrupts */
 	intrs = UFSHCD_ENABLE_MCQ_INTRS;
 	if (hba->quirks & UFSHCD_QUIRK_MCQ_BROKEN_INTR)
-		intrs &= ~MCQ_CQ_EVENT_STATUS;
+		intrs &= ~(MCQ_CQ_EVENT_STATUS | MCQ_IAG_EVENT_STATUS);
 	ufshcd_enable_intr(hba, intrs);
 
 	for (i = 0; i < hba->nr_hw_queues; i++) {
