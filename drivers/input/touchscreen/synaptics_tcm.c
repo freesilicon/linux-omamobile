@@ -63,10 +63,23 @@
 /* Commands */
 #define TCM_CMD_IDENTIFY		0x02
 #define TCM_CMD_RESET			0x04
+#define TCM_CMD_ENABLE_REPORT		0x05
 #define TCM_CMD_DISABLE_REPORT		0x06
 #define TCM_CMD_RUN_APP_FW		0x14
 #define TCM_CMD_GET_APP_INFO		0x20
+#define TCM_CMD_GET_DYNAMIC_CONFIG	0x23
+#define TCM_CMD_SET_DYNAMIC_CONFIG	0x24
 #define TCM_CMD_GET_TOUCH_REPORT_CONFIG	0x25
+#define TCM_CMD_EXIT_DEEP_SLEEP		0x2d
+
+/* Dynamic configuration field IDs */
+#define TCM_DC_DISABLE_DOZE		0x01
+#define TCM_DC_ENABLE_WAKEUP_GESTURE	0x09
+#define TCM_DC_FORCE_DOZE_MODE		0xf0
+#define TCM_DC_TOUCH_SCAN_MODE		0xf2
+
+#define TCM_SCAN_MODE_NORMAL_LIMIT	2
+#define TCM_SCAN_MODE_DEEP_SLEEP	4
 
 /* Status codes */
 #define TCM_STATUS_IDLE			0x00
@@ -827,6 +840,111 @@ static int tcm_get_info(struct tcm_ts *ts)
 	return 0;
 }
 
+static int tcm_get_dynamic_config(struct tcm_ts *ts, u8 id, u16 *val)
+{
+	__le16 raw;
+	int ret;
+
+	ret = tcm_command(ts, TCM_CMD_GET_DYNAMIC_CONFIG, &id, 1,
+			  &raw, sizeof(raw));
+	if (ret < 0)
+		return ret;
+	if (ret < (int)sizeof(raw))
+		return -EIO;
+
+	*val = le16_to_cpu(raw);
+	return 0;
+}
+
+static int tcm_set_dynamic_config(struct tcm_ts *ts, u8 id, u16 val)
+{
+	u8 payload[3] = { id };
+	int ret;
+
+	put_unaligned_le16(val, &payload[1]);
+	ret = tcm_command(ts, TCM_CMD_SET_DYNAMIC_CONFIG, payload,
+			  sizeof(payload), NULL, 0);
+	return ret < 0 ? ret : 0;
+}
+
+/*
+ * Controllers configured for late-sense-on wake up from reset or suspend in
+ * deep sleep or with touch reporting masked until sensing is explicitly
+ * activated.
+ */
+static void tcm_activate_touch(struct tcm_ts *ts, bool log_info)
+{
+	struct device *dev = &ts->spi->dev;
+	u8 report = TCM_REPORT_TOUCH;
+	u16 scan_before = 0;
+	u16 scan_after = 0;
+	bool have_scan;
+	int attempt;
+	int ret;
+
+	have_scan = !tcm_get_dynamic_config(ts, TCM_DC_TOUCH_SCAN_MODE,
+					    &scan_before);
+
+	for (attempt = 0; attempt < 3; attempt++) {
+		if (attempt)
+			msleep(20);
+
+		if (attempt == 0 || scan_after == TCM_SCAN_MODE_DEEP_SLEEP) {
+			ret = tcm_command(ts, TCM_CMD_EXIT_DEEP_SLEEP, NULL, 0,
+					  NULL, 0);
+			if (ret < 0 && attempt == 0)
+				dev_warn(dev, "could not exit deep sleep: %d\n",
+					 ret);
+		}
+
+		ret = tcm_set_dynamic_config(ts, TCM_DC_ENABLE_WAKEUP_GESTURE,
+					     0);
+		if (ret < 0 && attempt == 0)
+			dev_warn(dev, "could not clear wakeup gesture mode: %d\n",
+				 ret);
+
+		ret = tcm_set_dynamic_config(ts, TCM_DC_FORCE_DOZE_MODE, 0);
+		if (ret < 0 && attempt == 0)
+			dev_warn(dev, "could not clear forced doze mode: %d\n",
+				 ret);
+
+		if (attempt > 0) {
+			ret = tcm_set_dynamic_config(ts, TCM_DC_DISABLE_DOZE,
+						     1);
+			if (ret < 0)
+				dev_warn(dev, "could not disable doze: %d\n",
+					 ret);
+		}
+
+		if (attempt == 0) {
+			ret = tcm_command(ts, TCM_CMD_ENABLE_REPORT, &report,
+					  1, NULL, 0);
+			if (ret < 0)
+				dev_warn(dev, "could not enable touch report: %d\n",
+					 ret);
+		}
+
+		ret = tcm_get_dynamic_config(ts, TCM_DC_TOUCH_SCAN_MODE,
+					     &scan_after);
+		if (ret < 0 || scan_after < TCM_SCAN_MODE_NORMAL_LIMIT)
+			break;
+	}
+
+	if (ret < 0)
+		return;
+
+	if (log_info) {
+		if (have_scan)
+			dev_info(dev, "touch enabled, scan mode %#04x -> %#04x\n",
+				 scan_before, scan_after);
+		else
+			dev_info(dev, "touch enabled, scan mode %#04x\n",
+				 scan_after);
+	}
+	if (scan_after >= TCM_SCAN_MODE_NORMAL_LIMIT)
+		dev_warn(dev, "unexpected touch scan mode %#04x\n", scan_after);
+}
+
 static int tcm_input_init(struct tcm_ts *ts)
 {
 	struct device *dev = &ts->spi->dev;
@@ -978,6 +1096,8 @@ static int tcm_probe(struct spi_device *spi)
 	if (error)
 		return dev_err_probe(dev, error, "failed to register input\n");
 
+	tcm_activate_touch(ts, true);
+
 	return 0;
 }
 
@@ -1016,6 +1136,7 @@ static int tcm_resume(struct device *dev)
 
 	if (!READ_ONCE(ts->suspended)) {
 		enable_irq(irq);
+		tcm_activate_touch(ts, false);
 		return 0;
 	}
 
@@ -1028,6 +1149,7 @@ static int tcm_resume(struct device *dev)
 		/* Still asserted, so the thread now reads what woke us. */
 		enable_irq(irq);
 	}
+	tcm_activate_touch(ts, false);
 	return 0;
 }
 
