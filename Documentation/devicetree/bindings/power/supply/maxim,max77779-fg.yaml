@@ -18,10 +18,16 @@ allOf:
 
 properties:
   compatible:
-    const: maxim,max77779-fg
+    enum:
+      - maxim,max77779-fg
+      - maxim,max77779fg-spmi
 
   reg:
     maxItems: 1
+
+  max77779,pmic:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the sibling MAX77779 PMIC node on SPMI for firmware revision lookup.
 
   shunt-resistor-micro-ohms:
     description: Resistance of the battery current sense resistor in micro-ohms.
