@@ -746,14 +746,6 @@
 			#gpio-cells = <2>;
 			ngpios = <19>;
 			gpio-ranges = <&da9188_gpio 0 0 19>;
-
-			pmics2ts0_reset_l_1v2: pmics2ts0_reset_l_1v2 {
-				pins = "gpio17";
-			};
-
-			pmics2ts1_reset_l_1v2: pmics2ts1_reset_l_1v2 {
-				pins = "gpio18";
-			};
 		};
 	};
 
@@ -1251,6 +1243,7 @@
 			gpio-controller;
 			gpio-ranges = <&pinctrl_lsios 0 0 0x37>;
 			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x36 0x1>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&lsios_level_gia_0 0x23>, <&lsios_level_gia_0 0x24>,
@@ -1301,7 +1294,9 @@
 			compatible = "google,lga-hsion-pinctrl";
 			reg = <0x0 0x0c580000 0x0 0xc000>;
 			gpio-controller;
+			gpio-ranges = <&pinctrl_hsion 0 0 0xc>;
 			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0xb 0x1>;
 			power-domains = <&sswrp_hsio_n_pd>;
 			power-domain-names = "csr_access_pd";
 			status = "disabled";
@@ -1321,6 +1316,7 @@
 			gpio-controller;
 			gpio-ranges = <&pinctrl_hsios 0 0 0xf>;
 			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x9 0x1>;
 			power-domains = <&sswrp_hsio_s_pd>;
 			power-domain-names = "csr_access_pd";
 			status = "disabled";
@@ -1342,6 +1338,7 @@
 			gpio-controller;
 			gpio-ranges = <&pinctrl_gdmc 0 0 0x15>;
 			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x6 0x7>;
 			status = "disabled";
 		};
 
