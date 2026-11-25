@@ -46,6 +46,7 @@
 		serial0 = &uart16;
 		serial2 = &uart9;
 		ufs0 = &ufs0;
+		pcie1 = &pcie1;
 	};
 
 	/*
@@ -529,6 +530,13 @@
 			rpm-always-on;
 		};
 
+		hsio_s_pcie_pd: hsio_s_pcie_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x18>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			subdomain-id = <0x1>;
+		};
+
 		sswrp_tpu_pd: sswrp_tpu_pd {
 			#power-domain-cells = <0>;
 			sswrp-id = <0x20>;
@@ -716,6 +724,12 @@
 			lpcm-id = <0x6>;
 			clock-id = <0x10>;
 			use-smc;
+		};
+
+		hsios_phy_fw_clk: hsios_phy_fw_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x6>;
+			clock-id = <0xa>;
 		};
 	};
 
@@ -1229,6 +1243,14 @@
 				output-disable;
 				function = "cpm_int";
 			};
+
+			wlan2ap_host_wake_1v2: wlan2ap_host_wake_1v2 {
+				pins = "XCPM_EINT_8";
+				bias-pull-down;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
 		};
 
 		pinctrl_aoc: pinctrl@b400000 {
@@ -1514,6 +1536,49 @@
 				input-enable;
 				output-enable;
 			};
+
+			hsios_pcie1_perst: hsios-pcie1-perst {
+				pins = "XHSIOS_PCIE1_PERSTN0";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
+
+			hsios_pcie1_clkreq_func: hsios-pcie1-clkreq-func {
+				pins = "XHSIOS_PCIE1_CLKREQN0";
+				function = "hsios_pcie1";
+				bias-disable;
+				input-enable;
+				output-disable;
+			};
+
+			hsios_pcie1_clkreq_idle: hsios-pcie1-clkreq-idle {
+				pins = "XHSIOS_PCIE1_CLKREQN0";
+				function = "hsios_gpio";
+				bias-disable;
+				input-enable;
+				output-disable;
+			};
+
+			ap2wlan_dev_wake_1v2: ap2wlan-dev-wake-1v2 {
+				pins = "XHSIOS_GPIO5";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
+
+			ap2wlan_reg_on_1v2: ap2wlan-reg-on-1v2 {
+				pins = "XHSIOS_GPIO6";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
 		};
 
 		pinctrl_lsion: pinctrl@da00000 {
@@ -1701,6 +1766,26 @@
 			status = "disabled";
 		};
 
+		hsios_pulse_gia_3: interrupt-controller@3c253000 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3c253000 0x0 0x14>;
+			interrupts = <GIC_SPI 558 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			status = "disabled";
+		};
+
+		hsios_pulse_gia_4: interrupt-controller@3c253020 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3c253020 0x0 0x14>;
+			interrupts = <GIC_SPI 559 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			status = "disabled";
+		};
+
 		inftcu_level_gia_3: interrupt-controller@350d7000 {
 			compatible = "google,level-gia";
 			interrupt-controller;
@@ -1881,6 +1966,48 @@
 			vcc-supply = <&buck_11s_reg>;
 			vccq-supply = <&buck_13s_reg>;
 			gsa-device = <&gsa>;
+			dma-coherent;
+			status = "disabled";
+		};
+
+		pcie1: pcie@3c500000 {
+			compatible = "google,lga-pcie";
+			reg = <0x0 0x3c500000 0x0 0x94>,
+			      <0x0 0x3c520000 0x0 0xbc>,
+			      <0x0 0x3c550000 0x0 0xa000>,
+			      <0x0 0x3c800000 0x0 0xd00>,
+			      <0x0 0x3cb00000 0x0 0x1000>,
+			      <0x0 0x60000000 0x0 0x100000>;
+			reg-names = "sii", "top", "phy_sram", "dbi", "atu", "config";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			device_type = "pci";
+			linux,pci-domain = <1>;
+			bus-range = <0x00 0xff>;
+			ranges = <0x01000000 0x0 0x60100000 0x0 0x60100000 0x0 0x100000>,
+				 <0x02000000 0x0 0x60200000 0x0 0x60200000 0x0 0x1fe00000>;
+			clocks = <&hsios_phy_fw_clk>, <&hsios_aux_clk>;
+			clock-names = "phy_fw", "aux_clk";
+			resets = <&hsios_resets 4>,
+				 <&hsios_resets 0>,
+				 <&hsios_resets 1>,
+				 <&hsios_resets 2>;
+			reset-names = "init", "perst", "app_hold_phy", "power_up";
+			power-domains = <&hsio_s_pcie_pd>;
+			interrupts-extended = <&gic GIC_SPI 524 IRQ_TYPE_EDGE_RISING 0>,
+					      <&hsios_pulse_gia_4 14>,
+					      <&hsios_pulse_gia_3 17>;
+			interrupt-names = "msi", "cpl_timeout", "link_down";
+			iommu-map = <0x100 &inf_smmu 0x8000 0x1>;
+			pinctrl-names = "default", "idle";
+			pinctrl-0 = <&hsios_pcie1_clkreq_func &hsios_pcie1_perst>;
+			pinctrl-1 = <&hsios_pcie1_clkreq_idle &hsios_pcie1_perst>;
+			perstn-gpios = <&pinctrl_hsios 11 GPIO_ACTIVE_LOW>;
+			google,perst-delay-us = <18000>;
+			google,posted-rx-q-data-credits = <0x51>;
+			google,skip-link-equalization;
+			num-lanes = <1>;
+			max-link-speed = <3>;
 			dma-coherent;
 			status = "disabled";
 		};

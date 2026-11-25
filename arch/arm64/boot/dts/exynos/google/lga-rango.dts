@@ -333,3 +333,43 @@
 			0x3151 0x3351>;
 	status = "okay";
 };
+
+/ {
+	wlan_reg_on: regulator-wlan-reg-on {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-reg-on";
+		gpio = <&pinctrl_hsios 13 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <200000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ap2wlan_reg_on_1v2>;
+	};
+};
+
+&hsios_pulse_gia_3 {
+	status = "okay";
+};
+
+&hsios_pulse_gia_4 {
+	status = "okay";
+};
+
+&pcie1 {
+	status = "okay";
+
+	pcie@0,0 {
+		compatible = "pciclass,0604";
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <0x01 0xff>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		vpcie3v3-supply = <&wlan_reg_on>;
+
+		wifi@0,0 {
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			brcm,board-type = "google,lga-rango";
+		};
+	};
+};
