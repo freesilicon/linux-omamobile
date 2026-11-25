@@ -224,10 +224,18 @@ static int gsa_err_to_errno(u32 err)
 static void gsa_mbox_rx_callback(struct mbox_client *cl, void *mssg)
 {
 	struct gsa *gsa = container_of(cl, struct gsa, mbox_client);
+	const u32 *words = mssg;
 	unsigned long flags;
+	u32 argc, nwords;
 
 	spin_lock_irqsave(&gsa->irq_lock, flags);
-	memcpy(gsa->mbox_rsp, mssg, sizeof(gsa->mbox_rsp));
+	memset(gsa->mbox_rsp, 0, sizeof(gsa->mbox_rsp));
+	if (words) {
+		argc = READ_ONCE(words[2]);
+		/* Copy 3-word header + argc args only; ignore oversize argc */
+		nwords = (argc > MBOX_SR_NUM - 3) ? 3 : 3 + argc;
+		memcpy(gsa->mbox_rsp, words, nwords * sizeof(u32));
+	}
 	spin_unlock_irqrestore(&gsa->irq_lock, flags);
 	complete(&gsa->rsp);
 }
@@ -267,7 +275,7 @@ static int gsa_cmd_mbox_locked(struct gsa *gsa, u32 cmd, const u32 *req_args,
 	dev_info(gsa->dev, "cmd %u: answer 0x%08x err %u argc %u\n",
 		 cmd, rsp_cmd, err, argc);
 
-	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc + 3 > MBOX_SR_NUM) {
+	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc > MBOX_SR_NUM - 3) {
 		spin_unlock_irqrestore(&gsa->irq_lock, flags);
 		return -EIO;
 	}
@@ -330,7 +338,7 @@ static int gsa_cmd_mmio_locked(struct gsa *gsa, u32 cmd, const u32 *req_args,
 	dev_info(gsa->dev, "cmd %u: answer 0x%08x err %u argc %u\n",
 		 cmd, rsp_cmd, err, argc);
 
-	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc + 3 > MBOX_SR_NUM)
+	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc > MBOX_SR_NUM - 3)
 		return -EIO;
 
 	*gsa_err = err;
