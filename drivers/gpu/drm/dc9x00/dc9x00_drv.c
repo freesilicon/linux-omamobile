@@ -200,6 +200,8 @@ static void dc9x00_handle_pipe_irq(struct dc9x00_pipe *pipe, u32 st0)
 	    READ_ONCE(pipe->underrun_enabled) &&
 	    READ_ONCE(pipe->frame_pending)) {
 		atomic64_inc(&pipe->irq_underrun);
+		/* Report at most one underrun IRQ per frame; FRM_START re-arms. */
+		dc9x00_set_underrun_irq(pipe, false);
 		dev_warn_ratelimited(pipe->priv->dev,
 				     "DC9x00 Outpath%u underrun (st0=%#x)\n",
 				     pipe->id, st0);
@@ -553,11 +555,26 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 	drm_crtc_vblank_on(crtc);
 }
 
+static void dc9x00_send_crtc_vblank_event(struct drm_crtc *crtc,
+					  struct drm_crtc_state *cstate)
+{
+	unsigned long flags;
+
+	if (!cstate || !cstate->event)
+		return;
+
+	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+	drm_crtc_send_vblank_event(crtc, cstate->event);
+	cstate->event = NULL;
+	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+}
+
 static void dc9x00_crtc_atomic_disable(struct drm_crtc *crtc,
 				       struct drm_atomic_commit *state)
 {
 	struct dc9x00_pipe *pipe = pipe_from_crtc(crtc);
 	struct dc9x00_drm *priv = pipe->priv;
+	struct drm_crtc_state *cstate = drm_atomic_get_new_crtc_state(state, crtc);
 	u8 id = pipe->id;
 	u32 intr_bits, intr_en, iso;
 	unsigned long flags;
@@ -569,6 +586,7 @@ static void dc9x00_crtc_atomic_disable(struct drm_crtc *crtc,
 	mutex_lock(&priv->hw_lock);
 	if (!pipe->active) {
 		mutex_unlock(&priv->hw_lock);
+		dc9x00_send_crtc_vblank_event(crtc, cstate);
 		return;
 	}
 
@@ -584,19 +602,31 @@ static void dc9x00_crtc_atomic_disable(struct drm_crtc *crtc,
 	intr_en = readl(priv->base + DC9X00_BE_INTR_ENABLE);
 	intr_en &= ~intr_bits;
 	writel(intr_en, priv->base + DC9X00_BE_INTR_ENABLE);
+	writel(intr_bits, priv->base + DC9X00_BE_INTR_STATUS);
+	writel(intr_bits, priv->base + DC9X00_BE_INTR_OVERFLOW);
 
+	writel(0, priv->base + DC9X00_SH_LAYER_CONFIG(id));
+	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER_CONFIG(id));
 	writel(0, priv->base + DC9X00_OUTPUT_SW_CONFIG(id));
 	writel(0, priv->base + DC9X00_OUTPUT_START(id));
-	writel(0, priv->base + DC9X00_SH_OUTPUT_CLK_EN(id));
-
-	iso = readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
-	iso |= DC9X00_CLK_DOMAIN_ISO_DSI(id);
-	writel(iso, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
-	spin_unlock_irqrestore(&priv->intr_lock, flags);
 
 	priv->active_mask &= ~BIT(id);
+	if (!priv->active_mask) {
+		unsigned int i;
+
+		iso = readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+		for (i = 0; i < priv->num_pipes; i++) {
+			writel(0, priv->base + DC9X00_SH_OUTPUT_CLK_EN(i));
+			iso |= DC9X00_CLK_DOMAIN_ISO_DSI(i);
+		}
+		writel(iso, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	}
+	spin_unlock_irqrestore(&priv->intr_lock, flags);
+
 	pm_runtime_put_sync(priv->dev);
 	mutex_unlock(&priv->hw_lock);
+
+	dc9x00_send_crtc_vblank_event(crtc, cstate);
 }
 
 static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
@@ -610,12 +640,7 @@ static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
 	unsigned long flags;
 
 	if (!pipe->active) {
-		if (cstate->event) {
-			spin_lock_irqsave(&crtc->dev->event_lock, flags);
-			drm_crtc_send_vblank_event(crtc, cstate->event);
-			cstate->event = NULL;
-			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
-		}
+		dc9x00_send_crtc_vblank_event(crtc, cstate);
 		return;
 	}
 
@@ -677,6 +702,39 @@ static int dc9x00_dumb_create(struct drm_file *file_priv, struct drm_device *dev
 	return drm_gem_dma_dumb_create_internal(file_priv, dev, args);
 }
 
+static void dc9x00_prepare_active_pipe_clocks(struct drm_device *dev,
+					      struct drm_atomic_commit *state)
+{
+	struct dc9x00_drm *priv = to_dc9x00(dev);
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *cstate;
+	unsigned long flags;
+	u32 iso;
+	int i;
+
+	mutex_lock(&priv->hw_lock);
+	if (!priv->active_mask) {
+		mutex_unlock(&priv->hw_lock);
+		return;
+	}
+
+	spin_lock_irqsave(&priv->intr_lock, flags);
+	iso = readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	for_each_new_crtc_in_state(state, crtc, cstate, i) {
+		struct dc9x00_pipe *pipe = pipe_from_crtc(crtc);
+
+		if (!cstate->active || !drm_atomic_crtc_needs_modeset(cstate))
+			continue;
+
+		iso &= ~DC9X00_CLK_DOMAIN_ISO_DSI(pipe->id);
+		writel(1, priv->base + DC9X00_SH_OUTPUT_CLK_EN(pipe->id));
+	}
+	writel(iso, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	spin_unlock_irqrestore(&priv->intr_lock, flags);
+	mutex_unlock(&priv->hw_lock);
+}
+
 static void dc9x00_atomic_commit_tail(struct drm_atomic_commit *state)
 {
 	struct drm_device *dev = state->dev;
@@ -684,8 +742,14 @@ static void dc9x00_atomic_commit_tail(struct drm_atomic_commit *state)
 	drm_atomic_helper_commit_modeset_disables(dev, state);
 
 	/*
+	 * Ensure enabling pipes have their DPU-to-DSI clock domain un-isolated
+	 * and output CSR clock active before DSI2H/panel pre_enable runs.
+	 */
+	dc9x00_prepare_active_pipe_clocks(dev, state);
+
+	/*
 	 * Enable the DSI2H/CDPHY/panel chain before resetting BE and bringing
-	 * up DC9x00 Output0, then commit planes after priv->active is true.
+	 * up DC9x00 Output, then commit planes after pipe->active is true.
 	 */
 	drm_atomic_helper_commit_encoder_bridge_pre_enable(dev, state);
 	drm_atomic_helper_commit_encoder_bridge_enable(dev, state);

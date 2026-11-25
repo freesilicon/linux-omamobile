@@ -443,6 +443,7 @@ static int laguna_panel_disable(struct drm_panel *panel)
 static int laguna_panel_unprepare(struct drm_panel *panel)
 {
 	struct laguna_panel *ctx = to_laguna_panel(panel);
+	bool do_reset = ctx->desc->cold_init || panel_full_reset;
 
 	if (!ctx->prepared)
 		return 0;
@@ -450,6 +451,11 @@ static int laguna_panel_unprepare(struct drm_panel *panel)
 	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 	mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
 	msleep(20);
+
+	if (do_reset && ctx->reset_gpio) {
+		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+		usleep_range(1000, 1100);
+	}
 
 	if (ctx->vddd)
 		regulator_disable(ctx->vddd);
