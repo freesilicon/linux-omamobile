@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_DC9X00
+	tristate "VeriSilicon DC9x00 display controller (Google Laguna)"
+	depends on DRM && OF
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	select DRM_CLIENT_SELECTION
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_PANEL
+	select DRM_BRIDGE
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_DSC_HELPER
+	select DRM_PANEL_BRIDGE
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_MIPI_DSI
+	select GENERIC_PHY
+	select GENERIC_PHY_MIPI_DPHY
+	select VIDEOMODE_HELPERS
+	help
+	  Clean-room DRM/KMS driver for VeriSilicon DC9x00 display controller,
+	  DesignWare MIPI DSI-2 host, Synopsys CDPHY G301, Laguna panels, and
+	  opt-in PowerVR Stage G0 register probe on Tensor G5 Laguna.

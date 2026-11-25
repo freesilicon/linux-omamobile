@@ -215,3 +215,65 @@
 		status = "okay";
 	};
 };
+
+&dpu_level_gia {
+	status = "okay";
+};
+
+&sswrp_dpu {
+	status = "okay";
+};
+
+&dw_mipi_g301_cdphy0 {
+	status = "okay";
+};
+
+&dsi2h0 {
+	status = "okay";
+	datarate = <865>;
+
+	panel0: panel@0 {
+		compatible = "google,gs-rgeb";
+		reg = <0>;
+
+		port {
+			panel0_in: endpoint {
+				remote-endpoint = <&dsi0_port1_out>;
+			};
+		};
+	};
+};
+
+&dsi0_port1_out {
+	remote-endpoint = <&panel0_in>;
+};
+
+&dsi2h1 {
+	status = "disabled";
+	datarate = <1468>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	panel1: panel@0 {
+		compatible = "google,gs-rgea";
+		reg = <0>;
+
+		port {
+			panel1_in: endpoint {
+				remote-endpoint = <&dsi1_port1_out>;
+			};
+		};
+	};
+};
+
+&dsi1_port1_out {
+	remote-endpoint = <&panel1_in>;
+};
+
+&dpu {
+	status = "okay";
+};
+
+&gpu_stage0_probe {
+	status = "okay";
+};

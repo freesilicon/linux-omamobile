@@ -157,3 +157,43 @@
 &gpio_keys {
 	status = "okay";
 };
+
+&dpu_level_gia {
+	status = "okay";
+};
+
+&sswrp_dpu {
+	status = "okay";
+};
+
+&dw_mipi_g301_cdphy0 {
+	status = "okay";
+};
+
+&dsi2h0 {
+	status = "okay";
+	datarate = <1368>;
+
+	panel0: panel@0 {
+		compatible = "google,gs-mtea";
+		reg = <0>;
+
+		port {
+			panel0_in: endpoint {
+				remote-endpoint = <&dsi0_port1_out>;
+			};
+		};
+	};
+};
+
+&dsi0_port1_out {
+	remote-endpoint = <&panel0_in>;
+};
+
+&dpu {
+	status = "okay";
+};
+
+&gpu_stage0_probe {
+	status = "okay";
+};

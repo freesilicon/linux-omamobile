@@ -247,6 +247,14 @@
 			reg = <0x0 0xf6fce000 0x0 0x32000>;
 			no-map;
 		};
+
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x0 0x18000000>;
+			alignment = <0x0 0x400000>;
+			linux,cma-default;
+		};
 	};
 
 	cpus {
@@ -509,13 +517,47 @@
 			active-wakeup;
 			no-auto-resume;
 		};
+
+		dpu_dsi0_pd: dpu_dsi0_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x5>;
+			power-domains = <&sswrp_dpu_pd>;
+			subdomain-id = <0x2>;
+		};
+
+		dpu_dsi1_pd: dpu_dsi1_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x5>;
+			power-domains = <&sswrp_dpu_pd>;
+			subdomain-id = <0x3>;
+		};
+
+		dpu_fe0_pd: dpu_fe0_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x5>;
+			power-domains = <&dpu_dsi0_pd>;
+			subdomain-id = <0x0>;
+		};
+
+		dpu_fe1_pd: dpu_fe1_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x5>;
+			power-domains = <&dpu_fe0_pd>;
+			subdomain-id = <0x1>;
+		};
+
+		sswrp_gpu_pd: sswrp_gpu_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x14>;
+		};
 	};
 
 	cpm_clk: clock-controller {
 		compatible = "google,cpm-clk";
 		mboxes = <&goog_mba_cpm_iface>;
 		power-domains = <&sswrp_lsio_n_pd>, <&sswrp_lsio_e_pd>,
-				<&sswrp_lsio_s_pd>, <&sswrp_hsio_n_pd>;
+				<&sswrp_lsio_s_pd>, <&sswrp_hsio_n_pd>,
+				<&sswrp_hsio_s_pd>;
 
 		lsioe_gpio_clk: lsioe_gpio_clk {
 			#clock-cells = <0>;
@@ -635,6 +677,13 @@
 			#clock-cells = <0>;
 			lpcm-id = <0x5>;
 			clock-id = <0x12>;
+		};
+
+		hsios_mphy_ref_clk: hsios_mphy_ref_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x6>;
+			clock-id = <0x1>;
+			rates = <0x0 0x493e000 0x0 0x249f000>;
 		};
 	};
 
@@ -1655,20 +1704,168 @@
 			status = "disabled";
 		};
 
-		sswrp_dpu@ec00000 {
+		sswrp_dpu: sswrp_dpu@ec00000 {
 			compatible = "simple-bus";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges = <0x0 0x0 0x0ec00000 0x400000>;
 			status = "disabled";
 
-			dc9x00@200000 {
+			dpu: dc9x00@200000 {
 				compatible = "verisilicon,dc9x00";
 				reg = <0x200000 0x120000>, <0x390000 0x10000>;
 				reg-names = "dpu-fe-be", "dpu-gpcsr";
 				interrupt-parent = <&dpu_level_gia>;
+				interrupts = <0x24>, <0x25>, <0x26>, <0x29>;
+				interrupt-names = "outpath0_frm_start",
+						  "outpath0_frm_done",
+						  "outpath0_underrun",
+						  "output0_te_rising_edge";
+				power-domains = <&dpu_dsi0_pd>, <&dpu_fe0_pd>;
+				power-domain-names = "dpu_dsi0_pd", "dpu_fe0_pd";
+				status = "disabled";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						#address-cells = <1>;
+						#size-cells = <0>;
+						reg = <0>;
+
+						dc_port0_dsi0_out: endpoint@0 {
+							reg = <0>;
+							remote-endpoint = <&dsi0_ep0_in>;
+						};
+
+						dc_port0_dsi1_out: endpoint@1 {
+							reg = <1>;
+							remote-endpoint = <&dsi1_ep0_in>;
+						};
+					};
+				};
+			};
+
+			dw_mipi_g301_cdphy0: dw_mipi_cdphy@3c0000 {
+				compatible = "synopsys,dw-mipi-cdphy-v1";
+				reg = <0x3c0000 0x18000>, <0x3d8800 0x800>;
+				reg-names = "cdphy-tx", "u0-apb-regbank";
+				#phy-cells = <1>;
+				clocks = <&hsios_mphy_ref_clk>;
+				clock-names = "pllref";
+				power-domains = <&dpu_dsi0_pd>;
 				status = "disabled";
 			};
+
+			dsi2h0: dsi2host@3d8000 {
+				compatible = "verisilicon,dc9x00-mipi-dsi2h";
+				reg = <0x3d8000 0x800>;
+				interrupt-parent = <&dpu_level_gia>;
+				interrupts = <0x78>;
+				interrupt-names = "dsi0_irq";
+				power-domains = <&dpu_dsi0_pd>;
+				phys = <&dw_mipi_g301_cdphy0 0>;
+				phy-names = "dw-mipi-cdphy";
+				datarate = <1368>;
+				sys_clk = <400000>;
+				ipi_clk = <75000>;
+				lptx_clk = <20000>;
+				lp2hs_time = <0x009b00d4>;
+				hs2lp_time = <0x006a80cc>;
+				ppi_width = <1>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						#address-cells = <1>;
+						#size-cells = <0>;
+						reg = <0>;
+
+						dsi0_ep0_in: endpoint@0 {
+							reg = <0>;
+							remote-endpoint = <&dc_port0_dsi0_out>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+
+						dsi0_port1_out: endpoint {
+						};
+					};
+				};
+			};
+
+			dw_mipi_g301_cdphy1: dw_mipi_cdphy@3e0000 {
+				compatible = "synopsys,dw-mipi-cdphy-v1";
+				reg = <0x3e0000 0x18000>, <0x3f8800 0x800>;
+				reg-names = "cdphy-tx", "u0-apb-regbank";
+				#phy-cells = <1>;
+				clocks = <&hsios_mphy_ref_clk>;
+				clock-names = "pllref";
+				power-domains = <&dpu_dsi1_pd>;
+				status = "disabled";
+			};
+
+			dsi2h1: dsi2host@3f8000 {
+				compatible = "verisilicon,dc9x00-mipi-dsi2h";
+				reg = <0x3f8000 0x800>;
+				interrupt-parent = <&dpu_level_gia>;
+				interrupts = <0x79>;
+				interrupt-names = "dsi1_irq";
+				power-domains = <&dpu_dsi1_pd>;
+				phys = <&dw_mipi_g301_cdphy1 0>;
+				phy-names = "dw-mipi-cdphy";
+				datarate = <1468>;
+				sys_clk = <400000>;
+				ipi_clk = <75000>;
+				lptx_clk = <20000>;
+				lp2hs_time = <0x009b00d4>;
+				hs2lp_time = <0x006a80cc>;
+				ppi_width = <1>;
+				status = "disabled";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						#address-cells = <1>;
+						#size-cells = <0>;
+						reg = <0>;
+
+						dsi1_ep0_in: endpoint@0 {
+							reg = <0>;
+							remote-endpoint = <&dc_port0_dsi1_out>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+
+						dsi1_port1_out: endpoint {
+						};
+					};
+				};
+			};
+		};
+
+		gpu_stage0_probe: gpu-stage0-probe@3480a000 {
+			compatible = "google,laguna-gpu-stage0-probe";
+			reg = <0x0 0x3480a000 0x0 0x4>,
+			      <0x0 0x34826000 0x0 0x400>,
+			      <0x0 0x34820a30 0x0 0x10>,
+			      <0x0 0x34855c40 0x0 0x10>,
+			      <0x0 0x34f00000 0x0 0x100>;
+			reg-names = "gpu_control", "pvtc", "pvtc_pwroff", "dts", "rgx";
+			power-domains = <&sswrp_gpu_pd>;
+			status = "disabled";
 		};
 	};
 
