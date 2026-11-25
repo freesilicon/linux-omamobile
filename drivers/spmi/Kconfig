@@ -54,4 +54,14 @@ config SPMI_MTK_PMIF
 	  This is required for communicating with Mediatek PMICs and
 	  other devices that have the SPMI interface.
 
+config SPMI_SMARTDV
+	tristate "SmartDV SPMI Controller"
+	depends on HAS_IOMEM
+	depends on OF || COMPILE_TEST
+	help
+	  This enables support for the SmartDV SPMI master controller found
+	  on Google Laguna (Pixel 10) SoCs. It provides bus access to
+	  PMIC and fuel-gauge peripherals over the SPMI interface using
+	  MMIO command and data registers.
+
 endif
