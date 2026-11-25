@@ -20,6 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
@@ -160,32 +161,64 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	dev->rst = devm_reset_control_get_optional_exclusive_deasserted(device, NULL);
-	if (IS_ERR(dev->rst))
-		return dev_err_probe(device, PTR_ERR(dev->rst), "failed to acquire reset\n");
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE) {
+		dev->rst = devm_reset_control_get_optional_exclusive(device, NULL);
+		if (IS_ERR(dev->rst))
+			return dev_err_probe(device, PTR_ERR(dev->rst),
+					     "failed to acquire reset\n");
+		ret = reset_control_deassert(dev->rst);
+		if (ret)
+			return dev_err_probe(device, ret,
+					     "failed to deassert reset\n");
+	} else {
+		dev->rst = devm_reset_control_get_optional_exclusive_deasserted(device, NULL);
+		if (IS_ERR(dev->rst))
+			return dev_err_probe(device, PTR_ERR(dev->rst),
+					     "failed to acquire reset\n");
+	}
 
 	ret = i2c_dw_fw_parse_and_configure(dev);
 	if (ret)
-		return ret;
+		goto err_assert_rst;
 
 	ret = i2c_dw_probe_lock_support(dev);
-	if (ret)
-		return dev_err_probe(device, ret, "failed to probe lock support\n");
+	if (ret) {
+		ret = dev_err_probe(device, ret, "failed to probe lock support\n");
+		goto err_assert_rst;
+	}
 
 	i2c_dw_configure(dev);
 
 	/* Optional interface clock */
 	dev->pclk = devm_clk_get_optional(device, "pclk");
-	if (IS_ERR(dev->pclk))
-		return dev_err_probe(device, PTR_ERR(dev->pclk), "failed to acquire pclk\n");
+	if (IS_ERR(dev->pclk)) {
+		ret = dev_err_probe(device, PTR_ERR(dev->pclk),
+				    "failed to acquire pclk\n");
+		goto err_assert_rst;
+	}
 
 	dev->clk = devm_clk_get_optional(device, NULL);
-	if (IS_ERR(dev->clk))
-		return dev_err_probe(device, PTR_ERR(dev->clk), "failed to acquire clock\n");
+	if (IS_ERR(dev->clk)) {
+		ret = dev_err_probe(device, PTR_ERR(dev->clk),
+				    "failed to acquire clock\n");
+		goto err_assert_rst;
+	}
+
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE) {
+		dev->pinctrl = devm_pinctrl_get(device);
+		if (IS_ERR(dev->pinctrl)) {
+			ret = dev_err_probe(device, PTR_ERR(dev->pinctrl),
+					    "failed to acquire pinctrl\n");
+			goto err_assert_rst;
+		}
+		dev->cli_state = pinctrl_lookup_state(dev->pinctrl, "cli");
+		if (IS_ERR(dev->cli_state))
+			dev->cli_state = NULL;
+	}
 
 	ret = i2c_dw_prepare_clk(dev, true);
 	if (ret)
-		return ret;
+		goto err_assert_rst;
 
 	if (dev->clk) {
 		struct i2c_timings *t = &dev->timings;
@@ -205,7 +238,8 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 				       I2C_CLASS_HWMON : I2C_CLASS_DEPRECATED;
 	adap->nr = -1;
 
-	if (dev->flags & ACCESS_NO_IRQ_SUSPEND)
+	if (dev->flags & ACCESS_NO_IRQ_SUSPEND ||
+	    (dev->flags & MODEL_MASK) == MODEL_GOOGLE)
 		dev_pm_set_driver_flags(device, DPM_FLAG_SMART_PREPARE);
 	else
 		dev_pm_set_driver_flags(device, DPM_FLAG_SMART_PREPARE | DPM_FLAG_SMART_SUSPEND);
@@ -228,8 +262,14 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 	if (ret) {
 		dw_i2c_plat_pm_cleanup(dev);
 		i2c_dw_prepare_clk(dev, false);
+		goto err_assert_rst;
 	}
 
+	return 0;
+
+err_assert_rst:
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE)
+		reset_control_assert(dev->rst);
 	return ret;
 }
 
@@ -249,10 +289,13 @@ static void dw_i2c_plat_remove(struct platform_device *pdev)
 	dw_i2c_plat_pm_cleanup(dev);
 
 	i2c_dw_prepare_clk(dev, false);
+
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE)
+		reset_control_assert(dev->rst);
 }
 
 static const struct of_device_id dw_i2c_of_match[] = {
-	{ .compatible = "google,i2c" },
+	{ .compatible = "google,i2c", .data = (void *)MODEL_GOOGLE },
 	{ .compatible = "mobileye,eyeq6lplus-i2c" },
 	{ .compatible = "mscc,ocelot-i2c" },
 	{ .compatible = "snps,designware-i2c" },

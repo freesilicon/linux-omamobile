@@ -25,10 +25,12 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/reset.h>
 #include <linux/swab.h>
 #include <linux/types.h>
 #include <linux/units.h>
@@ -998,6 +1000,11 @@ static int i2c_dw_runtime_suspend(struct device *device)
 	i2c_dw_disable(dev);
 	i2c_dw_prepare_clk(dev, false);
 
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE) {
+		pinctrl_pm_select_sleep_state(device);
+		reset_control_assert(dev->rst);
+	}
+
 	return 0;
 }
 
@@ -1007,26 +1014,69 @@ static int i2c_dw_suspend(struct device *device)
 
 	i2c_mark_adapter_suspended(&dev->adapter);
 
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE)
+		return pm_runtime_force_suspend(device);
+
 	return i2c_dw_runtime_suspend(device);
 }
 
 static int i2c_dw_runtime_resume(struct device *device)
 {
 	struct dw_i2c_dev *dev = dev_get_drvdata(device);
+	bool is_google = (dev->flags & MODEL_MASK) == MODEL_GOOGLE;
+	int ret;
 
-	if (!dev->shared_with_punit)
-		i2c_dw_prepare_clk(dev, true);
+	if (is_google && dev->cli_state) {
+		ret = pinctrl_select_state(dev->pinctrl, dev->cli_state);
+		if (ret)
+			return ret;
+	}
 
-	i2c_dw_init(dev);
+	if (!dev->shared_with_punit) {
+		ret = i2c_dw_prepare_clk(dev, true);
+		if (ret)
+			return ret;
+	}
+
+	if (is_google) {
+		ret = reset_control_deassert(dev->rst);
+		if (ret)
+			goto err_clk;
+	}
+
+	ret = i2c_dw_init(dev);
+	if (ret)
+		goto err_rst;
+
+	if (is_google) {
+		ret = pinctrl_pm_select_default_state(device);
+		if (ret)
+			goto err_rst;
+	}
 
 	return 0;
+
+err_rst:
+	if (is_google)
+		reset_control_assert(dev->rst);
+err_clk:
+	if (!dev->shared_with_punit)
+		i2c_dw_prepare_clk(dev, false);
+	return ret;
 }
 
 static int i2c_dw_resume(struct device *device)
 {
 	struct dw_i2c_dev *dev = dev_get_drvdata(device);
+	int ret;
 
-	i2c_dw_runtime_resume(device);
+	if ((dev->flags & MODEL_MASK) == MODEL_GOOGLE)
+		ret = pm_runtime_force_resume(device);
+	else
+		ret = i2c_dw_runtime_resume(device);
+	if (ret)
+		return ret;
+
 	i2c_mark_adapter_resumed(&dev->adapter);
 
 	return 0;

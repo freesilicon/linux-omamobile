@@ -120,6 +120,8 @@
 
 struct clk;
 struct device;
+struct pinctrl;
+struct pinctrl_state;
 struct reset_control;
 
 /**
@@ -181,6 +183,8 @@ struct reset_control;
  *	to generate the high period and low period of SCL line.
  * @emptyfifo_hold_master: true if the controller acting as master holds
  *	the clock when the Tx FIFO is empty instead of emitting a stop.
+ * @pinctrl: optional pinctrl handle for SoC CLI mux restore
+ * @cli_state: optional "cli" pinctrl state applied before enabling clocks
  *
  * HCNT and LCNT parameters can be used if the platform knows more accurate
  * values than the one computed based only on the input clock frequency.
@@ -240,6 +244,8 @@ struct dw_i2c_dev {
 	u32			bus_capacitance_pF;
 	bool			clk_freq_optimized;
 	bool			emptyfifo_hold_master;
+	struct pinctrl		*pinctrl;
+	struct pinctrl_state	*cli_state;
 };
 
 #define ACCESS_INTR_MASK			BIT(0)
@@ -247,6 +253,7 @@ struct dw_i2c_dev {
 #define ARBITRATION_SEMAPHORE			BIT(2)
 #define ACCESS_POLLING				BIT(3)
 
+#define MODEL_GOOGLE				BIT(9)
 #define MODEL_AMD_NAVI_GPU			BIT(10)
 #define MODEL_WANGXUN_SP			BIT(11)
 #define MODEL_MASK				GENMASK(11, 8)
