@@ -26,13 +26,33 @@ module_param(panel_full_reset, bool, 0644);
 MODULE_PARM_DESC(panel_full_reset,
 		 "Pulse panel reset GPIO during prepare instead of preserving ABL state (default: N)");
 
+enum laguna_panel_type {
+	LAGUNA_PANEL_MTEA,
+	LAGUNA_PANEL_RGEB,
+	LAGUNA_PANEL_RGEA,
+};
+
 struct laguna_panel_desc {
+	enum laguna_panel_type type;
 	const struct drm_display_mode mode;
 	const struct drm_dsc_config dsc;
 	unsigned long mode_flags;
 	u32 lanes;
 	u32 hs_rate_mbps;
+	u32 te_fps;
+	u32 te_usec;
+	bool cold_init;
 };
+
+struct laguna_dcs_cmd {
+	u8 len;
+	u8 data[8];
+};
+
+#define LAGUNA_DCS_CMD(...) {					\
+	.len = sizeof((const u8[]){ __VA_ARGS__ }),		\
+	.data = { __VA_ARGS__ },				\
+}
 
 struct laguna_panel {
 	struct drm_panel panel;
@@ -51,6 +71,27 @@ static inline struct laguna_panel *to_laguna_panel(struct drm_panel *panel)
 	return container_of(panel, struct laguna_panel, panel);
 }
 
+static void laguna_panel_dcs_send(struct mipi_dsi_device *dsi,
+				  const u8 *cmd, size_t len)
+{
+	ssize_t ret;
+
+	ret = mipi_dsi_dcs_write_buffer(dsi, cmd, len);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "DCS %#02x (%zu bytes) returned %zd\n",
+			 cmd[0], len, ret);
+}
+
+static void laguna_panel_dcs_seq(struct mipi_dsi_device *dsi,
+				 const struct laguna_dcs_cmd *cmds,
+				 size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		laguna_panel_dcs_send(dsi, cmds[i].data, cmds[i].len);
+}
+
 static int laguna_panel_dcs_window(struct mipi_dsi_device *dsi, u16 w, u16 h)
 {
 	int ret;
@@ -62,13 +103,174 @@ static int laguna_panel_dcs_window(struct mipi_dsi_device *dsi, u16 w, u16 h)
 	return mipi_dsi_dcs_set_page_address(dsi, 0, h - 1);
 }
 
-static int laguna_panel_prepare(struct drm_panel *panel)
+static void laguna_panel_rgeb_prepare(struct laguna_panel *ctx)
 {
-	struct laguna_panel *ctx = to_laguna_panel(panel);
+	static const struct laguna_dcs_cmd crosstalk_cmds[] = {
+		LAGUNA_DCS_CMD(0xf0, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xf1, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xd0, 0x08),
+		LAGUNA_DCS_CMD(0x91, 0x02),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x48, 0x8f),
+		LAGUNA_DCS_CMD(0x8f, 0x63),
+		LAGUNA_DCS_CMD(0xf0, 0xa5, 0xa5),
+		LAGUNA_DCS_CMD(0xf1, 0xa5, 0xa5),
+	};
+	static const struct laguna_dcs_cmd init_ffc_cmds[] = {
+		LAGUNA_DCS_CMD(0xf0, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xfc, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x3e, 0xc5),
+		LAGUNA_DCS_CMD(0xc5, 0x59, 0x02),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x36, 0xc5),
+		LAGUNA_DCS_CMD(0xc5, 0x11, 0x10, 0x50, 0x05),
+	};
+	static const struct laguna_dcs_cmd evt1_vddd_cmds[] = {
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x58, 0xd7),
+		LAGUNA_DCS_CMD(0xd7, 0x06),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x5b, 0xd7),
+		LAGUNA_DCS_CMD(0xd7, 0x06),
+		LAGUNA_DCS_CMD(0xfe, 0x80),
+		LAGUNA_DCS_CMD(0xfe, 0x00),
+	};
+	static const struct laguna_dcs_cmd lock_cmds[] = {
+		LAGUNA_DCS_CMD(0xfc, 0xa5, 0xa5),
+		LAGUNA_DCS_CMD(0xf0, 0xa5, 0xa5),
+	};
+	static const struct laguna_dcs_cmd mode_60hz_cmds[] = {
+		LAGUNA_DCS_CMD(0xf0, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0x83, 0x08),
+		LAGUNA_DCS_CMD(0xf7, 0x2f),
+		LAGUNA_DCS_CMD(0xf0, 0xa5, 0xa5),
+	};
+	static const u8 wrctrld_cmd[] = { MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20 };
+	static const u8 dbv_cmd[] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x04, 0xb9 };
+	static const u8 normal_cmd[] = { MIPI_DCS_ENTER_NORMAL_MODE };
 	struct mipi_dsi_device *dsi = ctx->dsi;
 	struct drm_dsc_picture_parameter_set pps;
 	u16 w = ctx->desc->mode.hdisplay;
 	u16 h = ctx->desc->mode.vdisplay;
+	u8 rev_id = 0;
+	int ret;
+
+	laguna_panel_dcs_seq(dsi, crosstalk_cmds, ARRAY_SIZE(crosstalk_cmds));
+
+	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgeb SLPOUT returned %d\n", ret);
+	msleep(120);
+
+	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgeb set_tear_on returned %d\n", ret);
+
+	ret = laguna_panel_dcs_window(dsi, w, h);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgeb window update returned %d\n", ret);
+
+	laguna_panel_dcs_seq(dsi, init_ffc_cmds, ARRAY_SIZE(init_ffc_cmds));
+
+	ret = mipi_dsi_dcs_read(dsi, 0xdb, &rev_id, sizeof(rev_id));
+	if (ret != sizeof(rev_id) || (rev_id >> 3) >= 8)
+		laguna_panel_dcs_seq(dsi, evt1_vddd_cmds,
+				     ARRAY_SIZE(evt1_vddd_cmds));
+
+	laguna_panel_dcs_seq(dsi, lock_cmds, ARRAY_SIZE(lock_cmds));
+	laguna_panel_dcs_seq(dsi, mode_60hz_cmds, ARRAY_SIZE(mode_60hz_cmds));
+
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	ret = mipi_dsi_compression_mode(dsi, true);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgeb compression enable returned %d\n", ret);
+
+	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgeb PPS write returned %d\n", ret);
+
+	laguna_panel_dcs_send(dsi, wrctrld_cmd, sizeof(wrctrld_cmd));
+	laguna_panel_dcs_send(dsi, dbv_cmd, sizeof(dbv_cmd));
+	laguna_panel_dcs_send(dsi, normal_cmd, sizeof(normal_cmd));
+}
+
+static void laguna_panel_handoff_prepare(struct laguna_panel *ctx)
+{
+	static const struct laguna_dcs_cmd mtea_unlock_cmds[] = {
+		LAGUNA_DCS_CMD(0x9d, 0x01),
+		LAGUNA_DCS_CMD(0xf0, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xc3, 0x02),
+	};
+	static const struct laguna_dcs_cmd mtea_latch_cmds[] = {
+		LAGUNA_DCS_CMD(0xf7, 0x2f),
+		LAGUNA_DCS_CMD(0xf0, 0xa5, 0xa5),
+	};
+	static const u8 wrctrld_cmd[] = { MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20 };
+	static const u8 mtea_dbv_cmd[] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x12, 0x1d };
+	static const u8 rgea_dbv_cmd[] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x04, 0xb9 };
+	static const u8 normal_cmd[] = { MIPI_DCS_ENTER_NORMAL_MODE };
+	struct mipi_dsi_device *dsi = ctx->dsi;
+	struct drm_dsc_picture_parameter_set pps;
+	u16 w = ctx->desc->mode.hdisplay;
+	u16 h = ctx->desc->mode.vdisplay;
+	u8 pwr_mode = 0;
+	u8 brt[2] = {};
+	bool waking;
+	int ret;
+
+	ret = mipi_dsi_dcs_get_power_mode(dsi, &pwr_mode);
+	waking = panel_full_reset || ret < 0 ||
+		 !(pwr_mode & MIPI_DSI_DCS_POWER_MODE_SLEEP);
+
+	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "SLPOUT returned %d (continuing handoff)\n", ret);
+	msleep(waking ? 120 : 10);
+
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	ret = mipi_dsi_compression_mode(dsi, true);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "compression mode enable returned %d\n", ret);
+
+	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "PPS write returned %d\n", ret);
+
+	if (ctx->desc->type == LAGUNA_PANEL_MTEA) {
+		laguna_panel_dcs_seq(dsi, mtea_unlock_cmds,
+				     ARRAY_SIZE(mtea_unlock_cmds));
+		ret = laguna_panel_dcs_window(dsi, w, h);
+		if (ret < 0)
+			dev_warn(&dsi->dev, "window update returned %d\n", ret);
+		laguna_panel_dcs_seq(dsi, mtea_latch_cmds,
+				     ARRAY_SIZE(mtea_latch_cmds));
+	} else {
+		ret = laguna_panel_dcs_window(dsi, w, h);
+		if (ret < 0)
+			dev_warn(&dsi->dev, "window update returned %d\n", ret);
+	}
+
+	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "set_tear_on returned %d\n", ret);
+
+	laguna_panel_dcs_send(dsi, wrctrld_cmd, sizeof(wrctrld_cmd));
+
+	ret = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_BRIGHTNESS,
+				brt, sizeof(brt));
+	if (panel_full_reset || ret < 0 || (!brt[0] && !brt[1])) {
+		if (ctx->desc->type == LAGUNA_PANEL_MTEA)
+			laguna_panel_dcs_send(dsi, mtea_dbv_cmd,
+					      sizeof(mtea_dbv_cmd));
+		else
+			laguna_panel_dcs_send(dsi, rgea_dbv_cmd,
+					      sizeof(rgea_dbv_cmd));
+	}
+
+	laguna_panel_dcs_send(dsi, normal_cmd, sizeof(normal_cmd));
+}
+
+static int laguna_panel_prepare(struct drm_panel *panel)
+{
+	struct laguna_panel *ctx = to_laguna_panel(panel);
+	struct mipi_dsi_device *dsi = ctx->dsi;
+	bool do_reset = ctx->desc->cold_init || panel_full_reset;
 	int ret;
 
 	if (ctx->prepared)
@@ -83,19 +285,23 @@ static int laguna_panel_prepare(struct drm_panel *panel)
 		ret = regulator_enable(ctx->vci);
 		if (ret)
 			goto err_vddi;
+		if (do_reset)
+			usleep_range(10000, 11000);
 	}
 	if (ctx->vddd) {
 		ret = regulator_enable(ctx->vddd);
 		if (ret)
 			goto err_vci;
+		if (do_reset)
+			usleep_range(10000, 11000);
 	}
 
 	if (ctx->reset_gpio) {
-		if (panel_full_reset) {
-			gpiod_set_value_cansleep(ctx->reset_gpio, 0);
-			usleep_range(10000, 12000);
+		if (do_reset) {
+			gpiod_direction_output(ctx->reset_gpio, 0);
+			usleep_range(1000, 1100);
 			gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-			usleep_range(10000, 12000);
+			usleep_range(5000, 5100);
 		} else {
 			/* Keep reset deasserted without pulsing to preserve ABL state */
 			gpiod_set_value_cansleep(ctx->reset_gpio, 1);
@@ -104,27 +310,10 @@ static int laguna_panel_prepare(struct drm_panel *panel)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
-	if (ret < 0)
-		dev_warn(&dsi->dev, "SLPOUT returned %d (continuing handoff)\n", ret);
-	msleep(panel_full_reset ? 120 : 10);
-
-	ret = laguna_panel_dcs_window(dsi, w, h);
-	if (ret < 0)
-		dev_warn(&dsi->dev, "window update returned %d\n", ret);
-
-	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
-	ret = mipi_dsi_compression_mode(dsi, true);
-	if (ret < 0)
-		dev_warn(&dsi->dev, "compression mode enable returned %d\n", ret);
-
-	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
-	if (ret < 0)
-		dev_warn(&dsi->dev, "PPS write returned %d\n", ret);
-
-	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
-	if (ret < 0)
-		dev_warn(&dsi->dev, "set_tear_on returned %d\n", ret);
+	if (ctx->desc->type == LAGUNA_PANEL_RGEB && do_reset)
+		laguna_panel_rgeb_prepare(ctx);
+	else
+		laguna_panel_handoff_prepare(ctx);
 
 	ctx->prepared = true;
 	return 0;
@@ -141,9 +330,11 @@ err_vddi:
 static int laguna_panel_enable(struct drm_panel *panel)
 {
 	struct laguna_panel *ctx = to_laguna_panel(panel);
+	static const u8 normal_cmd[] = { MIPI_DCS_ENTER_NORMAL_MODE };
 	int ret;
 
 	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	laguna_panel_dcs_send(ctx->dsi, normal_cmd, sizeof(normal_cmd));
 	ret = mipi_dsi_dcs_set_display_on(ctx->dsi);
 	if (ret < 0)
 		dev_warn(&ctx->dsi->dev, "DISPON returned %d\n", ret);
@@ -219,6 +410,7 @@ static const struct drm_panel_funcs laguna_panel_funcs = {
 #define MTEA_VTOTAL	(2992 + 12 + 4 + 22)
 
 static const struct laguna_panel_desc google_mtea_desc = {
+	.type = LAGUNA_PANEL_MTEA,
 	.mode = {
 		.clock = MTEA_HTOTAL * MTEA_VTOTAL * 60 / 1000,
 		.hdisplay = 1344,
@@ -231,7 +423,7 @@ static const struct laguna_panel_desc google_mtea_desc = {
 		.vtotal = MTEA_VTOTAL,
 		.width_mm = 70,
 		.height_mm = 156,
-		.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+		.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
 	},
 	.dsc = {
 		.line_buf_depth = 9,
@@ -292,12 +484,16 @@ static const struct laguna_panel_desc google_mtea_desc = {
 	.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 	.lanes = 4,
 	.hs_rate_mbps = 1368,
+	.te_fps = 120,
+	.te_usec = 275,
+	.cold_init = false,
 };
 
 #define RGEB_HTOTAL	(1080 + 44 + 16 + 20)
 #define RGEB_VTOTAL	(2364 + 10 + 6 + 10)
 
 static const struct laguna_panel_desc google_rgeb_desc = {
+	.type = LAGUNA_PANEL_RGEB,
 	.mode = {
 		.clock = RGEB_HTOTAL * RGEB_VTOTAL * 60 / 1000,
 		.hdisplay = 1080,
@@ -310,7 +506,7 @@ static const struct laguna_panel_desc google_rgeb_desc = {
 		.vtotal = RGEB_VTOTAL,
 		.width_mm = 67,
 		.height_mm = 147,
-		.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+		.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
 	},
 	.dsc = {
 		.line_buf_depth = 9,
@@ -370,12 +566,16 @@ static const struct laguna_panel_desc google_rgeb_desc = {
 	.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 	.lanes = 4,
 	.hs_rate_mbps = 865,
+	.te_fps = 60,
+	.te_usec = 8623,
+	.cold_init = true,
 };
 
 #define RGEA_HTOTAL	(2152 + 80 + 30 + 38)
 #define RGEA_VTOTAL	(2076 + 6 + 4 + 14)
 
 static const struct laguna_panel_desc google_rgea_desc = {
+	.type = LAGUNA_PANEL_RGEA,
 	.mode = {
 		.clock = RGEA_HTOTAL * RGEA_VTOTAL * 60 / 1000,
 		.hdisplay = 2152,
@@ -388,7 +588,7 @@ static const struct laguna_panel_desc google_rgea_desc = {
 		.vtotal = RGEA_VTOTAL,
 		.width_mm = 147,
 		.height_mm = 141,
-		.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+		.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
 	},
 	.dsc = {
 		.line_buf_depth = 9,
@@ -448,6 +648,9 @@ static const struct laguna_panel_desc google_rgea_desc = {
 	.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 	.lanes = 4,
 	.hs_rate_mbps = 1468,
+	.te_fps = 60,
+	.te_usec = 8635,
+	.cold_init = false,
 };
 
 static struct regulator *laguna_get_opt_regulator(struct device *dev, const char *id)
@@ -459,7 +662,8 @@ static struct regulator *laguna_get_opt_regulator(struct device *dev, const char
 	return reg;
 }
 
-const struct drm_dsc_config *laguna_panel_get_dsc_by_mode(u16 hdisplay, u16 vdisplay)
+static const struct laguna_panel_desc *
+laguna_panel_find_desc(u16 hdisplay, u16 vdisplay)
 {
 	static const struct laguna_panel_desc * const descs[] = {
 		&google_mtea_desc,
@@ -471,9 +675,24 @@ const struct drm_dsc_config *laguna_panel_get_dsc_by_mode(u16 hdisplay, u16 vdis
 	for (i = 0; i < ARRAY_SIZE(descs); i++) {
 		if (descs[i]->mode.hdisplay == hdisplay &&
 		    descs[i]->mode.vdisplay == vdisplay)
-			return &descs[i]->dsc;
+			return descs[i];
 	}
 	return NULL;
+}
+
+const struct drm_dsc_config *laguna_panel_get_dsc_by_mode(u16 hdisplay, u16 vdisplay)
+{
+	const struct laguna_panel_desc *desc = laguna_panel_find_desc(hdisplay, vdisplay);
+
+	return desc ? &desc->dsc : NULL;
+}
+
+void laguna_panel_get_te_info(u16 hdisplay, u16 vdisplay, u32 *te_fps, u32 *te_usec)
+{
+	const struct laguna_panel_desc *desc = laguna_panel_find_desc(hdisplay, vdisplay);
+
+	*te_fps = desc ? desc->te_fps : 60;
+	*te_usec = desc ? desc->te_usec : 373;
 }
 
 static int laguna_panel_probe(struct mipi_dsi_device *dsi)

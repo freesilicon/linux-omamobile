@@ -26,6 +26,8 @@ int dc9x00_dsc_configure(void __iomem *base, u8 panel_id,
 			 const struct drm_dsc_config *dsc_cfg);
 
 const struct drm_dsc_config *laguna_panel_get_dsc_by_mode(u16 hdisplay, u16 vdisplay);
+void laguna_panel_get_te_info(u16 hdisplay, u16 vdisplay,
+			      u32 *te_fps, u32 *te_usec);
 
 void dc9x00_gpu_probe_debugfs_init(struct dentry *root);
 void dc9x00_gpu_probe_debugfs_cleanup(void);
