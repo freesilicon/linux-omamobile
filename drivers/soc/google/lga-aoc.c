@@ -872,6 +872,10 @@ ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 	}
 
 	if (type == LGA_AOC_SVC_QUEUE) {
+		if (size <= sizeof(mhdr)) {
+			ret = -EIO;
+			goto out;
+		}
 		rp %= slots;
 		slot_ptr = aoc->dram + aoc->ipc_offset + offset + (size_t)rp * size;
 		memcpy(&mhdr, slot_ptr, sizeof(mhdr));
