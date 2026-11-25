@@ -690,30 +690,42 @@
 			status = "disabled";
 		};
 
-		usb: usb@c400000 {
-			compatible = "google,lga-dwc3";
-			reg = <0x0 0x0c400000 0x0 0xd060>;
-			interrupts = <GIC_SPI 580 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 597 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 598 IRQ_TYPE_LEVEL_HIGH 0>;
-			interrupt-names = "core", "hs_pme", "ss_pme";
-			clocks = <&hsion_usbc_non_sticky_clk>, <&hsion_usbc_sticky_clk>;
-			clock-names = "non_sticky", "sticky";
-			resets = <&hsion_resets 0xa>, <&hsion_resets 0xb>,
-				 <&hsion_resets 0xc>, <&hsion_resets 0x6>;
-			reset-names = "non_sticky", "sticky", "drd_bus", "top";
-			power-domains = <&hsio_n_usb_psw_pd>, <&hsio_n_usb_pd>;
-			power-domain-names = "psw", "top";
-			/* Omit usb3-phy so dwc3-google enters USB2ONLY_MODE without usb_phy_fw */
-			phys = <&usb_phy 0>;
-			phy-names = "usb2-phy";
-			dr_mode = "peripheral";
-			maximum-speed = "high-speed";
-			snps,quirk-frame-length-adjustment = <0x20>;
-			snps,gfladj-refclk-lpm-sel-quirk;
-			snps,incr-burst-type-adjustment = <4>;
-			google,usb-cfg-csr = <&usb_cfg_csr 0x0 0x20>;
-			status = "disabled";
+		simple_usb_bus {
+			compatible = "simple-bus";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			dma-ranges = <0x0 0x0 0x0 0x0 0x1 0x0>;
+			ranges;
+
+			usb: usb@c400000 {
+				compatible = "google,lga-dwc3";
+				reg = <0x0 0x0c400000 0x0 0xd060>;
+				interrupts = <GIC_SPI 580 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 597 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 598 IRQ_TYPE_LEVEL_HIGH 0>;
+				interrupt-names = "core", "hs_pme", "ss_pme";
+				clocks = <&hsion_usbc_non_sticky_clk>, <&hsion_usbc_sticky_clk>;
+				clock-names = "non_sticky", "sticky";
+				resets = <&hsion_resets 0xa>, <&hsion_resets 0xb>,
+					 <&hsion_resets 0xc>, <&hsion_resets 0x6>;
+				reset-names = "non_sticky", "sticky", "drd_bus", "top";
+				power-domains = <&hsio_n_usb_psw_pd>, <&hsio_n_usb_pd>;
+				power-domain-names = "psw", "top";
+				iommus = <&amb_smmu 0x8100>;
+				/*
+				 * Omit usb3-phy so dwc3-google enters
+				 * USB2ONLY_MODE without usb_phy_fw.
+				 */
+				phys = <&usb_phy 0>;
+				phy-names = "usb2-phy";
+				dr_mode = "peripheral";
+				maximum-speed = "high-speed";
+				snps,quirk-frame-length-adjustment = <0x20>;
+				snps,gfladj-refclk-lpm-sel-quirk;
+				snps,incr-burst-type-adjustment = <4>;
+				google,usb-cfg-csr = <&usb_cfg_csr 0x0 0x20>;
+				status = "disabled";
+			};
 		};
 
 		/* === Stage 2 Stubs (disabled; reference addresses / GIAs / IOMMUs) === */
@@ -819,17 +831,6 @@
 			status = "disabled";
 		};
 
-		gsa: gsa@e010000 {
-			compatible = "google,gs101-gsa-v1";
-			reg = <0x0 0x0e010000 0x0 0x1000>;
-			log-region = <&gsa_reserved_log>;
-			iommus = <&amb_smmu 0x8201>;
-			mboxes = <&gsa_ap_0_mba 0>;
-			mbox-channels = <1>;
-			channel-max-pending-msgs = <1>;
-			status = "disabled";
-		};
-
 		tpu_level_gia: interrupt-controller@36310300 {
 			compatible = "google,level-gia";
 			interrupt-controller;
@@ -867,7 +868,7 @@
 			status = "disabled";
 		};
 
-		sswrp_tpu@36000000 {
+		sswrp_tpu: sswrp_tpu@36000000 {
 			compatible = "simple-bus";
 			#address-cells = <1>;
 			#size-cells = <1>;
@@ -958,6 +959,33 @@
 				interrupt-parent = <&dpu_level_gia>;
 				status = "disabled";
 			};
+		};
+	};
+
+	gsa: gsa {
+		compatible = "google,gs101-gsa-v1";
+		log-region = <&gsa_reserved_log>;
+		iommus = <&amb_smmu 0x8201>;
+		mboxes = <&gsa_ap_0_mba 0>;
+		mbox-channels = <1>;
+		channel-max-pending-msgs = <1>;
+		status = "disabled";
+	};
+
+	trusty: trusty {
+		compatible = "android,trusty-smc-v1";
+
+		irq {
+			compatible = "android,trusty-irq-v1";
+			ipi-range = <0x8 0xf 0x8>;
+		};
+
+		log {
+			compatible = "android,trusty-log-v1";
+		};
+
+		virtio {
+			compatible = "android,trusty-virtio-v1";
 		};
 	};
 };

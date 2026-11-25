@@ -49,3 +49,47 @@
 &usb {
 	status = "okay";
 };
+
+&cpuacc_level_gia {
+	status = "okay";
+};
+
+&cpuacc_pulse_gia {
+	status = "okay";
+};
+
+&amb_smmu {
+	status = "okay";
+};
+
+&gsa_mba_syscon {
+	status = "okay";
+};
+
+&gsa_ap_0_mba {
+	status = "okay";
+};
+
+&gsa {
+	status = "okay";
+};
+
+&tpu_level_gia {
+	status = "okay";
+};
+
+&tpu_pulse_gia {
+	status = "okay";
+};
+
+&tpu_smmu {
+	status = "okay";
+};
+
+&sswrp_tpu {
+	status = "okay";
+};
+
+&buenos {
+	status = "okay";
+};

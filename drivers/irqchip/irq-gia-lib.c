@@ -145,13 +145,16 @@ static bool gia_telemetry_on = true;
 
 static int gia_telemetry_memory_alloc(struct gia_device_data *gdd)
 {
-	gdd->telemetry.concurrency = devm_kmalloc(gdd->dev, sizeof(*(gdd->telemetry.concurrency)) *
-						  MAX_CONCURRENCY, GFP_KERNEL);
+	gdd->telemetry.concurrency = devm_kcalloc(gdd->dev, MAX_CONCURRENCY,
+						  sizeof(*(gdd->telemetry.concurrency)),
+						  GFP_KERNEL);
 	if (!gdd->telemetry.concurrency)
 		return -ENOMEM;
 
-	gdd->telemetry.irq_latencies = devm_kmalloc(gdd->dev, sizeof(struct gia_irq_latency) *
-						    gdd->nr_irq_chips * IRQS_PER_REG, GFP_KERNEL);
+	gdd->telemetry.irq_latencies = devm_kcalloc(gdd->dev,
+						    gdd->nr_irq_chips * IRQS_PER_REG,
+						    sizeof(struct gia_irq_latency),
+						    GFP_KERNEL);
 	if (!gdd->telemetry.irq_latencies)
 		return -ENOMEM;
 
@@ -1278,7 +1281,7 @@ static int __init gia_lib_init(void)
 
 	return 0;
 }
-module_init(gia_lib_init);
+subsys_initcall(gia_lib_init);
 
 MODULE_AUTHOR("Google LLC");
 MODULE_DESCRIPTION("Generic Interrupt Aggregator Library");

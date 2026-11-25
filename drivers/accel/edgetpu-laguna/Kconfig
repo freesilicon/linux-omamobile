@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_ACCEL_EDGETPU_LAGUNA
+	tristate "Google Tensor G5 (Laguna) EdgeTPU NPU"
+	depends on DRM_ACCEL
+	depends on HAS_IOMEM && OF
+	depends on IOMMU_API
+	depends on DMA_SHARED_BUFFER
+	depends on PM
+	depends on GOOGLE_GSA
+	depends on ARM64 || COMPILE_TEST
+	select FW_LOADER
+	select GENERIC_ALLOCATOR
+	select IOMMU_IOVA
+	help
+	  Minimal clean-room driver for the Google Tensor G5 (Laguna / buenos)
+	  EdgeTPU neural accelerator. Exposes /dev/edgetpu-soc with the
+	  Litebuf VII inference ioctls, arm,smmu-v3 36-bit DMA-BUF mappings,
+	  KCI firmware control, and GSA firmware authentication.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called edgetpu-laguna.

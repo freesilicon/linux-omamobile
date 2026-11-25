@@ -18,21 +18,22 @@ config GOOGLE_GSA
 	help
 	  The GSA is the security core of Google Tensor SoCs. It authenticates
 	  and loads the firmware of other cores, such as the AoC (the audio
-	  and sensor DSP), and is reached through a mailbox of command and
-	  response registers.
+	  and sensor DSP) and the EdgeTPU, and is reached either directly
+	  through Samsung-style mailbox registers (gs201/zumapro) or via a
+	  Linux mailbox controller (google,gs101-gsa-v1 on Laguna).
 
-	  This driver gives the AoC driver the GSA's firmware loading and
-	  exposes status queries in debugfs, for bring-up.
+	  This driver provides firmware loading and lifecycle control for AoC
+	  and EdgeTPU drivers and exposes status queries in debugfs.
 
 config GOOGLE_GSA_TRUSTY
-	bool "AoC state commands through Trusty"
+	bool "AoC and TPU state commands through Trusty"
 	depends on GOOGLE_GSA && TRUSTY_VIRTIO_IPC
 	depends on TRUSTY_VIRTIO_IPC=y || GOOGLE_GSA=m
 	help
-	  Send AoC state commands (start, reset, get state) to the GSA's
-	  hwmgr.aoc service in Trusty, as Google's kernels do. Without it,
-	  only the mailbox command can be tried (aoc_cmd_mbox=1), which no
-	  Google kernel uses.
+	  Send AoC and EdgeTPU state commands (start, suspend, resume,
+	  shutdown, get state) to the GSA's hwmgr.aoc and hwmgr.tpu services
+	  in Trusty, as Google's kernels do. Without it, only the mailbox
+	  command path can be tried (aoc_cmd_mbox=1 / tpu_cmd_mbox=1).
 
 config GS201_AOC_SYSMMU
 	tristate "gs201 AoC System MMU static windows"

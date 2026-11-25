@@ -49,6 +49,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
+#include <linux/mailbox_client.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -76,6 +77,9 @@
 #define GSA_MB_CMD_RSP			BIT(31)
 
 /* Commands (gsa_mbox.h, enum gsa_mbox_cmd) */
+#define GSA_MB_CMD_LOAD_TPU_FW_IMG	50
+#define GSA_MB_CMD_TPU_CMD		51
+#define GSA_MB_CMD_UNLOAD_TPU_FW_IMG	52
 #define GSA_MB_CMD_LOAD_AOC_FW_IMG	90
 #define GSA_MB_CMD_AOC_CMD		91
 #define GSA_MB_CMD_UNLOAD_AOC_FW_IMG	92
@@ -108,11 +112,18 @@ static bool aoc_cmd_mbox;
 module_param(aoc_cmd_mbox, bool, 0444);
 MODULE_PARM_DESC(aoc_cmd_mbox, "Send AoC state commands on the mailbox (cmd 91) instead of through Trusty");
 
+static bool tpu_cmd_mbox;
+module_param(tpu_cmd_mbox, bool, 0444);
+MODULE_PARM_DESC(tpu_cmd_mbox, "Send TPU state commands on the mailbox (cmd 51/52) instead of through Trusty");
+
 static bool s2mpu_probe;
 module_param(s2mpu_probe, bool, 0444);
 MODULE_PARM_DESC(s2mpu_probe, "Expose s2mpu_ctrl0 (read under a GSA wakelock) in debugfs");
 
+struct gsa_tz;
+
 #if IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY)
+#define HWMGR_TPU_PORT			"com.android.trusty.gsa.hwmgr.tpu"
 #define HWMGR_AOC_PORT			"com.android.trusty.gsa.hwmgr.aoc"
 #define HWMGR_CMD_RESP			BIT(31)
 #define HWMGR_CMD_STATE_CMD		1
@@ -124,6 +135,7 @@ MODULE_PARM_DESC(s2mpu_probe, "Expose s2mpu_ctrl0 (read under a GSA wakelock) in
 
 struct gsa_tz {
 	struct device *dev;
+	const char *port;
 	struct tipc_chan *chan;
 	struct mutex req_lock;		/* one request at a time */
 	struct mutex rsp_lock;		/* rsp_* against the callback */
@@ -138,15 +150,22 @@ struct gsa {
 	struct device *dev;
 	void __iomem *base;
 	void __iomem *s2mpu;
-	spinlock_t irq_lock;		/* INTMR0 read-modify-write */
-	struct mutex cmd_lock;		/* one command in the shared registers */
+	bool use_mbox;
+#if IS_ENABLED(CONFIG_MAILBOX)
+	struct mbox_client mbox_client;
+	struct mbox_chan *mbox_chan;
+	u32 mbox_rsp[MBOX_SR_NUM];
+#endif
+	spinlock_t irq_lock;		/* INTMR0 / mbox_rsp synchronization */
+	struct mutex cmd_lock;		/* one command in flight */
 	struct mutex wake_lock;		/* wake_count, S2MPU */
 	struct completion rsp;
 	struct dentry *debugfs;
 	unsigned int wake_count;
 	bool wedged;
 #if IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY)
-	struct gsa_tz tz;
+	struct gsa_tz tz_aoc;
+	struct gsa_tz tz_tpu;
 #endif
 };
 
@@ -201,29 +220,93 @@ static int gsa_err_to_errno(u32 err)
 	}
 }
 
-/*
- * Run one command. Returns the number of response arguments copied to
- * @rsp_args, or a negative error. The GSA's own error code, if any, is
- * stored in @gsa_err.
- */
-static int gsa_cmd_timeout(struct gsa *gsa, u32 cmd, const u32 *req_args,
-			   u32 req_argc, u32 *rsp_args, u32 rsp_max,
-			   u32 *gsa_err, unsigned int timeout_ms)
+#if IS_ENABLED(CONFIG_MAILBOX)
+static void gsa_mbox_rx_callback(struct mbox_client *cl, void *mssg)
 {
+	struct gsa *gsa = container_of(cl, struct gsa, mbox_client);
+	const u32 *words = mssg;
+	unsigned long flags;
+	u32 argc, nwords;
+
+	spin_lock_irqsave(&gsa->irq_lock, flags);
+	memset(gsa->mbox_rsp, 0, sizeof(gsa->mbox_rsp));
+	if (words) {
+		argc = READ_ONCE(words[2]);
+		/* Copy 3-word header + argc args only; ignore oversize argc */
+		nwords = (argc > MBOX_SR_NUM - 3) ? 3 : 3 + argc;
+		memcpy(gsa->mbox_rsp, words, nwords * sizeof(u32));
+	}
+	spin_unlock_irqrestore(&gsa->irq_lock, flags);
+	complete(&gsa->rsp);
+}
+
+static int gsa_cmd_mbox_locked(struct gsa *gsa, u32 cmd, const u32 *req_args,
+			       u32 req_argc, u32 *rsp_args, u32 rsp_max,
+			       u32 *gsa_err, unsigned int timeout_ms)
+{
+	u32 msg[32] = { };
 	u32 rsp_cmd, err, argc, i;
+	unsigned long flags;
 	int ret;
 
-	if (req_argc + 2 > MBOX_SR_NUM)
-		return -EINVAL;
+	msg[0] = cmd;
+	msg[1] = req_argc;
+	for (i = 0; i < req_argc; i++)
+		msg[i + 2] = req_args[i];
 
-	*gsa_err = 0;
+	reinit_completion(&gsa->rsp);
+	ret = mbox_send_message(gsa->mbox_chan, msg);
+	if (ret < 0)
+		return ret;
 
-	mutex_lock(&gsa->cmd_lock);
-
-	if (gsa->wedged) {
-		ret = -EIO;
-		goto out;
+	if (!wait_for_completion_timeout(&gsa->rsp,
+					 msecs_to_jiffies(timeout_ms))) {
+		gsa->wedged = true;
+		dev_err(gsa->dev, "cmd %u: no answer in %u ms, mailbox disabled\n",
+			cmd, timeout_ms);
+		return -ETIMEDOUT;
 	}
+
+	spin_lock_irqsave(&gsa->irq_lock, flags);
+	rsp_cmd = gsa->mbox_rsp[0];
+	err = gsa->mbox_rsp[1];
+	argc = gsa->mbox_rsp[2];
+
+	dev_info(gsa->dev, "cmd %u: answer 0x%08x err %u argc %u\n",
+		 cmd, rsp_cmd, err, argc);
+
+	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc > MBOX_SR_NUM - 3) {
+		spin_unlock_irqrestore(&gsa->irq_lock, flags);
+		return -EIO;
+	}
+
+	*gsa_err = err;
+	if (err) {
+		spin_unlock_irqrestore(&gsa->irq_lock, flags);
+		return gsa_err_to_errno(err);
+	}
+
+	argc = min(argc, rsp_max);
+	for (i = 0; i < argc; i++)
+		rsp_args[i] = gsa->mbox_rsp[i + 3];
+	spin_unlock_irqrestore(&gsa->irq_lock, flags);
+
+	return argc;
+}
+#else
+static int gsa_cmd_mbox_locked(struct gsa *gsa, u32 cmd, const u32 *req_args,
+			       u32 req_argc, u32 *rsp_args, u32 rsp_max,
+			       u32 *gsa_err, unsigned int timeout_ms)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static int gsa_cmd_mmio_locked(struct gsa *gsa, u32 cmd, const u32 *req_args,
+			       u32 req_argc, u32 *rsp_args, u32 rsp_max,
+			       u32 *gsa_err, unsigned int timeout_ms)
+{
+	u32 rsp_cmd, err, argc, i;
 
 	writel(cmd, gsa->base + MBOX_SR(0));
 	writel(req_argc, gsa->base + MBOX_SR(1));
@@ -243,8 +326,7 @@ static int gsa_cmd_timeout(struct gsa *gsa, u32 cmd, const u32 *req_args,
 		gsa->wedged = true;
 		dev_err(gsa->dev, "cmd %u: no answer in %u ms, mailbox disabled\n",
 			cmd, timeout_ms);
-		ret = -ETIMEDOUT;
-		goto out;
+		return -ETIMEDOUT;
 	}
 
 	rsp_cmd = readl(gsa->base + MBOX_SR(0));
@@ -256,21 +338,51 @@ static int gsa_cmd_timeout(struct gsa *gsa, u32 cmd, const u32 *req_args,
 	dev_info(gsa->dev, "cmd %u: answer 0x%08x err %u argc %u\n",
 		 cmd, rsp_cmd, err, argc);
 
-	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc + 3 > MBOX_SR_NUM) {
-		ret = -EIO;
-		goto out;
-	}
+	if (rsp_cmd != (cmd | GSA_MB_CMD_RSP) || argc > MBOX_SR_NUM - 3)
+		return -EIO;
 
 	*gsa_err = err;
-	if (err) {
-		ret = gsa_err_to_errno(err);
-		goto out;
-	}
+	if (err)
+		return gsa_err_to_errno(err);
 
 	argc = min(argc, rsp_max);
 	for (i = 0; i < argc; i++)
 		rsp_args[i] = readl(gsa->base + MBOX_SR(i + 3));
-	ret = argc;
+	return argc;
+}
+
+/*
+ * Run one command. Returns the number of response arguments copied to
+ * @rsp_args, or a negative error. The GSA's own error code, if any, is
+ * stored in @gsa_err.
+ */
+static int gsa_cmd_timeout(struct gsa *gsa, u32 cmd, const u32 *req_args,
+			   u32 req_argc, u32 *rsp_args, u32 rsp_max,
+			   u32 *gsa_err, unsigned int timeout_ms)
+{
+	int ret;
+
+	if (req_argc + 2 > MBOX_SR_NUM)
+		return -EINVAL;
+
+	*gsa_err = 0;
+
+	mutex_lock(&gsa->cmd_lock);
+
+	if (gsa->wedged) {
+		ret = -EIO;
+		goto out;
+	}
+
+	if (gsa->use_mbox)
+		ret = gsa_cmd_mbox_locked(gsa, cmd, req_args, req_argc,
+					  rsp_args, rsp_max, gsa_err,
+					  timeout_ms);
+	else
+		ret = gsa_cmd_mmio_locked(gsa, cmd, req_args, req_argc,
+					  rsp_args, rsp_max, gsa_err,
+					  timeout_ms);
+
 out:
 	mutex_unlock(&gsa->cmd_lock);
 	return ret;
@@ -343,6 +455,46 @@ static void gsa_s2mpu_restore(struct gsa *gsa, u32 ctrl0)
 		writel(ctrl0, gsa->s2mpu + S2MPU_CTRL0);
 }
 
+static int gsa_load_fw_image(struct device *dev, u32 mb_cmd, const char *name,
+			     dma_addr_t header, phys_addr_t body)
+{
+	struct gsa *gsa = dev_get_drvdata(dev);
+	bool use_wakelock = !gsa->use_mbox || gsa->s2mpu;
+	u32 req[4], err, ctrl0 = 0;
+	int ret;
+
+	req[0] = lower_32_bits(header);
+	req[1] = upper_32_bits(header);
+	req[2] = lower_32_bits(body);
+	req[3] = upper_32_bits(body);
+
+	mutex_lock(&gsa->wake_lock);
+	if (use_wakelock) {
+		ret = gsa_wake_get(gsa);
+		if (ret)
+			goto out;
+		ctrl0 = gsa_s2mpu_open(gsa);
+	}
+
+	dev_info(dev, "loading %s image: header %pad body %pa\n",
+		 name, &header, &body);
+	ret = gsa_cmd_timeout(gsa, mb_cmd, req, 4, NULL, 0,
+			      &err, GSA_LOAD_TIMEOUT_MS);
+	if (ret > 0)
+		ret = 0;
+	if (ret)
+		dev_err(dev, "%s image load failed: %d (gsa err %u)\n",
+			name, ret, err);
+
+	if (use_wakelock) {
+		gsa_s2mpu_restore(gsa, ctrl0);
+		gsa_wake_put(gsa);
+	}
+out:
+	mutex_unlock(&gsa->wake_lock);
+	return ret;
+}
+
 /**
  * gsa_load_aoc_fw_image() - authenticate and load an AoC firmware image
  * @dev: the GSA device, from gsa_get_device()
@@ -357,44 +509,33 @@ static void gsa_s2mpu_restore(struct gsa *gsa, u32 ctrl0)
 int gsa_load_aoc_fw_image(struct device *dev, dma_addr_t header,
 			  phys_addr_t body)
 {
-	struct gsa *gsa = dev_get_drvdata(dev);
-	u32 req[4], err, ctrl0;
-	int ret;
-
-	req[0] = lower_32_bits(header);
-	req[1] = upper_32_bits(header);
-	req[2] = lower_32_bits(body);
-	req[3] = upper_32_bits(body);
-
-	mutex_lock(&gsa->wake_lock);
-	ret = gsa_wake_get(gsa);
-	if (ret)
-		goto out;
-
-	ctrl0 = gsa_s2mpu_open(gsa);
-
-	dev_info(dev, "loading AoC image: header %pad body %pa\n", &header, &body);
-	ret = gsa_cmd_timeout(gsa, GSA_MB_CMD_LOAD_AOC_FW_IMG, req, 4, NULL, 0,
-			      &err, GSA_LOAD_TIMEOUT_MS);
-	if (ret > 0)
-		ret = 0;
-	if (ret)
-		dev_err(dev, "AoC image load failed: %d (gsa err %u)\n", ret, err);
-
-	gsa_s2mpu_restore(gsa, ctrl0);
-	gsa_wake_put(gsa);
-out:
-	mutex_unlock(&gsa->wake_lock);
-	return ret;
+	return gsa_load_fw_image(dev, GSA_MB_CMD_LOAD_AOC_FW_IMG, "AoC",
+				 header, body);
 }
 EXPORT_SYMBOL_GPL(gsa_load_aoc_fw_image);
 
-static int gsa_mbox_aoc_cmd(struct gsa *gsa, u32 cmd)
+/**
+ * gsa_load_tpu_fw_image() - authenticate and load a TPU firmware image
+ * @dev: the GSA device, from gsa_get_device()
+ * @header: DMA address (for the GSA device) of the 4 KiB image header
+ * @body: physical address of the image body, at its load address
+ *
+ * Return: 0 on success, negative error otherwise.
+ */
+int gsa_load_tpu_fw_image(struct device *dev, dma_addr_t header,
+			  phys_addr_t body)
+{
+	return gsa_load_fw_image(dev, GSA_MB_CMD_LOAD_TPU_FW_IMG, "TPU",
+				 header, body);
+}
+EXPORT_SYMBOL_GPL(gsa_load_tpu_fw_image);
+
+static int gsa_mbox_state_cmd(struct gsa *gsa, u32 mb_cmd, u32 cmd)
 {
 	u32 rsp = 0, err;
 	int ret;
 
-	ret = gsa_cmd(gsa, GSA_MB_CMD_AOC_CMD, &cmd, 1, &rsp, 1, &err);
+	ret = gsa_cmd(gsa, mb_cmd, &cmd, 1, &rsp, 1, &err);
 	if (ret < 0)
 		return ret;
 	if (ret < 1)
@@ -447,6 +588,15 @@ static void gsa_tz_close(struct gsa_tz *tz)
 	}
 }
 
+static void gsa_tz_init(struct gsa_tz *tz, struct device *dev, const char *port)
+{
+	tz->dev = dev;
+	tz->port = port;
+	mutex_init(&tz->req_lock);
+	mutex_init(&tz->rsp_lock);
+	init_completion(&tz->reply);
+}
+
 static int gsa_tz_connect(struct gsa_tz *tz)
 {
 	struct tipc_chan *chan;
@@ -457,7 +607,7 @@ static int gsa_tz_connect(struct gsa_tz *tz)
 		return PTR_ERR(chan);
 
 	reinit_completion(&tz->reply);
-	ret = tipc_chan_connect(chan, HWMGR_AOC_PORT);
+	ret = tipc_chan_connect(chan, tz->port);
 	if (ret < 0)
 		goto err;
 
@@ -470,7 +620,7 @@ static int gsa_tz_connect(struct gsa_tz *tz)
 	}
 
 	tz->chan = chan;
-	dev_info(tz->dev, "TZ: %s connected\n", HWMGR_AOC_PORT);
+	dev_info(tz->dev, "TZ: %s connected\n", tz->port);
 	return 0;
 err:
 	tipc_chan_destroy(chan);
@@ -542,7 +692,8 @@ out:
 	return ret;
 }
 
-static int gsa_tz_aoc_cmd(struct gsa *gsa, u32 cmd)
+static int gsa_tz_hwmgr_cmd(struct gsa *gsa, struct gsa_tz *tz,
+			    const char *name, u32 cmd)
 {
 	struct {
 		u32 hdr_cmd;
@@ -555,7 +706,7 @@ static int gsa_tz_aoc_cmd(struct gsa *gsa, u32 cmd)
 	} rsp = { };
 	int ret;
 
-	ret = gsa_tz_xchg(&gsa->tz, &req, sizeof(req), &rsp, sizeof(rsp));
+	ret = gsa_tz_xchg(tz, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0)
 		return ret;
 	if (ret != sizeof(rsp) || rsp.hdr_cmd != (req.hdr_cmd | HWMGR_CMD_RESP)) {
@@ -564,13 +715,13 @@ static int gsa_tz_aoc_cmd(struct gsa *gsa, u32 cmd)
 		return -EIO;
 	}
 	if (rsp.err) {
-		dev_err(gsa->dev, "TZ: AoC cmd %u: err %u\n", cmd, rsp.err);
+		dev_err(gsa->dev, "TZ: %s cmd %u: err %u\n", name, cmd, rsp.err);
 		return -EIO;
 	}
 	return rsp.state;
 }
 
-static int gsa_tz_aoc_unload(struct gsa *gsa)
+static int gsa_tz_hwmgr_unload(struct gsa *gsa, struct gsa_tz *tz)
 {
 	u32 req = HWMGR_CMD_UNLOAD_IMG;
 	struct {
@@ -579,24 +730,81 @@ static int gsa_tz_aoc_unload(struct gsa *gsa)
 	} rsp = { };
 	int ret;
 
-	ret = gsa_tz_xchg(&gsa->tz, &req, sizeof(req), &rsp, sizeof(rsp));
+	ret = gsa_tz_xchg(tz, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0)
 		return ret;
 	if (ret != sizeof(rsp) || rsp.hdr_cmd != (req | HWMGR_CMD_RESP) || rsp.err)
 		return -EIO;
 	return 0;
 }
+
+static inline struct gsa_tz *gsa_aoc_tz(struct gsa *gsa)
+{
+	return &gsa->tz_aoc;
+}
+
+static inline struct gsa_tz *gsa_tpu_tz(struct gsa *gsa)
+{
+	return &gsa->tz_tpu;
+}
 #else
-static int gsa_tz_aoc_cmd(struct gsa *gsa, u32 cmd)
+static inline struct gsa_tz *gsa_aoc_tz(struct gsa *gsa)
+{
+	return NULL;
+}
+
+static inline struct gsa_tz *gsa_tpu_tz(struct gsa *gsa)
+{
+	return NULL;
+}
+
+static int gsa_tz_hwmgr_cmd(struct gsa *gsa, struct gsa_tz *tz,
+			    const char *name, u32 cmd)
 {
 	return -EOPNOTSUPP;
 }
 
-static int gsa_tz_aoc_unload(struct gsa *gsa)
+static int gsa_tz_hwmgr_unload(struct gsa *gsa, struct gsa_tz *tz)
 {
 	return -EOPNOTSUPP;
 }
 #endif
+
+static int gsa_send_state_cmd(struct device *dev, struct gsa_tz *tz,
+			      bool use_mbox, u32 mb_cmd, const char *name,
+			      u32 cmd)
+{
+	struct gsa *gsa = dev_get_drvdata(dev);
+	int ret;
+
+	if (use_mbox)
+		ret = gsa_mbox_state_cmd(gsa, mb_cmd, cmd);
+	else
+		ret = gsa_tz_hwmgr_cmd(gsa, tz, name, cmd);
+
+	dev_info(dev, "%s cmd %u (%s): %d\n", name, cmd,
+		 use_mbox ? "mailbox" : "Trusty", ret);
+	return ret;
+}
+
+static int gsa_unload_fw_image(struct device *dev, struct gsa_tz *tz,
+			       bool use_mbox, u32 mb_cmd, const char *name)
+{
+	struct gsa *gsa = dev_get_drvdata(dev);
+	u32 err;
+	int ret;
+
+	if (use_mbox) {
+		ret = gsa_cmd(gsa, mb_cmd, NULL, 0, NULL, 0, &err);
+		if (ret > 0)
+			ret = 0;
+	} else {
+		ret = gsa_tz_hwmgr_unload(gsa, tz);
+	}
+	dev_info(dev, "%s unload (%s): %d\n", name,
+		 use_mbox ? "mailbox" : "Trusty", ret);
+	return ret;
+}
 
 /**
  * gsa_send_aoc_cmd() - run an AoC management command (GSA_AOC_*)
@@ -608,16 +816,9 @@ static int gsa_tz_aoc_unload(struct gsa *gsa)
 int gsa_send_aoc_cmd(struct device *dev, u32 cmd)
 {
 	struct gsa *gsa = dev_get_drvdata(dev);
-	int ret;
 
-	if (aoc_cmd_mbox)
-		ret = gsa_mbox_aoc_cmd(gsa, cmd);
-	else
-		ret = gsa_tz_aoc_cmd(gsa, cmd);
-
-	dev_info(dev, "AoC cmd %u (%s): %d\n", cmd,
-		 aoc_cmd_mbox ? "mailbox" : "Trusty", ret);
-	return ret;
+	return gsa_send_state_cmd(dev, gsa_aoc_tz(gsa), aoc_cmd_mbox,
+				  GSA_MB_CMD_AOC_CMD, "AoC", cmd);
 }
 EXPORT_SYMBOL_GPL(gsa_send_aoc_cmd);
 
@@ -633,25 +834,45 @@ EXPORT_SYMBOL_GPL(gsa_send_aoc_cmd);
 int gsa_unload_aoc_fw_image(struct device *dev)
 {
 	struct gsa *gsa = dev_get_drvdata(dev);
-	u32 err;
-	int ret;
 
-	if (aoc_cmd_mbox) {
-		ret = gsa_cmd(gsa, GSA_MB_CMD_UNLOAD_AOC_FW_IMG, NULL, 0, NULL, 0,
-			      &err);
-		if (ret > 0)
-			ret = 0;
-	} else {
-		ret = gsa_tz_aoc_unload(gsa);
-	}
-	dev_info(dev, "AoC unload (%s): %d\n", aoc_cmd_mbox ? "mailbox" : "Trusty",
-		 ret);
-	return ret;
+	return gsa_unload_fw_image(dev, gsa_aoc_tz(gsa), aoc_cmd_mbox,
+				   GSA_MB_CMD_UNLOAD_AOC_FW_IMG, "AoC");
 }
 EXPORT_SYMBOL_GPL(gsa_unload_aoc_fw_image);
 
 /**
- * gsa_get_device() - find the GSA a client's "google,gsa" property names
+ * gsa_send_tpu_cmd() - run a TPU management command (enum gsa_tpu_cmd)
+ * @dev: the GSA device, from gsa_get_device()
+ * @cmd: the command
+ *
+ * Return: the new TPU state (enum gsa_tpu_state) or a negative error.
+ */
+int gsa_send_tpu_cmd(struct device *dev, enum gsa_tpu_cmd cmd)
+{
+	struct gsa *gsa = dev_get_drvdata(dev);
+
+	return gsa_send_state_cmd(dev, gsa_tpu_tz(gsa), tpu_cmd_mbox,
+				  GSA_MB_CMD_TPU_CMD, "TPU", cmd);
+}
+EXPORT_SYMBOL_GPL(gsa_send_tpu_cmd);
+
+/**
+ * gsa_unload_tpu_fw_image() - unlock and unload the TPU image
+ * @dev: the GSA device, from gsa_get_device()
+ *
+ * Return: 0 on success, negative error otherwise.
+ */
+int gsa_unload_tpu_fw_image(struct device *dev)
+{
+	struct gsa *gsa = dev_get_drvdata(dev);
+
+	return gsa_unload_fw_image(dev, gsa_tpu_tz(gsa), tpu_cmd_mbox,
+				   GSA_MB_CMD_UNLOAD_TPU_FW_IMG, "TPU");
+}
+EXPORT_SYMBOL_GPL(gsa_unload_tpu_fw_image);
+
+/**
+ * gsa_get_device() - find the GSA a client's "google,gsa" or "gsa-device" property names
  * @client: the client device
  *
  * Return: the GSA device with a reference held (drop it with
@@ -664,6 +885,8 @@ struct device *gsa_get_device(struct device *client)
 	struct device_node *np;
 
 	np = of_parse_phandle(client->of_node, "google,gsa", 0);
+	if (!np)
+		np = of_parse_phandle(client->of_node, "gsa-device", 0);
 	if (!np)
 		return ERR_PTR(-ENODEV);
 
@@ -740,7 +963,8 @@ DEFINE_SHOW_ATTRIBUTE(gsa_aoc_state);
 static int gsa_aoc_state_tz_show(struct seq_file *s, void *unused)
 {
 	struct gsa *gsa = s->private;
-	int ret = gsa_tz_aoc_cmd(gsa, GSA_AOC_GET_STATE);
+	int ret = gsa_tz_hwmgr_cmd(gsa, gsa_aoc_tz(gsa), "AoC",
+				   GSA_AOC_GET_STATE);
 
 	if (ret < 0)
 		seq_printf(s, "error %d\n", ret);
@@ -749,6 +973,29 @@ static int gsa_aoc_state_tz_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(gsa_aoc_state_tz);
+
+static const char *gsa_tpu_state_name(int state)
+{
+	static const char * const names[] = {
+		"inactive", "loaded", "running", "suspended"
+	};
+
+	return state >= 0 && state < ARRAY_SIZE(names) ? names[state] : "?";
+}
+
+static int gsa_tpu_state_tz_show(struct seq_file *s, void *unused)
+{
+	struct gsa *gsa = s->private;
+	int ret = gsa_tz_hwmgr_cmd(gsa, gsa_tpu_tz(gsa), "TPU",
+				   GSA_TPU_GET_STATE);
+
+	if (ret < 0)
+		seq_printf(s, "error %d\n", ret);
+	else
+		seq_printf(s, "state %d (%s)\n", ret, gsa_tpu_state_name(ret));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(gsa_tpu_state_tz);
 
 static int gsa_s2mpu_ctrl0_show(struct seq_file *s, void *unused)
 {
@@ -771,9 +1018,8 @@ DEFINE_SHOW_ATTRIBUTE(gsa_s2mpu_ctrl0);
 static int gsa_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct resource *res;
 	struct gsa *gsa;
-	int irq, ret;
+	int ret;
 
 	gsa = devm_kzalloc(dev, sizeof(*gsa), GFP_KERNEL);
 	if (!gsa)
@@ -785,39 +1031,63 @@ static int gsa_probe(struct platform_device *pdev)
 	mutex_init(&gsa->wake_lock);
 	init_completion(&gsa->rsp);
 #if IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY)
-	gsa->tz.dev = dev;
-	mutex_init(&gsa->tz.req_lock);
-	mutex_init(&gsa->tz.rsp_lock);
-	init_completion(&gsa->tz.reply);
+	gsa_tz_init(&gsa->tz_aoc, dev, HWMGR_AOC_PORT);
+	gsa_tz_init(&gsa->tz_tpu, dev, HWMGR_TPU_PORT);
 #endif
 
-	gsa->base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(gsa->base))
-		return PTR_ERR(gsa->base);
+	if (of_property_present(dev->of_node, "mboxes")) {
+		if (!IS_ENABLED(CONFIG_MAILBOX))
+			return dev_err_probe(dev, -ENODEV,
+					     "CONFIG_MAILBOX disabled\n");
+#if IS_ENABLED(CONFIG_MAILBOX)
+		gsa->use_mbox = true;
+		gsa->mbox_client.dev = dev;
+		gsa->mbox_client.tx_block = true;
+		gsa->mbox_client.tx_tout = GSA_CMD_TIMEOUT_MS;
+		gsa->mbox_client.rx_callback = gsa_mbox_rx_callback;
+		gsa->mbox_chan = mbox_request_channel(&gsa->mbox_client, 0);
+		if (IS_ERR(gsa->mbox_chan))
+			return dev_err_probe(dev, PTR_ERR(gsa->mbox_chan),
+					     "failed to request mailbox channel\n");
+#endif
+		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(36));
+		if (ret) {
+			ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+			if (ret)
+				goto err_free_mbox;
+		}
+	} else {
+		struct resource *res;
+		int irq;
 
-	/* Optional second range: mapped, but only touched under a wakelock */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	if (res) {
-		gsa->s2mpu = devm_ioremap_resource(dev, res);
-		if (IS_ERR(gsa->s2mpu))
-			return PTR_ERR(gsa->s2mpu);
+		gsa->base = devm_platform_ioremap_resource(pdev, 0);
+		if (IS_ERR(gsa->base))
+			return PTR_ERR(gsa->base);
+
+		/* Optional second range: mapped, but only touched under a wakelock */
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+		if (res) {
+			gsa->s2mpu = devm_ioremap_resource(dev, res);
+			if (IS_ERR(gsa->s2mpu))
+				return PTR_ERR(gsa->s2mpu);
+		}
+
+		irq = platform_get_irq(pdev, 0);
+		if (irq < 0)
+			return irq;
+
+		/* Image headers for the GSA are kept below 4 GiB, to be safe */
+		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+		if (ret)
+			return ret;
+
+		/* Known state: all 16 GSA -> AP interrupts masked, as Google does */
+		writel(0xffff, gsa->base + MBOX_INTMR0);
+
+		ret = devm_request_irq(dev, irq, gsa_irq, 0, dev_name(dev), gsa);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to request IRQ\n");
 	}
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
-
-	/* Image headers for the GSA are kept below 4 GiB, to be safe */
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
-
-	/* Known state: all 16 GSA -> AP interrupts masked, as Google does */
-	writel(0xffff, gsa->base + MBOX_INTMR0);
-
-	ret = devm_request_irq(dev, irq, gsa_irq, 0, dev_name(dev), gsa);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to request IRQ\n");
 
 	gsa->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("sjtag_status", 0400, gsa->debugfs, gsa,
@@ -825,9 +1095,12 @@ static int gsa_probe(struct platform_device *pdev)
 	if (aoc_query)
 		debugfs_create_file("aoc_state", 0400, gsa->debugfs, gsa,
 				    &gsa_aoc_state_fops);
-	if (IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY))
+	if (IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY)) {
 		debugfs_create_file("aoc_state_tz", 0400, gsa->debugfs, gsa,
 				    &gsa_aoc_state_tz_fops);
+		debugfs_create_file("tpu_state_tz", 0400, gsa->debugfs, gsa,
+				    &gsa_tpu_state_tz_fops);
+	}
 	if (s2mpu_probe && gsa->s2mpu)
 		debugfs_create_file("s2mpu_ctrl0", 0400, gsa->debugfs, gsa,
 				    &gsa_s2mpu_ctrl0_fops);
@@ -835,11 +1108,19 @@ static int gsa_probe(struct platform_device *pdev)
 	/* Last: gsa_get_device() treats drvdata as "probed" */
 	platform_set_drvdata(pdev, gsa);
 
-	dev_info(dev, "mailbox ready, irq %d%s%s%s\n", irq,
+	dev_info(dev, "mailbox ready (%s%s%s%s)\n",
+		 gsa->use_mbox ? "mbox framework" : "mmio",
 		 gsa->s2mpu ? ", S2MPU" : "",
 		 IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY) ? ", Trusty" : "",
 		 aoc_query ? ", aoc_state query enabled" : "");
 	return 0;
+
+err_free_mbox:
+#if IS_ENABLED(CONFIG_MAILBOX)
+	if (gsa->use_mbox && !IS_ERR_OR_NULL(gsa->mbox_chan))
+		mbox_free_channel(gsa->mbox_chan);
+#endif
+	return ret;
 }
 
 static void gsa_remove(struct platform_device *pdev)
@@ -848,9 +1129,19 @@ static void gsa_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(gsa->debugfs);
 #if IS_ENABLED(CONFIG_GOOGLE_GSA_TRUSTY)
-	mutex_lock(&gsa->tz.req_lock);
-	gsa_tz_close(&gsa->tz);
-	mutex_unlock(&gsa->tz.req_lock);
+	mutex_lock(&gsa->tz_aoc.req_lock);
+	gsa_tz_close(&gsa->tz_aoc);
+	mutex_unlock(&gsa->tz_aoc.req_lock);
+
+	mutex_lock(&gsa->tz_tpu.req_lock);
+	gsa_tz_close(&gsa->tz_tpu);
+	mutex_unlock(&gsa->tz_tpu.req_lock);
+#endif
+#if IS_ENABLED(CONFIG_MAILBOX)
+	if (gsa->use_mbox) {
+		mbox_free_channel(gsa->mbox_chan);
+		return;
+	}
 #endif
 	writel(0xffff, gsa->base + MBOX_INTMR0);
 }
@@ -858,6 +1149,7 @@ static void gsa_remove(struct platform_device *pdev)
 static const struct of_device_id gsa_of_match[] = {
 	{ .compatible = "google,gs201-gsa" },
 	{ .compatible = "google,zumapro-gsa" },
+	{ .compatible = "google,gs101-gsa-v1" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, gsa_of_match);
