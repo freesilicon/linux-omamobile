@@ -4523,6 +4523,9 @@ static int arm_smmu_def_domain_type(struct device *dev)
 			return IOMMU_DOMAIN_IDENTITY;
 	}
 
+	if (dev->of_node && of_property_read_bool(dev->of_node, "iommu-idmapped"))
+		return IOMMU_DOMAIN_IDENTITY;
+
 	return 0;
 }
 
