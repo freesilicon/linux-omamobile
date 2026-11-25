@@ -266,6 +266,89 @@ static void laguna_panel_handoff_prepare(struct laguna_panel *ctx)
 	laguna_panel_dcs_send(dsi, normal_cmd, sizeof(normal_cmd));
 }
 
+static void laguna_panel_rgea_prepare(struct laguna_panel *ctx)
+{
+	static const struct laguna_dcs_cmd init_cmds[] = {
+		LAGUNA_DCS_CMD(0xf0, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xb9, 0x44, 0x51),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x04, 0xb9),
+		LAGUNA_DCS_CMD(0xb9, 0x81, 0xe0, 0x02, 0x81, 0xe0, 0x02),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x0d, 0xb9),
+		LAGUNA_DCS_CMD(0xb9, 0x02, 0x02, 0x07, 0x02, 0x02, 0x07),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x06, 0xbd),
+		LAGUNA_DCS_CMD(0xbd, 0x80),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x04, 0xbb),
+		LAGUNA_DCS_CMD(0xbb, 0x0c),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x03, 0xbb),
+		LAGUNA_DCS_CMD(0xbb, 0x00, 0x0c),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x48, 0xf4),
+		LAGUNA_DCS_CMD(0xf4, 0x73, 0x73, 0x73, 0x73),
+		LAGUNA_DCS_CMD(0xfc, 0x5a, 0x5a),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0xa1, 0x62),
+		LAGUNA_DCS_CMD(0x62, 0x01),
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x02, 0xc4),
+		LAGUNA_DCS_CMD(0xc4, 0x00),
+		LAGUNA_DCS_CMD(0xfc, 0xa5, 0xa5),
+	};
+	static const struct laguna_dcs_cmd dvt1_timing_cmds[] = {
+		LAGUNA_DCS_CMD(0xb0, 0x00, 0x88, 0xad),
+		LAGUNA_DCS_CMD(0xad, 0x23, 0x00, 0x04),
+	};
+	static const struct laguna_dcs_cmd mode_60hz_lock_cmds[] = {
+		LAGUNA_DCS_CMD(0xbd, 0x01),
+		LAGUNA_DCS_CMD(0x83, 0x02),
+		LAGUNA_DCS_CMD(0xf7, 0x2f),
+		LAGUNA_DCS_CMD(0xf0, 0xa5, 0xa5),
+	};
+	static const u8 dsc_on_cmd[] = { 0x9d, 0x01 };
+	static const u8 wrctrld_cmd[] = { MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20 };
+	static const u8 dbv_cmd[] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x04, 0x4f };
+	static const u8 normal_cmd[] = { MIPI_DCS_ENTER_NORMAL_MODE };
+	struct mipi_dsi_device *dsi = ctx->dsi;
+	struct drm_dsc_picture_parameter_set pps;
+	u16 w = ctx->desc->mode.hdisplay;
+	u16 h = ctx->desc->mode.vdisplay;
+	u8 rev_id = 0;
+	int ret;
+
+	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgea SLPOUT returned %d\n", ret);
+	msleep(120);
+
+	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgea set_tear_on returned %d\n", ret);
+
+	laguna_panel_dcs_seq(dsi, init_cmds, ARRAY_SIZE(init_cmds));
+
+	ret = mipi_dsi_dcs_read(dsi, 0xdb, &rev_id, sizeof(rev_id));
+	if (ret != sizeof(rev_id) || (rev_id >> 3) >= 0x10)
+		laguna_panel_dcs_seq(dsi, dvt1_timing_cmds,
+				     ARRAY_SIZE(dvt1_timing_cmds));
+
+	laguna_panel_dcs_seq(dsi, mode_60hz_lock_cmds,
+			     ARRAY_SIZE(mode_60hz_lock_cmds));
+
+	ret = laguna_panel_dcs_window(dsi, w, h);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgea window update returned %d\n", ret);
+
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	ret = mipi_dsi_compression_mode(dsi, true);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgea compression enable returned %d\n", ret);
+
+	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
+	if (ret < 0)
+		dev_warn(&dsi->dev, "rgea PPS write returned %d\n", ret);
+
+	laguna_panel_dcs_send(dsi, dsc_on_cmd, sizeof(dsc_on_cmd));
+	laguna_panel_dcs_send(dsi, wrctrld_cmd, sizeof(wrctrld_cmd));
+	laguna_panel_dcs_send(dsi, dbv_cmd, sizeof(dbv_cmd));
+	laguna_panel_dcs_send(dsi, normal_cmd, sizeof(normal_cmd));
+}
+
 static int laguna_panel_prepare(struct drm_panel *panel)
 {
 	struct laguna_panel *ctx = to_laguna_panel(panel);
@@ -301,7 +384,7 @@ static int laguna_panel_prepare(struct drm_panel *panel)
 			gpiod_direction_output(ctx->reset_gpio, 0);
 			usleep_range(1000, 1100);
 			gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-			usleep_range(5000, 5100);
+			usleep_range(10000, 11000);
 		} else {
 			/* Keep reset deasserted without pulsing to preserve ABL state */
 			gpiod_set_value_cansleep(ctx->reset_gpio, 1);
@@ -310,8 +393,10 @@ static int laguna_panel_prepare(struct drm_panel *panel)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	if (ctx->desc->type == LAGUNA_PANEL_RGEB && do_reset)
+	if (do_reset && ctx->desc->type == LAGUNA_PANEL_RGEB)
 		laguna_panel_rgeb_prepare(ctx);
+	else if (do_reset && ctx->desc->type == LAGUNA_PANEL_RGEA)
+		laguna_panel_rgea_prepare(ctx);
 	else
 		laguna_panel_handoff_prepare(ctx);
 
@@ -650,7 +735,7 @@ static const struct laguna_panel_desc google_rgea_desc = {
 	.hs_rate_mbps = 1468,
 	.te_fps = 60,
 	.te_usec = 8635,
-	.cold_init = false,
+	.cold_init = true,
 };
 
 static struct regulator *laguna_get_opt_regulator(struct device *dev, const char *id)

@@ -55,22 +55,21 @@ static int cmd_opt;
 module_param(cmd_opt, int, 0644);
 MODULE_PARM_DESC(cmd_opt, "DC9x00 OUTPUT0_CMD_OPT value (default: 0 trigger mode)");
 
-struct dc9x00_drm {
-	struct drm_device drm;
-	struct device *dev;
-	void __iomem *base;
-	void __iomem *gpcsr;
-	struct dev_pm_domain_list *pd_list;
+#define DC9X00_MAX_PIPES	2
+
+struct dc9x00_drm;
+
+struct dc9x00_pipe {
+	struct dc9x00_drm *priv;
+	u8 id;
 	struct drm_plane primary;
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector *connector;
 	struct drm_bridge *bridge;
-	struct dentry *debug_dir;
 
+	/* Protects pending_event completion against IRQ/watchdog races */
 	spinlock_t event_lock;
-	/* Protects BE_INTR_ENABLE, frame_pending, and underrun_enabled */
-	spinlock_t intr_lock;
 	struct drm_pending_vblank_event *pending_event;
 	struct timer_list commit_watchdog;
 	atomic64_t irq_frm_start;
@@ -83,80 +82,159 @@ struct dc9x00_drm {
 	bool underrun_enabled;
 };
 
+struct dc9x00_drm {
+	struct drm_device drm;
+	struct device *dev;
+	void __iomem *base;
+	void __iomem *gpcsr;
+	struct dev_pm_domain_list *pd_list;
+	struct dc9x00_pipe pipes[DC9X00_MAX_PIPES];
+	unsigned int num_pipes;
+	struct dentry *debug_dir;
+
+	/* Serializes pipeline enable/disable and HW reset across pipes */
+	struct mutex hw_lock;
+	/* Protects BE_INTR_ENABLE, POST_PROCESS_OUT, CLK_ISO, and pipe flags */
+	spinlock_t intr_lock;
+	u32 active_mask;
+};
+
 static inline struct dc9x00_drm *to_dc9x00(struct drm_device *drm)
 {
 	return container_of(drm, struct dc9x00_drm, drm);
 }
 
-static void dc9x00_set_underrun_irq(struct dc9x00_drm *priv, bool enable)
+static inline struct dc9x00_pipe *pipe_from_plane(struct drm_plane *plane)
 {
+	return container_of(plane, struct dc9x00_pipe, primary);
+}
+
+static inline struct dc9x00_pipe *pipe_from_crtc(struct drm_crtc *crtc)
+{
+	return container_of(crtc, struct dc9x00_pipe, crtc);
+}
+
+static void dc9x00_set_underrun_irq(struct dc9x00_pipe *pipe, bool enable)
+{
+	struct dc9x00_drm *priv = pipe->priv;
+	u32 bit = DC9X00_BE_OUTPATH_UNDERRUN(pipe->id);
 	unsigned long flags;
 	u32 intr_en;
 
 	spin_lock_irqsave(&priv->intr_lock, flags);
-	if (!priv->active) {
-		priv->underrun_enabled = false;
+	if (!pipe->active) {
+		pipe->underrun_enabled = false;
 		spin_unlock_irqrestore(&priv->intr_lock, flags);
 		return;
 	}
 
-	writel(DC9X00_BE_OUTPATH0_UNDERRUN, priv->base + DC9X00_BE_INTR_STATUS);
-	writel(DC9X00_BE_OUTPATH0_UNDERRUN, priv->base + DC9X00_BE_INTR_OVERFLOW);
+	writel(bit, priv->base + DC9X00_BE_INTR_STATUS);
+	writel(bit, priv->base + DC9X00_BE_INTR_OVERFLOW);
 
 	intr_en = readl(priv->base + DC9X00_BE_INTR_ENABLE);
 	if (enable)
-		intr_en |= DC9X00_BE_OUTPATH0_UNDERRUN;
+		intr_en |= bit;
 	else
-		intr_en &= ~DC9X00_BE_OUTPATH0_UNDERRUN;
+		intr_en &= ~bit;
 	writel(intr_en, priv->base + DC9X00_BE_INTR_ENABLE);
-	priv->underrun_enabled = enable;
+	pipe->underrun_enabled = enable;
 	spin_unlock_irqrestore(&priv->intr_lock, flags);
 }
 
-static void dc9x00_complete_pending_event(struct dc9x00_drm *priv)
+static void dc9x00_complete_pending_event(struct dc9x00_pipe *pipe)
 {
+	struct dc9x00_drm *priv = pipe->priv;
 	struct drm_pending_vblank_event *ev;
 	unsigned long flags;
 
-	spin_lock_irqsave(&priv->event_lock, flags);
-	ev = priv->pending_event;
-	priv->pending_event = NULL;
+	spin_lock_irqsave(&pipe->event_lock, flags);
+	ev = pipe->pending_event;
+	pipe->pending_event = NULL;
 	if (ev) {
 		spin_lock(&priv->drm.event_lock);
-		drm_crtc_send_vblank_event(&priv->crtc, ev);
+		drm_crtc_send_vblank_event(&pipe->crtc, ev);
 		spin_unlock(&priv->drm.event_lock);
 	}
-	spin_unlock_irqrestore(&priv->event_lock, flags);
+	spin_unlock_irqrestore(&pipe->event_lock, flags);
 }
 
 static void dc9x00_commit_watchdog_fn(struct timer_list *t)
 {
-	struct dc9x00_drm *priv = timer_container_of(priv, t, commit_watchdog);
+	struct dc9x00_pipe *pipe = timer_container_of(pipe, t, commit_watchdog);
+	struct dc9x00_drm *priv = pipe->priv;
 
-	dc9x00_set_underrun_irq(priv, false);
-	WRITE_ONCE(priv->frame_pending, false);
+	dc9x00_set_underrun_irq(pipe, false);
+	WRITE_ONCE(pipe->frame_pending, false);
 
-	if (priv->pending_event) {
-		atomic64_inc(&priv->watchdog_fires);
-		if (priv->active)
+	if (pipe->pending_event) {
+		atomic64_inc(&pipe->watchdog_fires);
+		if (pipe->active) {
+			u32 coord = readl(priv->base +
+					  DC9X00_SH_OUTPUT_CURRENT_COORD(pipe->id));
+
 			dev_warn_ratelimited(priv->dev,
-					     "DC9x00 frame watchdog (fe0=%#x be0=%#x be1=%#x coord=%#x req=%#x rev=%#x)\n",
+					     "DC9x00 pipe%u watchdog (fe0=%#x be0=%#x be1=%#x coord=%#x req=%#x rev=%#x)\n",
+					     pipe->id,
 					     readl(priv->base + DC9X00_FE0_INTR_STATUS),
 					     readl(priv->base + DC9X00_BE_INTR_STATUS),
 					     readl(priv->base + DC9X00_BE_INTR_STATUS1),
-					     readl(priv->base + DC9X00_SH_OUTPUT0_CURRENT_COORD),
+					     coord,
 					     readl(priv->base + DC9X00_BE_DEBUG_REQ_BURST_CNT),
 					     readl(priv->base + DC9X00_BE_DEBUG_REV_BURST_CNT));
+		}
 	}
-	dc9x00_complete_pending_event(priv);
+	dc9x00_complete_pending_event(pipe);
+}
+
+static void dc9x00_handle_pipe_irq(struct dc9x00_pipe *pipe, u32 st0)
+{
+	u32 underrun = DC9X00_BE_OUTPATH_UNDERRUN(pipe->id);
+	u32 frm_start = DC9X00_BE_OUTPATH_FRM_START(pipe->id);
+	u32 frm_done = DC9X00_BE_OUTPATH_FRM_DONE(pipe->id);
+	u32 te_rising = DC9X00_BE_OUTPATH_TE_RISING(pipe->id);
+
+	if (!READ_ONCE(pipe->active))
+		return;
+
+	if ((st0 & underrun) &&
+	    READ_ONCE(pipe->underrun_enabled) &&
+	    READ_ONCE(pipe->frame_pending)) {
+		atomic64_inc(&pipe->irq_underrun);
+		dev_warn_ratelimited(pipe->priv->dev,
+				     "DC9x00 Outpath%u underrun (st0=%#x)\n",
+				     pipe->id, st0);
+	}
+
+	if (st0 & frm_start) {
+		atomic64_inc(&pipe->irq_frm_start);
+		if (!(st0 & frm_done) && READ_ONCE(pipe->frame_pending))
+			dc9x00_set_underrun_irq(pipe, true);
+	}
+
+	if (st0 & frm_done) {
+		atomic64_inc(&pipe->irq_frm_done);
+		dc9x00_set_underrun_irq(pipe, false);
+		WRITE_ONCE(pipe->frame_pending, false);
+	}
+
+	if (st0 & te_rising) {
+		atomic64_inc(&pipe->irq_te);
+		drm_crtc_handle_vblank(&pipe->crtc);
+	}
+
+	if ((st0 & frm_done) || (use_te_sync && (st0 & te_rising))) {
+		timer_delete(&pipe->commit_watchdog);
+		dc9x00_complete_pending_event(pipe);
+	}
 }
 
 static irqreturn_t dc9x00_be_irq(int irq, void *data)
 {
 	struct dc9x00_drm *priv = data;
+	unsigned int i;
 	u32 st0, ov0, st1, ov1;
 
-	if (!priv->active)
+	if (!READ_ONCE(priv->active_mask))
 		return IRQ_NONE;
 
 	st0 = readl(priv->base + DC9X00_BE_INTR_STATUS);
@@ -178,36 +256,8 @@ static irqreturn_t dc9x00_be_irq(int irq, void *data)
 	if (!st0 && !ov0 && !st1 && !ov1)
 		return IRQ_NONE;
 
-	if ((st0 & DC9X00_BE_OUTPATH0_UNDERRUN) &&
-	    READ_ONCE(priv->underrun_enabled) &&
-	    READ_ONCE(priv->frame_pending)) {
-		atomic64_inc(&priv->irq_underrun);
-		dev_warn_ratelimited(priv->dev, "DC9x00 Outpath0 underrun (st0=%#x)\n", st0);
-	}
-
-	if (st0 & DC9X00_BE_OUTPATH0_FRM_START) {
-		atomic64_inc(&priv->irq_frm_start);
-		if (!(st0 & DC9X00_BE_OUTPATH0_FRM_DONE) &&
-		    READ_ONCE(priv->frame_pending))
-			dc9x00_set_underrun_irq(priv, true);
-	}
-
-	if (st0 & DC9X00_BE_OUTPATH0_FRM_DONE) {
-		atomic64_inc(&priv->irq_frm_done);
-		dc9x00_set_underrun_irq(priv, false);
-		WRITE_ONCE(priv->frame_pending, false);
-	}
-
-	if (st0 & DC9X00_BE_OUTPATH0_TE_RISING) {
-		atomic64_inc(&priv->irq_te);
-		drm_crtc_handle_vblank(&priv->crtc);
-	}
-
-	if ((st0 & DC9X00_BE_OUTPATH0_FRM_DONE) ||
-	    (use_te_sync && (st0 & DC9X00_BE_OUTPATH0_TE_RISING))) {
-		timer_delete(&priv->commit_watchdog);
-		dc9x00_complete_pending_event(priv);
-	}
+	for (i = 0; i < priv->num_pipes; i++)
+		dc9x00_handle_pipe_irq(&priv->pipes[i], st0);
 
 	return IRQ_HANDLED;
 }
@@ -270,25 +320,30 @@ static int dc9x00_plane_atomic_check(struct drm_plane *plane,
 static void dc9x00_plane_atomic_update(struct drm_plane *plane,
 				       struct drm_atomic_commit *state)
 {
-	struct dc9x00_drm *priv = to_dc9x00(plane->dev);
+	struct dc9x00_pipe *pipe = pipe_from_plane(plane);
+	struct dc9x00_drm *priv = pipe->priv;
 	struct drm_plane_state *pstate = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_framebuffer *fb = pstate->fb;
 	struct drm_gem_dma_object *dma_obj;
 	dma_addr_t paddr;
-	u32 fmt, cfg, w, h;
+	u8 id = pipe->id;
+	u32 fmt, cfg, w, h, roi_orig;
 
-	if (!priv->active || !fb || !pstate->visible) {
-		if (priv->active) {
-			writel(0, priv->base + DC9X00_SH_LAYER0_CONFIG);
-			writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER0_CONFIG);
+	if (!pipe->active || !fb || !pstate->visible) {
+		if (pipe->active) {
+			writel(0, priv->base + DC9X00_SH_LAYER_CONFIG(id));
+			writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER_CONFIG(id));
 		}
 		return;
 	}
 
 	dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
-	paddr = dma_obj->dma_addr + fb->offsets[0];
+	paddr = dma_obj->dma_addr + fb->offsets[0] +
+		(dma_addr_t)(pstate->src.y1 >> 16) * fb->pitches[0] +
+		(dma_addr_t)(pstate->src.x1 >> 16) * fb->format->cpp[0];
 	w = drm_rect_width(&pstate->dst);
 	h = drm_rect_height(&pstate->dst);
+	roi_orig = (pstate->dst.x1 & 0xffff) | ((pstate->dst.y1 & 0xffff) << 16);
 
 	switch (fb->format->format) {
 	case DRM_FORMAT_ARGB8888:
@@ -300,37 +355,39 @@ static void dc9x00_plane_atomic_update(struct drm_plane *plane,
 		break;
 	}
 
-	writel(0, priv->base + DC9X00_LAYER0_OUTPUT_PATH_ID);
-	writel(0, priv->base + DC9X00_SH_LAYER0_BLEND_STACK_ID);
-	writel(0, priv->base + DC9X00_SH_LAYER0_ALPHA_BLEND_CFG);
+	writel(id, priv->base + DC9X00_LAYER_OUTPUT_PATH_ID(id));
+	writel(0, priv->base + DC9X00_SH_LAYER_BLEND_STACK_ID(id));
+	writel(0, priv->base + DC9X00_SH_LAYER_ALPHA_BLEND_CFG(id));
 
-	writel(lower_32_bits(paddr), priv->base + DC9X00_SH_LAYER0_ADDR);
+	writel(lower_32_bits(paddr), priv->base + DC9X00_SH_LAYER_ADDR(id));
 	writel(upper_32_bits(paddr) & DC9X00_SH_LAYER0_HIGH_ADDR_MASK,
-	       priv->base + DC9X00_SH_LAYER0_HIGH_ADDR);
-	writel(fb->pitches[0], priv->base + DC9X00_SH_LAYER0_STRIDE);
-	writel((w & 0xffff) | ((h & 0xffff) << 16), priv->base + DC9X00_SH_LAYER0_SIZE);
-	writel(DC9X00_LAYER_DMA_MODE_NORMAL, priv->base + DC9X00_SH_LAYER0_DMA_MODE);
-	writel(0, priv->base + DC9X00_SH_LAYER0_OUT_ROI_ORIGIN);
-	writel((w & 0xffff) | ((h & 0xffff) << 16), priv->base + DC9X00_SH_LAYER0_OUT_ROI_SIZE);
+	       priv->base + DC9X00_SH_LAYER_HIGH_ADDR(id));
+	writel(fb->pitches[0], priv->base + DC9X00_SH_LAYER_STRIDE(id));
+	writel((w & 0xffff) | ((h & 0xffff) << 16), priv->base + DC9X00_SH_LAYER_SIZE(id));
+	writel(DC9X00_LAYER_DMA_MODE_NORMAL, priv->base + DC9X00_SH_LAYER_DMA_MODE(id));
+	writel(roi_orig, priv->base + DC9X00_SH_LAYER_OUT_ROI_ORIGIN(id));
+	writel((w & 0xffff) | ((h & 0xffff) << 16), priv->base + DC9X00_SH_LAYER_OUT_ROI_SIZE(id));
 
 	cfg = DC9X00_LAYER_CFG_ENABLE |
 	      DC9X00_LAYER_CFG_BYPASS_HDR |
 	      FIELD_PREP(DC9X00_LAYER_CFG_SWIZZLE_MASK, DC9X00_LAYER_CFG_SWIZZLE_ARGB) |
 	      FIELD_PREP(DC9X00_LAYER_CFG_TILE_MASK, DC9X00_LAYER_CFG_TILE_LINEAR) |
 	      FIELD_PREP(DC9X00_LAYER_CFG_FORMAT_MASK, fmt);
-	writel(cfg, priv->base + DC9X00_SH_LAYER0_CONFIG);
+	writel(cfg, priv->base + DC9X00_SH_LAYER_CONFIG(id));
 }
 
 static void dc9x00_plane_atomic_disable(struct drm_plane *plane,
 					struct drm_atomic_commit *state)
 {
-	struct dc9x00_drm *priv = to_dc9x00(plane->dev);
+	struct dc9x00_pipe *pipe = pipe_from_plane(plane);
+	struct dc9x00_drm *priv = pipe->priv;
+	u8 id = pipe->id;
 
-	if (!priv->active)
+	if (!pipe->active)
 		return;
 
-	writel(0, priv->base + DC9X00_SH_LAYER0_CONFIG);
-	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER0_CONFIG);
+	writel(0, priv->base + DC9X00_SH_LAYER_CONFIG(id));
+	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER_CONFIG(id));
 }
 
 static const struct drm_plane_helper_funcs dc9x00_plane_helper_funcs = {
@@ -351,7 +408,8 @@ static const struct drm_plane_funcs dc9x00_plane_funcs = {
 static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 				      struct drm_atomic_commit *state)
 {
-	struct dc9x00_drm *priv = to_dc9x00(crtc->dev);
+	struct dc9x00_pipe *pipe = pipe_from_crtc(crtc);
+	struct dc9x00_drm *priv = pipe->priv;
 	struct drm_crtc_state *cstate = drm_atomic_get_new_crtc_state(state, crtc);
 	const struct drm_display_mode *mode = &cstate->adjusted_mode;
 	const struct drm_dsc_config *dsc_cfg;
@@ -364,6 +422,7 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 		.multiplex_mode_enable = true,
 		.de_raster_enable = true,
 	};
+	u8 id = pipe->id;
 	u32 w = mode->hdisplay;
 	u32 h = mode->vdisplay;
 	u32 hfp = mode->hsync_start - mode->hdisplay;
@@ -373,6 +432,8 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 	u32 vsa = mode->vsync_end - mode->vsync_start;
 	u32 vbp = mode->vtotal - mode->vsync_end;
 	u32 te_fps, te_usec, sys_us, active_us, line_cycles, sys_cycles, urgent;
+	u32 intr_bits, intr_en, iso;
+	unsigned long flags;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(priv->dev);
@@ -381,130 +442,174 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 		return;
 	}
 
-	dev_info(priv->dev, "DC9x00 Chip ID=%#x Rev=%#x Prod=%#x (%ux%u)\n",
-		 readl(priv->base + DC9X00_CHIP_ID),
+	mutex_lock(&priv->hw_lock);
+
+	dev_info(priv->dev, "DC9x00 pipe%u ID=%#x Rev=%#x Prod=%#x (%ux%u)\n",
+		 id, readl(priv->base + DC9X00_CHIP_ID),
 		 readl(priv->base + DC9X00_CHIP_REV),
 		 readl(priv->base + DC9X00_PRODUCT_ID), w, h);
 
-	dc9x00_sw_reset(priv);
-	dc9x00_force_be_csr_read(priv);
-	writel(0x0, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	if (!priv->active_mask) {
+		dc9x00_sw_reset(priv);
+		dc9x00_force_be_csr_read(priv);
+		writel(readl(priv->base + DC9X00_BE_INTR_STATUS),
+		       priv->base + DC9X00_BE_INTR_STATUS);
+		writel(readl(priv->base + DC9X00_BE_INTR_STATUS1),
+		       priv->base + DC9X00_BE_INTR_STATUS1);
+		writel(readl(priv->base + DC9X00_BE_INTR_OVERFLOW),
+		       priv->base + DC9X00_BE_INTR_OVERFLOW);
+		writel(0, priv->base + DC9X00_BE_INTR_ENABLE);
+	}
+
+	intr_bits = DC9X00_BE_OUTPATH_FRM_START(id) |
+		    DC9X00_BE_OUTPATH_FRM_DONE(id) |
+		    DC9X00_BE_OUTPATH_TE_RISING(id);
+
+	spin_lock_irqsave(&priv->intr_lock, flags);
+	iso = readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	iso &= ~DC9X00_CLK_DOMAIN_ISO_DSI(id);
+	writel(iso, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
 	readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
 
-	/* Output0 clock must be enabled before writing Output0 CSRs */
-	writel(1, priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
-	readl(priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
+	/* Output clock must be enabled before writing Output CSRs */
+	writel(1, priv->base + DC9X00_SH_OUTPUT_CLK_EN(id));
+	readl(priv->base + DC9X00_SH_OUTPUT_CLK_EN(id));
 
-	writel(readl(priv->base + DC9X00_BE_INTR_STATUS), priv->base + DC9X00_BE_INTR_STATUS);
-	writel(readl(priv->base + DC9X00_BE_INTR_STATUS1), priv->base + DC9X00_BE_INTR_STATUS1);
-	writel(readl(priv->base + DC9X00_BE_INTR_OVERFLOW), priv->base + DC9X00_BE_INTR_OVERFLOW);
+	writel(intr_bits | DC9X00_BE_OUTPATH_UNDERRUN(id),
+	       priv->base + DC9X00_BE_INTR_STATUS);
+	writel(intr_bits | DC9X00_BE_OUTPATH_UNDERRUN(id),
+	       priv->base + DC9X00_BE_INTR_OVERFLOW);
 
-	priv->underrun_enabled = false;
-	priv->frame_pending = false;
-	writel(DC9X00_BE_OUTPATH0_FRM_START | DC9X00_BE_OUTPATH0_FRM_DONE |
-	       DC9X00_BE_OUTPATH0_TE_RISING,
-	       priv->base + DC9X00_BE_INTR_ENABLE);
+	pipe->underrun_enabled = false;
+	pipe->frame_pending = false;
+	intr_en = readl(priv->base + DC9X00_BE_INTR_ENABLE);
+	intr_en = (intr_en & ~DC9X00_BE_OUTPATH_UNDERRUN(id)) | intr_bits;
+	writel(intr_en, priv->base + DC9X00_BE_INTR_ENABLE);
+	spin_unlock_irqrestore(&priv->intr_lock, flags);
 
-	writel(DC9X00_SH_PANEL0_OUTPUT_PATH, priv->base + DC9X00_SH_PANEL0_CONFIG);
-	writel(DC9X00_SH_PANEL0_FMT_RGB888, priv->base + DC9X00_SH_PANEL0_FORMAT);
-	writel(0, priv->base + DC9X00_SH_PANEL0_BG_ALPHA);
-	writel(0, priv->base + DC9X00_SH_PANEL0_BG_RED);
-	writel(0, priv->base + DC9X00_SH_PANEL0_BG_GREEN);
-	writel(0, priv->base + DC9X00_SH_PANEL0_BG_BLUE);
-	writel(w, priv->base + DC9X00_SH_PANEL0_IMAGE_WIDTH);
-	writel(h, priv->base + DC9X00_SH_PANEL0_IMAGE_HEIGHT);
-	writel(w, priv->base + DC9X00_SH_PANEL0_DITHER_WIDTH);
-	writel(h, priv->base + DC9X00_SH_PANEL0_DITHER_HEIGHT);
-	writel(w, priv->base + DC9X00_SH_PANEL0_WIDTH);
-	writel(h, priv->base + DC9X00_SH_PANEL0_HEIGHT);
+	writel(DC9X00_SH_PANEL0_OUTPUT_PATH, priv->base + DC9X00_SH_PANEL_CONFIG(id));
+	writel(DC9X00_SH_PANEL0_FMT_RGB888, priv->base + DC9X00_SH_PANEL_FORMAT(id));
+	writel(0, priv->base + DC9X00_SH_PANEL_BG_ALPHA(id));
+	writel(0, priv->base + DC9X00_SH_PANEL_BG_RED(id));
+	writel(0, priv->base + DC9X00_SH_PANEL_BG_GREEN(id));
+	writel(0, priv->base + DC9X00_SH_PANEL_BG_BLUE(id));
+	writel(w, priv->base + DC9X00_SH_PANEL_IMAGE_WIDTH(id));
+	writel(h, priv->base + DC9X00_SH_PANEL_IMAGE_HEIGHT(id));
+	writel(w, priv->base + DC9X00_SH_PANEL_DITHER_WIDTH(id));
+	writel(h, priv->base + DC9X00_SH_PANEL_DITHER_HEIGHT(id));
+	writel(w, priv->base + DC9X00_SH_PANEL_WIDTH(id));
+	writel(h, priv->base + DC9X00_SH_PANEL_HEIGHT(id));
 
 	dsc_cfg = laguna_panel_get_dsc_by_mode(w, h);
 	if (!dsc_cfg)
 		dsc_usage.enable = false;
-	dc9x00_dsc_configure(priv->base, 0, &dsc_usage, dsc_cfg);
+	dc9x00_dsc_configure(priv->base, id, &dsc_usage, dsc_cfg);
 
-	writel(DC9X00_OUTPUT0_WORK_MODE_CMD, priv->base + DC9X00_OUTPUT0_CTRL);
-	writel(cmd_opt & 0x3, priv->base + DC9X00_OUTPUT0_CMD_OPT);
-	writel(0, priv->base + DC9X00_OUTPUT0_DE_SYNC_MODE);
-	writel(te_sel & 0x1, priv->base + DC9X00_OUTPUT0_TE_SEL);
-	writel(0, priv->base + DC9X00_OUTPUT0_TE_POLARITY);
+	writel(DC9X00_OUTPUT0_WORK_MODE_CMD, priv->base + DC9X00_OUTPUT_CTRL(id));
+	writel(cmd_opt & 0x3, priv->base + DC9X00_OUTPUT_CMD_OPT(id));
+	writel(0, priv->base + DC9X00_OUTPUT_DE_SYNC_MODE(id));
+	writel(te_sel & 0x1, priv->base + DC9X00_OUTPUT_TE_SEL(id));
+	writel(0, priv->base + DC9X00_OUTPUT_TE_POLARITY(id));
 
 	writel((mode->flags & DRM_MODE_FLAG_NHSYNC) ? 1 : 0,
-	       priv->base + DC9X00_OUTPUT0_TIMING_HSYNC);
-	writel(hfp, priv->base + DC9X00_SH_OUTPUT0_TIMING_HFP);
-	writel(w, priv->base + DC9X00_SH_OUTPUT0_TIMING_HA);
-	writel(hbp, priv->base + DC9X00_SH_OUTPUT0_TIMING_HBP);
-	writel(hsa, priv->base + DC9X00_SH_OUTPUT0_TIMING_HS);
+	       priv->base + DC9X00_OUTPUT_TIMING_HSYNC(id));
+	writel(hfp, priv->base + DC9X00_SH_OUTPUT_TIMING_HFP(id));
+	writel(w, priv->base + DC9X00_SH_OUTPUT_TIMING_HA(id));
+	writel(hbp, priv->base + DC9X00_SH_OUTPUT_TIMING_HBP(id));
+	writel(hsa, priv->base + DC9X00_SH_OUTPUT_TIMING_HS(id));
 	writel((mode->flags & DRM_MODE_FLAG_NVSYNC) ? 1 : 0,
-	       priv->base + DC9X00_OUTPUT0_TIMING_VSYNC);
-	writel(vfp, priv->base + DC9X00_SH_OUTPUT0_TIMING_VFP);
-	writel(h, priv->base + DC9X00_SH_OUTPUT0_TIMING_VA);
-	writel(vbp, priv->base + DC9X00_SH_OUTPUT0_TIMING_VBP);
-	writel(vsa, priv->base + DC9X00_SH_OUTPUT0_TIMING_VS);
+	       priv->base + DC9X00_OUTPUT_TIMING_VSYNC(id));
+	writel(vfp, priv->base + DC9X00_SH_OUTPUT_TIMING_VFP(id));
+	writel(h, priv->base + DC9X00_SH_OUTPUT_TIMING_VA(id));
+	writel(vbp, priv->base + DC9X00_SH_OUTPUT_TIMING_VBP(id));
+	writel(vsa, priv->base + DC9X00_SH_OUTPUT_TIMING_VS(id));
 
 	writel(dsc_usage.enable ? DC9X00_IPI_FMT_COMPRESSED : DC9X00_IPI_FMT_RGB,
-	       priv->base + DC9X00_SH_OUTPUT0_IPI_FORMAT);
-	writel(DC9X00_IPI_DEPTH_BITS8, priv->base + DC9X00_SH_OUTPUT0_IPI_DEPTH);
+	       priv->base + DC9X00_SH_OUTPUT_IPI_FORMAT(id));
+	writel(DC9X00_IPI_DEPTH_BITS8, priv->base + DC9X00_SH_OUTPUT_IPI_DEPTH(id));
 
 	laguna_panel_get_te_info(w, h, &te_fps, &te_usec);
 	sys_us = USEC_PER_SEC / max_t(u32, 1, te_fps);
 	active_us = sys_us > te_usec ? sys_us - te_usec : sys_us;
 	line_cycles = mult_frac(active_us, 100 * 99, 100 * max_t(u32, 1, h));
 	writel((line_cycles & 0xffff) | ((h & 0xffff) << 16),
-	       priv->base + DC9X00_SH_OUTPUT0_SCANOUT_COUNTER);
-	writel(0, priv->base + DC9X00_OUTPUT0_SCANOUT_DELAY_COUNTER);
+	       priv->base + DC9X00_SH_OUTPUT_SCANOUT_COUNTER(id));
+	writel(0, priv->base + DC9X00_OUTPUT_SCANOUT_DELAY_COUNTER(id));
 
 	sys_cycles = mult_frac(sys_us, 100 * 90, 100 * max_t(u32, 1, h));
 	writel((sys_cycles & 0xffff) | ((h & 0xffff) << 16),
-	       priv->base + DC9X00_SH_OUTPUT0_SYSTEM_COUNTER);
-	writel(200 * 100, priv->base + DC9X00_OUTPUT0_SYS_DELAY_COUNTER);
+	       priv->base + DC9X00_SH_OUTPUT_SYSTEM_COUNTER(id));
+	writel(200 * 100, priv->base + DC9X00_OUTPUT_SYS_DELAY_COUNTER(id));
 
-	urgent = readl(priv->base + DC9X00_SH_OUTPUT0_URGENT_VALUE);
+	urgent = readl(priv->base + DC9X00_SH_OUTPUT_URGENT_VALUE(id));
 	urgent = (urgent & ~DC9X00_URGENT_VALUE_MASK) |
 		 FIELD_PREP(DC9X00_URGENT_VALUE_MASK, 3);
-	writel(urgent, priv->base + DC9X00_SH_OUTPUT0_URGENT_VALUE);
+	writel(urgent, priv->base + DC9X00_SH_OUTPUT_URGENT_VALUE(id));
 
-	priv->active = true;
+	WRITE_ONCE(pipe->active, true);
+	priv->active_mask |= BIT(id);
+	mutex_unlock(&priv->hw_lock);
+
 	drm_crtc_vblank_on(crtc);
 }
 
 static void dc9x00_crtc_atomic_disable(struct drm_crtc *crtc,
 				       struct drm_atomic_commit *state)
 {
-	struct dc9x00_drm *priv = to_dc9x00(crtc->dev);
+	struct dc9x00_pipe *pipe = pipe_from_crtc(crtc);
+	struct dc9x00_drm *priv = pipe->priv;
+	u8 id = pipe->id;
+	u32 intr_bits, intr_en, iso;
 	unsigned long flags;
 
-	timer_delete_sync(&priv->commit_watchdog);
-	dc9x00_complete_pending_event(priv);
+	timer_delete_sync(&pipe->commit_watchdog);
+	dc9x00_complete_pending_event(pipe);
 	drm_crtc_vblank_off(crtc);
 
-	if (!priv->active)
+	mutex_lock(&priv->hw_lock);
+	if (!pipe->active) {
+		mutex_unlock(&priv->hw_lock);
 		return;
+	}
+
+	intr_bits = DC9X00_BE_OUTPATH_FRM_START(id) |
+		    DC9X00_BE_OUTPATH_FRM_DONE(id) |
+		    DC9X00_BE_OUTPATH_UNDERRUN(id) |
+		    DC9X00_BE_OUTPATH_TE_RISING(id);
 
 	spin_lock_irqsave(&priv->intr_lock, flags);
-	priv->active = false;
-	priv->frame_pending = false;
-	priv->underrun_enabled = false;
-	writel(0, priv->base + DC9X00_BE_INTR_ENABLE);
+	WRITE_ONCE(pipe->active, false);
+	WRITE_ONCE(pipe->frame_pending, false);
+	pipe->underrun_enabled = false;
+	intr_en = readl(priv->base + DC9X00_BE_INTR_ENABLE);
+	intr_en &= ~intr_bits;
+	writel(intr_en, priv->base + DC9X00_BE_INTR_ENABLE);
+
+	writel(0, priv->base + DC9X00_OUTPUT_SW_CONFIG(id));
+	writel(0, priv->base + DC9X00_OUTPUT_START(id));
+	writel(0, priv->base + DC9X00_SH_OUTPUT_CLK_EN(id));
+
+	iso = readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	iso |= DC9X00_CLK_DOMAIN_ISO_DSI(id);
+	writel(iso, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
 	spin_unlock_irqrestore(&priv->intr_lock, flags);
 
-	writel(0, priv->base + DC9X00_OUTPUT0_SW_CONFIG);
-	writel(0, priv->base + DC9X00_OUTPUT0_START);
-	writel(0, priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
-	writel(0xf, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
-
+	priv->active_mask &= ~BIT(id);
 	pm_runtime_put_sync(priv->dev);
+	mutex_unlock(&priv->hw_lock);
 }
 
 static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *state)
 {
-	struct dc9x00_drm *priv = to_dc9x00(crtc->dev);
+	struct dc9x00_pipe *pipe = pipe_from_crtc(crtc);
+	struct dc9x00_drm *priv = pipe->priv;
 	struct drm_crtc_state *cstate = drm_atomic_get_new_crtc_state(state, crtc);
+	u8 id = pipe->id;
 	u32 mux;
 	unsigned long flags;
 
-	if (!priv->active) {
+	if (!pipe->active) {
 		if (cstate->event) {
 			spin_lock_irqsave(&crtc->dev->event_lock, flags);
 			drm_crtc_send_vblank_event(crtc, cstate->event);
@@ -514,31 +619,31 @@ static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
 		return;
 	}
 
-	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER0_CONFIG);
-	writel(DC9X00_PANEL0_REG_SWITCH, priv->base + DC9X00_PANEL0_CONFIG);
-	writel(DC9X00_OUTPUT0_REG_SWITCH, priv->base + DC9X00_OUTPUT0_CONFIG);
-
-	mux = readl(priv->base + DC9X00_POST_PROCESS_OUT);
-	mux &= ~DC9X00_POST_MUX_OUT0_MASK;
-	writel(mux, priv->base + DC9X00_POST_PROCESS_OUT);
+	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER_CONFIG(id));
+	writel(DC9X00_PANEL0_REG_SWITCH, priv->base + DC9X00_PANEL_CONFIG(id));
+	writel(DC9X00_OUTPUT0_REG_SWITCH, priv->base + DC9X00_OUTPUT_CONFIG(id));
 
 	if (cstate->event) {
-		spin_lock_irqsave(&priv->event_lock, flags);
-		WARN_ON(priv->pending_event);
-		priv->pending_event = cstate->event;
+		spin_lock_irqsave(&pipe->event_lock, flags);
+		WARN_ON(pipe->pending_event);
+		pipe->pending_event = cstate->event;
 		cstate->event = NULL;
-		spin_unlock_irqrestore(&priv->event_lock, flags);
-		mod_timer(&priv->commit_watchdog, jiffies + msecs_to_jiffies(50));
+		spin_unlock_irqrestore(&pipe->event_lock, flags);
+		mod_timer(&pipe->commit_watchdog, jiffies + msecs_to_jiffies(50));
 	}
 
 	spin_lock_irqsave(&priv->intr_lock, flags);
-	priv->frame_pending = true;
-	writel(DC9X00_BE_OUTPATH0_FRM_START | DC9X00_BE_OUTPATH0_UNDERRUN,
+	mux = readl(priv->base + DC9X00_POST_PROCESS_OUT);
+	mux = (mux & ~DC9X00_POST_MUX_OUT_MASK(id)) | DC9X00_POST_MUX_OUT_VAL(id);
+	writel(mux, priv->base + DC9X00_POST_PROCESS_OUT);
+
+	WRITE_ONCE(pipe->frame_pending, true);
+	writel(DC9X00_BE_OUTPATH_FRM_START(id) | DC9X00_BE_OUTPATH_UNDERRUN(id),
 	       priv->base + DC9X00_BE_INTR_STATUS);
 	spin_unlock_irqrestore(&priv->intr_lock, flags);
 
-	writel(0x1, priv->base + DC9X00_OUTPUT0_START);
-	writel(0x1, priv->base + DC9X00_OUTPUT0_SW_CONFIG);
+	writel(0x1, priv->base + DC9X00_OUTPUT_START(id));
+	writel(0x1, priv->base + DC9X00_OUTPUT_SW_CONFIG(id));
 }
 
 static const struct drm_crtc_helper_funcs dc9x00_crtc_helper_funcs = {
@@ -624,6 +729,10 @@ static int dc9x00_setup_irqs(struct platform_device *pdev, struct dc9x00_drm *pr
 		"outpath0_frm_done",
 		"outpath0_underrun",
 		"output0_te_rising_edge",
+		"outpath1_frm_start",
+		"outpath1_frm_done",
+		"outpath1_underrun",
+		"output1_te_rising_edge",
 	};
 	unsigned int i;
 	int irq, ret;
@@ -644,6 +753,7 @@ static int dc9x00_setup_irqs(struct platform_device *pdev, struct dc9x00_drm *pr
 
 #define DC9X00_DPU_SMMU_BASE	0x0ed80000
 #define DC9X00_DSI2H0_BASE	0x0efd8000
+#define DC9X00_DSI2H1_BASE	0x0eff8000
 
 struct dc9x00_reg_dump_entry {
 	const char *name;
@@ -704,6 +814,26 @@ static int dc9x00_display_regs_show(struct seq_file *m, void *data)
 		{ "SH_OUTPUT0_CLK_EN", DC9X00_SH_OUTPUT0_CLK_EN },
 		{ "POST_PROCESS_OUT", DC9X00_POST_PROCESS_OUT },
 	};
+	static const struct dc9x00_reg_dump_entry pipe1_regs[] = {
+		{ "SH_LAYER1_ADDR", DC9X00_SH_LAYER_ADDR(1) },
+		{ "SH_LAYER1_SIZE", DC9X00_SH_LAYER_SIZE(1) },
+		{ "SH_LAYER1_CONFIG", DC9X00_SH_LAYER_CONFIG(1) },
+		{ "SH_PANEL1_CONFIG", DC9X00_SH_PANEL_CONFIG(1) },
+		{ "SH_PANEL1_DSC_CFG", DC9X00_SH_PANEL1_DSC_CONFIG },
+		{ "SH_PANEL1_WIDTH", DC9X00_SH_PANEL_WIDTH(1) },
+		{ "SH_PANEL1_HEIGHT", DC9X00_SH_PANEL_HEIGHT(1) },
+		{ "DSC1_ENC_MAIN", DC9X00_PANEL1_DSC_BASE },
+		{ "DSC1_HS0_DF_CTRL", DC9X00_PANEL1_DSC_BASE + 0x100 },
+		{ "OUTPUT1_START", DC9X00_OUTPUT_START(1) },
+		{ "OUTPUT1_SW_CONFIG", DC9X00_OUTPUT_SW_CONFIG(1) },
+		{ "OUTPUT1_CTRL", DC9X00_OUTPUT_CTRL(1) },
+		{ "SH_OUTPUT1_IPI_FMT", DC9X00_SH_OUTPUT_IPI_FORMAT(1) },
+		{ "SH_OUTPUT1_COORD", DC9X00_SH_OUTPUT_CURRENT_COORD(1) },
+		{ "SH_OUTPUT1_SYS_CNT", DC9X00_SH_OUTPUT_SYSTEM_COUNTER(1) },
+		{ "SH_OUTPUT1_SCN_CNT", DC9X00_SH_OUTPUT_SCANOUT_COUNTER(1) },
+		{ "SH_OUTPUT1_URGENT", DC9X00_SH_OUTPUT_URGENT_VALUE(1) },
+		{ "SH_OUTPUT1_CLK_EN", DC9X00_SH_OUTPUT_CLK_EN(1) },
+	};
 	static const struct dc9x00_reg_dump_entry smmu_table[] = {
 		{ "DPU_SMMU_IDR0", 0x00 },
 		{ "DPU_SMMU_IDR1", 0x04 },
@@ -727,16 +857,24 @@ static int dc9x00_display_regs_show(struct seq_file *m, void *data)
 	struct dc9x00_drm *priv = m->private;
 	void __iomem *smmu_regs;
 	void __iomem *dsi2h_regs;
+	unsigned int i;
 	int ret;
 
-	seq_printf(m, "active=%d use_te_sync=%d te_sel=%d cmd_opt=%d\n",
-		   priv->active, use_te_sync, te_sel, cmd_opt);
-	seq_printf(m, "irqs: frm_start=%lld frm_done=%lld underrun=%lld te=%lld watchdog=%lld\n",
-		   atomic64_read(&priv->irq_frm_start),
-		   atomic64_read(&priv->irq_frm_done),
-		   atomic64_read(&priv->irq_underrun),
-		   atomic64_read(&priv->irq_te),
-		   atomic64_read(&priv->watchdog_fires));
+	seq_printf(m, "active_mask=%#x num_pipes=%u use_te_sync=%d te_sel=%d cmd_opt=%d\n",
+		   READ_ONCE(priv->active_mask), priv->num_pipes,
+		   use_te_sync, te_sel, cmd_opt);
+	for (i = 0; i < priv->num_pipes; i++) {
+		struct dc9x00_pipe *pipe = &priv->pipes[i];
+
+		seq_printf(m,
+			   "pipe%u active=%d irqs: frm_start=%lld frm_done=%lld underrun=%lld te=%lld watchdog=%lld\n",
+			   pipe->id, READ_ONCE(pipe->active),
+			   atomic64_read(&pipe->irq_frm_start),
+			   atomic64_read(&pipe->irq_frm_done),
+			   atomic64_read(&pipe->irq_underrun),
+			   atomic64_read(&pipe->irq_te),
+			   atomic64_read(&pipe->watchdog_fires));
+	}
 
 	ret = pm_runtime_get_if_active(priv->dev);
 	if (ret <= 0) {
@@ -745,6 +883,8 @@ static int dc9x00_display_regs_show(struct seq_file *m, void *data)
 	}
 
 	dc9x00_dump_reg_table(m, priv->base, dc_regs, ARRAY_SIZE(dc_regs));
+	if (priv->num_pipes > 1)
+		dc9x00_dump_reg_table(m, priv->base, pipe1_regs, ARRAY_SIZE(pipe1_regs));
 
 	smmu_regs = ioremap(DC9X00_DPU_SMMU_BASE, 0x100);
 	if (smmu_regs) {
@@ -755,9 +895,20 @@ static int dc9x00_display_regs_show(struct seq_file *m, void *data)
 
 	dsi2h_regs = ioremap(DC9X00_DSI2H0_BASE, 0x500);
 	if (dsi2h_regs) {
+		seq_puts(m, "-- dsi2h0 --\n");
 		dc9x00_dump_reg_table(m, dsi2h_regs, dsi2h_table,
 				      ARRAY_SIZE(dsi2h_table));
 		iounmap(dsi2h_regs);
+	}
+
+	if (priv->num_pipes > 1) {
+		dsi2h_regs = ioremap(DC9X00_DSI2H1_BASE, 0x500);
+		if (dsi2h_regs) {
+			seq_puts(m, "-- dsi2h1 --\n");
+			dc9x00_dump_reg_table(m, dsi2h_regs, dsi2h_table,
+					      ARRAY_SIZE(dsi2h_table));
+			iounmap(dsi2h_regs);
+		}
 	}
 
 	pm_runtime_put(priv->dev);
@@ -765,24 +916,84 @@ static int dc9x00_display_regs_show(struct seq_file *m, void *data)
 }
 DEFINE_SHOW_ATTRIBUTE(dc9x00_display_regs);
 
+static int dc9x00_init_pipe(struct dc9x00_drm *priv, unsigned int idx)
+{
+	static const u32 formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
+	struct dc9x00_pipe *pipe = &priv->pipes[idx];
+	struct drm_device *drm = &priv->drm;
+	int ret;
+
+	pipe->priv = priv;
+	pipe->id = idx;
+	spin_lock_init(&pipe->event_lock);
+	timer_setup(&pipe->commit_watchdog, dc9x00_commit_watchdog_fn, 0);
+
+	ret = drm_universal_plane_init(drm, &pipe->primary, BIT(idx),
+				       &dc9x00_plane_funcs, formats,
+				       ARRAY_SIZE(formats), NULL,
+				       DRM_PLANE_TYPE_PRIMARY,
+				       "dc9x00-layer%u", idx);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&pipe->primary, &dc9x00_plane_helper_funcs);
+
+	ret = drm_plane_create_blend_mode_property(&pipe->primary,
+						   BIT(DRM_MODE_BLEND_PIXEL_NONE));
+	if (ret)
+		return ret;
+
+	ret = drm_crtc_init_with_planes(drm, &pipe->crtc, &pipe->primary, NULL,
+					&dc9x00_crtc_funcs, "dc9x00-crtc%u", idx);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&pipe->crtc, &dc9x00_crtc_helper_funcs);
+
+	pipe->encoder.possible_crtcs = drm_crtc_mask(&pipe->crtc);
+	ret = drm_encoder_init(drm, &pipe->encoder, &dc9x00_encoder_funcs,
+			       DRM_MODE_ENCODER_DSI, "dc9x00-dsi%u", idx);
+	if (ret)
+		return ret;
+
+	ret = drm_bridge_attach(&pipe->encoder, pipe->bridge, NULL,
+				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+	if (ret)
+		return ret;
+
+	pipe->connector = drm_bridge_connector_init(drm, &pipe->encoder);
+	if (IS_ERR(pipe->connector))
+		return PTR_ERR(pipe->connector);
+
+	drm_connector_attach_encoder(pipe->connector, &pipe->encoder);
+	return 0;
+}
+
 static int dc9x00_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	static const char * const pd_names[] = { "dpu_dsi0_pd", "dpu_fe0_pd" };
-	const struct dev_pm_domain_attach_data pd_cfg = {
-		.pd_names = pd_names,
-		.num_pd_names = ARRAY_SIZE(pd_names),
+	static const char * const pd_names_single[] = { "dpu_dsi0_pd", "dpu_fe0_pd" };
+	static const char * const pd_names_dual[] = {
+		"dpu_dsi0_pd", "dpu_dsi1_pd", "dpu_fe0_pd", "dpu_fe1_pd"
+	};
+	struct dev_pm_domain_attach_data pd_cfg = {
 		.pd_flags = PD_FLAG_DEV_LINK_ON,
 	};
-	static const u32 formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
-	struct drm_bridge *bridge;
+	struct drm_bridge *bridge0, *bridge1;
 	struct dc9x00_drm *priv;
 	struct drm_device *drm;
+	unsigned int i;
 	int ret;
 
-	bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
-	if (IS_ERR(bridge))
-		return dev_err_probe(dev, PTR_ERR(bridge), "waiting for DSI2H bridge\n");
+	bridge0 = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
+	if (IS_ERR(bridge0))
+		return dev_err_probe(dev, PTR_ERR(bridge0), "waiting for DSI2H0 bridge\n");
+
+	bridge1 = devm_drm_of_get_bridge(dev, dev->of_node, 0, 1);
+	if (IS_ERR(bridge1)) {
+		if (PTR_ERR(bridge1) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(bridge1),
+					     "waiting for DSI2H1 bridge\n");
+		bridge1 = NULL;
+	}
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
 	if (ret)
@@ -794,10 +1005,14 @@ static int dc9x00_probe(struct platform_device *pdev)
 
 	drm = &priv->drm;
 	priv->dev = dev;
-	priv->bridge = bridge;
-	spin_lock_init(&priv->event_lock);
+	mutex_init(&priv->hw_lock);
 	spin_lock_init(&priv->intr_lock);
-	timer_setup(&priv->commit_watchdog, dc9x00_commit_watchdog_fn, 0);
+	priv->pipes[0].bridge = bridge0;
+	priv->num_pipes = 1;
+	if (bridge1) {
+		priv->pipes[1].bridge = bridge1;
+		priv->num_pipes = 2;
+	}
 
 	priv->base = devm_platform_ioremap_resource_byname(pdev, "dpu-fe-be");
 	if (IS_ERR(priv->base))
@@ -806,6 +1021,14 @@ static int dc9x00_probe(struct platform_device *pdev)
 	priv->gpcsr = devm_platform_ioremap_resource_byname(pdev, "dpu-gpcsr");
 	if (IS_ERR(priv->gpcsr))
 		priv->gpcsr = NULL;
+
+	if (of_property_match_string(dev->of_node, "power-domain-names", "dpu_dsi1_pd") >= 0) {
+		pd_cfg.pd_names = pd_names_dual;
+		pd_cfg.num_pd_names = ARRAY_SIZE(pd_names_dual);
+	} else {
+		pd_cfg.pd_names = pd_names_single;
+		pd_cfg.num_pd_names = ARRAY_SIZE(pd_names_single);
+	}
 
 	ret = devm_pm_domain_attach_list(dev, &pd_cfg, &priv->pd_list);
 	if (ret < 0)
@@ -828,43 +1051,13 @@ static int dc9x00_probe(struct platform_device *pdev)
 	drm->mode_config.funcs = &dc9x00_mode_config_funcs;
 	drm->mode_config.helper_private = &dc9x00_mode_config_helper_funcs;
 
-	ret = drm_universal_plane_init(drm, &priv->primary, 1, &dc9x00_plane_funcs,
-				       formats, ARRAY_SIZE(formats), NULL,
-				       DRM_PLANE_TYPE_PRIMARY, "dc9x00-layer0");
-	if (ret)
-		goto err_pm;
-	drm_plane_helper_add(&priv->primary, &dc9x00_plane_helper_funcs);
-
-	ret = drm_plane_create_blend_mode_property(&priv->primary,
-						   BIT(DRM_MODE_BLEND_PIXEL_NONE));
-	if (ret)
-		goto err_pm;
-
-	ret = drm_crtc_init_with_planes(drm, &priv->crtc, &priv->primary, NULL,
-					&dc9x00_crtc_funcs, "dc9x00-crtc0");
-	if (ret)
-		goto err_pm;
-	drm_crtc_helper_add(&priv->crtc, &dc9x00_crtc_helper_funcs);
-
-	priv->encoder.possible_crtcs = drm_crtc_mask(&priv->crtc);
-	ret = drm_encoder_init(drm, &priv->encoder, &dc9x00_encoder_funcs,
-			       DRM_MODE_ENCODER_DSI, "dc9x00-dsi0");
-	if (ret)
-		goto err_pm;
-
-	ret = drm_bridge_attach(&priv->encoder, priv->bridge, NULL,
-				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
-	if (ret)
-		goto err_pm;
-
-	priv->connector = drm_bridge_connector_init(drm, &priv->encoder);
-	if (IS_ERR(priv->connector)) {
-		ret = PTR_ERR(priv->connector);
-		goto err_pm;
+	for (i = 0; i < priv->num_pipes; i++) {
+		ret = dc9x00_init_pipe(priv, i);
+		if (ret)
+			goto err_pm;
 	}
-	drm_connector_attach_encoder(priv->connector, &priv->encoder);
 
-	ret = drm_vblank_init(drm, 1);
+	ret = drm_vblank_init(drm, priv->num_pipes);
 	if (ret)
 		goto err_pm;
 
@@ -893,12 +1086,14 @@ err_pm:
 static void dc9x00_remove(struct platform_device *pdev)
 {
 	struct dc9x00_drm *priv = platform_get_drvdata(pdev);
+	unsigned int i;
 
 	dc9x00_gpu_probe_debugfs_cleanup();
 	debugfs_remove_recursive(priv->debug_dir);
 	drm_dev_unplug(&priv->drm);
 	drm_atomic_helper_shutdown(&priv->drm);
-	timer_delete_sync(&priv->commit_watchdog);
+	for (i = 0; i < priv->num_pipes; i++)
+		timer_delete_sync(&priv->pipes[i].commit_watchdog);
 	pm_runtime_disable(&pdev->dev);
 }
 
