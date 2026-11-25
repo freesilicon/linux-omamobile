@@ -158,7 +158,7 @@ static int da9188_pinconf_get(struct pinctrl_dev *pctldev, unsigned int pin,
 		}
 		break;
 	default:
-		return -EOPNOTSUPP;
+		return -ENOTSUPP;
 	}
 
 	*config = pinconf_to_config_packed(param, arg);
@@ -210,7 +210,7 @@ static int da9188_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 				}
 			}
 			if (idx == ARRAY_SIZE(da9188_drv_ma_table))
-				return -EOPNOTSUPP;
+				return -ENOTSUPP;
 			break;
 		}
 		case PIN_CONFIG_BIAS_DISABLE:
@@ -224,7 +224,7 @@ static int da9188_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 			else if (arg == 800000)
 				val = DA9188_GPIO_PULL_UP_800K;
 			else
-				return -EOPNOTSUPP;
+				return -ENOTSUPP;
 			break;
 		case PIN_CONFIG_BIAS_PULL_DOWN:
 			cmd = DA9188_GPIO_CMD_SET_PULL_CONFIG;
@@ -233,10 +233,10 @@ static int da9188_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 			else if (arg == 800000)
 				val = DA9188_GPIO_PULL_DN_800K;
 			else
-				return -EOPNOTSUPP;
+				return -ENOTSUPP;
 			break;
 		default:
-			return -EOPNOTSUPP;
+			return -ENOTSUPP;
 		}
 
 		ret = da9188_gpio_mb_cmd(priv, cmd, pin, val, NULL);
@@ -274,14 +274,14 @@ static int da9188_pinmux_get_func_groups(struct pinctrl_dev *pctldev,
 					 const char * const **groups,
 					 unsigned int *num_groups)
 {
-	return -EOPNOTSUPP;
+	return -ENOTSUPP;
 }
 
 static int da9188_pinmux_set_mux(struct pinctrl_dev *pctldev,
 				 unsigned int func_selector,
 				 unsigned int group_selector)
 {
-	return -EOPNOTSUPP;
+	return -ENOTSUPP;
 }
 
 static int da9188_pinmux_gpio_set_direction(struct pinctrl_dev *pctldev,

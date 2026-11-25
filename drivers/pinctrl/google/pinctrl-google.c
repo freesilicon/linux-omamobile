@@ -165,11 +165,17 @@ static const struct pinctrl_ops google_pinctrl_ops = {
 
 /* Pinmux ops */
 
+static bool google_pad_valid(struct google_pinctrl *gctl, unsigned int pad)
+{
+	return pad < gctl->info->num_groups &&
+	       gpiochip_line_is_valid(&gctl->chip, pad);
+}
+
 static int google_pinmux_request(struct pinctrl_dev *pctldev, unsigned int offset)
 {
 	struct google_pinctrl *gctl = pinctrl_dev_get_drvdata(pctldev);
 
-	return gpiochip_line_is_valid(&gctl->chip, offset) ? 0 : -EINVAL;
+	return google_pad_valid(gctl, offset) ? 0 : -EINVAL;
 }
 
 static int google_pinmux_get_funcs_count(struct pinctrl_dev *pctldev)
@@ -215,7 +221,7 @@ static int google_pinmux_set_mux(struct pinctrl_dev *pctldev,
 	unsigned int slot;
 	int ret;
 
-	if (group_selector >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, group_selector))
 		return -EINVAL;
 
 	g = &gctl->info->groups[group_selector];
@@ -246,7 +252,7 @@ static int google_pinmux_gpio_request_enable(struct pinctrl_dev *pctldev,
 	const struct google_pingroup *g;
 	int func;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	g = &gctl->info->groups[offset];
@@ -282,7 +288,7 @@ static int google_pinconf_group_get(struct pinctrl_dev *pctldev,
 	u32 arg = 0;
 	int ret;
 
-	if (group >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, group))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -340,7 +346,7 @@ static int google_pinconf_group_get(struct pinctrl_dev *pctldev,
 		arg = !!(tx_val & GOOGLE_TXDATA_DOUT_BIT);
 		break;
 	default:
-		return -EOPNOTSUPP;
+		return -ENOTSUPP;
 	}
 
 	*config = pinconf_to_config_packed(param, arg);
@@ -358,7 +364,7 @@ static int google_pinconf_group_set(struct pinctrl_dev *pctldev,
 	unsigned int i;
 	int ret;
 
-	if (group >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, group))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -399,7 +405,7 @@ static int google_pinconf_group_set(struct pinctrl_dev *pctldev,
 			break;
 		case PIN_CONFIG_DRIVE_STRENGTH:
 			if (arg > FIELD_MAX(GOOGLE_PARAM_DRV_MASK)) {
-				ret = -EOPNOTSUPP;
+				ret = -ENOTSUPP;
 				goto unlock;
 			}
 			param_val &= ~GOOGLE_PARAM_DRV_MASK;
@@ -439,7 +445,7 @@ static int google_pinconf_group_set(struct pinctrl_dev *pctldev,
 		case PIN_CONFIG_PERSIST_STATE:
 			break;
 		default:
-			ret = -EOPNOTSUPP;
+			ret = -ENOTSUPP;
 			goto unlock;
 		}
 	}
@@ -470,7 +476,7 @@ static int google_gpio_direction_input(struct gpio_chip *chip, unsigned int offs
 	u32 val;
 	int ret;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -499,7 +505,7 @@ static int google_gpio_direction_output(struct gpio_chip *chip,
 	u32 val;
 	int ret;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -527,7 +533,7 @@ static int google_gpio_get_direction(struct gpio_chip *chip, unsigned int offset
 	u32 val;
 	int ret;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -550,7 +556,7 @@ static int google_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	u32 val;
 	int ret;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -572,7 +578,7 @@ static int google_gpio_set(struct gpio_chip *chip, unsigned int offset, int valu
 	u32 val;
 	int ret;
 
-	if (offset >= gctl->info->num_groups)
+	if (!google_pad_valid(gctl, offset))
 		return -EINVAL;
 
 	ret = google_csr_get(gctl);
@@ -631,6 +637,9 @@ static void google_gpio_irq_mask_pad(struct google_pinctrl *gctl,
 {
 	unsigned long flags;
 	u32 rxdata, trig;
+
+	if (!google_pad_valid(gctl, pad))
+		return;
 
 	if (google_csr_get(gctl) < 0)
 		return;
@@ -1070,7 +1079,7 @@ static void google_gpio_irq_mask_all(struct google_pinctrl *gctl)
 	for (i = 0; i < gctl->num_irqs; i++) {
 		unsigned int pad = gctl->irq_map[i].pad;
 
-		if (pad < gctl->info->num_groups)
+		if (google_pad_valid(gctl, pad))
 			google_gpio_irq_mask_pad(gctl, pad, false);
 	}
 }
@@ -1190,7 +1199,8 @@ static void google_wake_irq_mask_update(struct google_pinctrl *gctl, bool unmask
 		return;
 
 	for (i = 0; i < gctl->num_irqs; i++) {
-		if (!gctl->irq_map[i].wakeup)
+		if (!gctl->irq_map[i].wakeup &&
+		    google_pad_valid(gctl, gctl->irq_map[i].pad))
 			google_gpio_irq_mask_pad(gctl, gctl->irq_map[i].pad, unmask);
 	}
 }
