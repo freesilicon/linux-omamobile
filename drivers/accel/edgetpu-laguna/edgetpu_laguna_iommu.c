@@ -7,7 +7,10 @@
  */
 
 #include <linux/bitmap.h>
+#include <linux/device.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-direct.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
@@ -141,10 +144,17 @@ int edgetpu_laguna_iommu_map_sgt(struct iommu_domain *domain, dma_addr_t iova,
 	return 0;
 }
 
+static void laguna_dma_dev_release(struct device *dev)
+{
+	kfree(dev);
+}
+
 int edgetpu_laguna_iommu_init(struct edgetpu_laguna_dev *etdev)
 {
+	struct device *dma_dev;
 	u32 pasid_bits = 4;
 	u32 win[3];
+	int ret;
 
 	mutex_init(&etdev->mmu_lock);
 	spin_lock_init(&etdev->clients_lock);
@@ -177,6 +187,30 @@ int edgetpu_laguna_iommu_init(struct edgetpu_laguna_dev *etdev)
 		return -ENODEV;
 	}
 
+	dma_dev = kzalloc_obj(*dma_dev);
+	if (!dma_dev)
+		return -ENOMEM;
+
+	device_initialize(dma_dev);
+	dma_dev->release = laguna_dma_dev_release;
+	dev_clear_dma_coherent(dma_dev);
+	dma_dev->dma_parms = &etdev->dma_parms;
+	ret = dev_set_name(dma_dev, "%s-dma", dev_name(etdev->dev));
+	if (ret) {
+		put_device(dma_dev);
+		return ret;
+	}
+
+	ret = dma_coerce_mask_and_coherent(dma_dev, DMA_BIT_MASK(64));
+	if (ret) {
+		put_device(dma_dev);
+		return ret;
+	}
+
+	dma_set_max_seg_size(dma_dev, UINT_MAX);
+	dma_set_seg_boundary(dma_dev, ULONG_MAX);
+	etdev->dma_dev = dma_dev;
+
 	dev_info(etdev->dev, "IOMMU window [%pad..%pad], max_pasids=%u\n",
 		 &etdev->dma_win_start, &etdev->dma_win_end, etdev->max_pasids);
 	return 0;
@@ -184,6 +218,10 @@ int edgetpu_laguna_iommu_init(struct edgetpu_laguna_dev *etdev)
 
 void edgetpu_laguna_iommu_exit(struct edgetpu_laguna_dev *etdev)
 {
+	if (etdev->dma_dev) {
+		put_device(etdev->dma_dev);
+		etdev->dma_dev = NULL;
+	}
 	etdev->default_domain = NULL;
 }
 
@@ -192,7 +230,7 @@ struct laguna_domain *edgetpu_laguna_domain_alloc(struct edgetpu_laguna_dev *etd
 	struct laguna_domain *etdom;
 	int pasid, ret;
 
-	etdom = kzalloc(sizeof(*etdom), GFP_KERNEL);
+	etdom = kzalloc_obj(*etdom);
 	if (!etdom)
 		return ERR_PTR(-ENOMEM);
 
@@ -220,8 +258,6 @@ struct laguna_domain *edgetpu_laguna_domain_alloc(struct edgetpu_laguna_dev *etd
 	etdom->etdev = etdev;
 	etdom->pasid = pasid;
 	etdom->attached = true;
-
-	edgetpu_laguna_fw_shared_context_map(etdev, etdom);
 	return etdom;
 
 err_free_domain:
@@ -280,6 +316,81 @@ static void laguna_destroy_mapping(struct laguna_domain *etdom,
 	kfree(map);
 }
 
+static int laguna_map_dmabuf_sgt(struct edgetpu_laguna_dev *etdev,
+				 struct laguna_domain *etdom,
+				 dma_addr_t iova, size_t offset,
+				 size_t aligned_size, struct sg_table *sgt,
+				 int prot)
+{
+	struct scatterlist *sg;
+	size_t skip = offset;
+	size_t mapped = 0;
+	unsigned int i;
+	int ret;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t dma_addr = sg_dma_address(sg);
+		size_t seg_len = sg_dma_len(sg);
+		dma_addr_t seg_iova;
+		phys_addr_t paddr;
+		size_t map_len;
+
+		if (!seg_len)
+			continue;
+		if (skip >= seg_len) {
+			skip -= seg_len;
+			continue;
+		}
+
+		dma_addr += skip;
+		seg_len -= skip;
+		skip = 0;
+
+		paddr = dma_to_phys(etdev->dma_dev, dma_addr);
+		if (!PAGE_ALIGNED(paddr) ||
+		    (seg_len < aligned_size - mapped && !PAGE_ALIGNED(seg_len))) {
+			dev_err(etdev->dev,
+				"dmabuf seg unaligned: paddr=%pa len=%zu\n",
+				&paddr, seg_len);
+			ret = -EINVAL;
+			goto err_unmap;
+		}
+
+		map_len = PAGE_ALIGN(min(seg_len, aligned_size - mapped));
+		if (!map_len)
+			continue;
+
+		seg_iova = iova + mapped;
+		ret = iommu_map(etdom->domain, seg_iova, paddr, map_len, prot,
+				GFP_KERNEL);
+		if (ret) {
+			dev_err(etdev->dev,
+				"iommu_map(pasid=%u, iova=%pad, paddr=%pa, len=%zu) failed: %d\n",
+				etdom->pasid, &seg_iova, &paddr, map_len, ret);
+			goto err_unmap;
+		}
+
+		mapped += map_len;
+		if (mapped >= aligned_size)
+			break;
+	}
+
+	if (mapped < aligned_size) {
+		dev_err(etdev->dev,
+			"dmabuf short sgt: mapped=%zu expected=%zu (nents=%u)\n",
+			mapped, aligned_size, sgt->nents);
+		ret = -EIO;
+		goto err_unmap;
+	}
+
+	return 0;
+
+err_unmap:
+	if (mapped)
+		iommu_unmap(etdom->domain, iova, mapped);
+	return ret;
+}
+
 int edgetpu_laguna_map_dmabuf(struct laguna_client *client,
 			      struct edgetpu_map_dmabuf_ioctl *req)
 {
@@ -292,11 +403,12 @@ int edgetpu_laguna_map_dmabuf(struct laguna_client *client,
 	struct sg_table *sgt;
 	dma_addr_t iova;
 	size_t map_size, aligned_size;
-	ssize_t mapped;
 	int prot, ret;
 
 	if (!etdom)
 		return -EINVAL;
+	if (!etdev->dma_dev)
+		return -ENODEV;
 	if (req->offset & ~PAGE_MASK)
 		return -EINVAL;
 
@@ -321,34 +433,35 @@ int edgetpu_laguna_map_dmabuf(struct laguna_client *client,
 		goto err_put;
 	}
 
-	attach = dma_buf_attach(dmabuf, etdev->dev);
+	attach = dma_buf_attach(dmabuf, etdev->dma_dev);
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
+		dev_err(etdev->dev, "dma_buf_attach failed: %d\n", ret);
 		goto err_put;
 	}
 
 	sgt = dma_buf_map_attachment_unlocked(attach, dir);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
+		dev_err(etdev->dev, "dma_buf_map_attachment failed: %d\n", ret);
 		goto err_detach;
 	}
 
 	iova = laguna_alloc_iova(etdev, etdom, aligned_size, req->flags);
 	if (!iova) {
 		ret = -ENOSPC;
+		dev_err(etdev->dev, "laguna_alloc_iova(%zu) failed\n",
+			aligned_size);
 		goto err_unmap_attach;
 	}
 
 	prot = laguna_prot_from_dir(etdev->dev, dir, false, false);
-	mapped = iommu_map_sgtable(etdom->domain, iova, sgt, prot);
-	if (mapped < 0 || (size_t)mapped < aligned_size) {
-		if (mapped > 0)
-			iommu_unmap(etdom->domain, iova, (size_t)mapped);
-		ret = mapped < 0 ? (int)mapped : -EIO;
+	ret = laguna_map_dmabuf_sgt(etdev, etdom, iova, req->offset,
+				    aligned_size, sgt, prot);
+	if (ret)
 		goto err_free_iova;
-	}
 
-	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	map = kzalloc_obj(*map);
 	if (!map) {
 		ret = -ENOMEM;
 		goto err_iommu_unmap;

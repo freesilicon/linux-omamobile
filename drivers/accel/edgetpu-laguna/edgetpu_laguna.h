@@ -12,6 +12,7 @@
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/device.h>
 #include <linux/dma-direction.h>
 #include <linux/genalloc.h>
 #include <linux/ioctl.h>
@@ -560,6 +561,7 @@ struct laguna_domain {
 	struct iova_domain iovad;
 	u32 pasid;
 	bool attached;
+	bool shared_mapped;
 };
 
 struct laguna_img_mapping {
@@ -612,6 +614,8 @@ struct laguna_client {
 
 struct edgetpu_laguna_dev {
 	struct device *dev;
+	struct device *dma_dev;
+	struct device_dma_parameters dma_parms;
 	struct miscdevice mdev;
 	void __iomem *top_regs;
 	void __iomem *lpcm_regs;
@@ -675,8 +679,8 @@ void edgetpu_laguna_fw_exit(struct edgetpu_laguna_dev *etdev);
 int edgetpu_laguna_fw_boot(struct edgetpu_laguna_dev *etdev);
 int edgetpu_laguna_fw_restart(struct edgetpu_laguna_dev *etdev);
 void edgetpu_laguna_fw_stop(struct edgetpu_laguna_dev *etdev);
-void edgetpu_laguna_fw_shared_context_map(struct edgetpu_laguna_dev *etdev,
-					  struct laguna_domain *etdom);
+int edgetpu_laguna_fw_shared_context_map(struct edgetpu_laguna_dev *etdev,
+					 struct laguna_domain *etdom);
 void edgetpu_laguna_fw_shared_context_unmap(struct edgetpu_laguna_dev *etdev,
 					    struct laguna_domain *etdom);
 int edgetpu_laguna_iremap_alloc(struct edgetpu_laguna_dev *etdev, size_t size,

@@ -223,6 +223,14 @@ static int laguna_ioctl_acquire_wakelock(struct laguna_client *client)
 	if (ret)
 		return ret;
 
+	if (!client->etdom->shared_mapped) {
+		ret = edgetpu_laguna_fw_shared_context_map(etdev, client->etdom);
+		if (ret) {
+			edgetpu_laguna_pm_put(etdev);
+			return ret;
+		}
+	}
+
 	ret = edgetpu_laguna_kci_allocate_vmbox(etdev, client->etdom->pasid,
 						(u8)client->vcid,
 						client->first_open,

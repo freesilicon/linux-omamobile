@@ -253,25 +253,44 @@ err_clear:
 	return ret;
 }
 
-void edgetpu_laguna_fw_shared_context_map(struct edgetpu_laguna_dev *etdev,
-					  struct laguna_domain *etdom)
+int edgetpu_laguna_fw_shared_context_map(struct edgetpu_laguna_dev *etdev,
+					 struct laguna_domain *etdom)
 {
-	struct laguna_img_mapping *cur;
-	int ret;
+	struct laguna_img_mapping *cur, *pos;
+	int ret = 0;
+
+	if (etdom->shared_mapped)
+		return 0;
 
 	mutex_lock(&etdev->img_map_lock);
 	list_for_each_entry(cur, &etdev->img_mappings, node) {
-		if (!cur->sgt && (cur->cfg_map_flags & LAGUNA_IMG_MAP_SHARED)) {
-			ret = edgetpu_laguna_iommu_map(etdom->domain,
-						       cur->daddr, cur->paddr,
-						       cur->size, cur->cfg_map_flags);
-			if (ret)
-				dev_warn(etdev->dev,
-					 "shared img map %pad failed pasid=%u: %d\n",
-					 &cur->daddr, etdom->pasid, ret);
+		if (cur->sgt || !(cur->cfg_map_flags & LAGUNA_IMG_MAP_SHARED))
+			continue;
+
+		ret = edgetpu_laguna_iommu_map(etdom->domain, cur->daddr,
+					       cur->paddr, cur->size,
+					       cur->cfg_map_flags);
+		if (ret) {
+			dev_err(etdev->dev,
+				"shared img map %pad failed pasid=%u: %d\n",
+				&cur->daddr, etdom->pasid, ret);
+			list_for_each_entry(pos, &etdev->img_mappings, node) {
+				if (pos == cur)
+					break;
+				if (!pos->sgt &&
+				    (pos->cfg_map_flags & LAGUNA_IMG_MAP_SHARED))
+					edgetpu_laguna_iommu_unmap(etdom->domain,
+								   pos->daddr,
+								   pos->size);
+			}
+			goto out_unlock;
 		}
 	}
+	etdom->shared_mapped = true;
+
+out_unlock:
 	mutex_unlock(&etdev->img_map_lock);
+	return ret;
 }
 
 void edgetpu_laguna_fw_shared_context_unmap(struct edgetpu_laguna_dev *etdev,
@@ -279,12 +298,16 @@ void edgetpu_laguna_fw_shared_context_unmap(struct edgetpu_laguna_dev *etdev,
 {
 	struct laguna_img_mapping *cur;
 
+	if (!etdom->shared_mapped)
+		return;
+
 	mutex_lock(&etdev->img_map_lock);
 	list_for_each_entry(cur, &etdev->img_mappings, node) {
 		if (!cur->sgt && (cur->cfg_map_flags & LAGUNA_IMG_MAP_SHARED))
 			edgetpu_laguna_iommu_unmap(etdom->domain,
 						   cur->daddr, cur->size);
 	}
+	etdom->shared_mapped = false;
 	mutex_unlock(&etdev->img_map_lock);
 }
 
