@@ -49,3 +49,124 @@
 &usb {
 	status = "okay";
 };
+
+&ldo_27s_reg {
+	regulator-min-microvolt = <1850000>;
+	regulator-max-microvolt = <1850000>;
+};
+
+&lsion_level_gia_4 {
+	status = "okay";
+};
+
+&lsioe_level_gia_0 {
+	status = "okay";
+};
+
+&lsioe_level_gia_4 {
+	status = "okay";
+};
+
+&lsios_level_gia_0 {
+	status = "okay";
+};
+
+&lsios_level_gia_4 {
+	status = "okay";
+};
+
+&pinctrl_cpm {
+	status = "okay";
+};
+
+&pinctrl_aoc {
+	status = "okay";
+};
+
+&pinctrl_lsioe {
+	status = "okay";
+};
+
+&pinctrl_lsios {
+	status = "okay";
+};
+
+&i2c14 {
+	status = "okay";
+
+	s2dos07x02_outer: regulator@60 {
+		compatible = "samsung,s2dos07x02";
+		reg = <0x60>;
+		regulator-name = "s2dos07x02-pmic";
+		regulator-min-microvolt = <850000>;
+		regulator-max-microvolt = <2100000>;
+	};
+};
+
+&i2c4 {
+	status = "okay";
+
+	s2dos07x02_inner: regulator@60 {
+		compatible = "samsung,s2dos07x02";
+		reg = <0x60>;
+		regulator-name = "s2dos07x02-inner-pmic";
+		regulator-min-microvolt = <850000>;
+		regulator-max-microvolt = <2100000>;
+	};
+};
+
+&spi20 {
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "synaptics,tcm-spi";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		rx-sample-delay-ns = <25>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts0_2_aoc_int_l_1v2 &pmics2ts0_reset_l_1v2>;
+		vdd-supply = <&ldo_27s_reg>;
+		avdd-supply = <&ldo_26s_reg>;
+		reset-gpios = <&da9188_gpio 0x11 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&pinctrl_aoc>;
+		interrupts = <0x41 IRQ_TYPE_LEVEL_LOW>;
+		power-delay-ms = <200>;
+		reset-active-ms = <20>;
+		reset-delay-ms = <200>;
+	};
+};
+
+&spi19 {
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "st,fst2";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		rx-sample-delay-ns = <25>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts1_2_aoc_int_l_1v2 &pmics2ts1_reset_l_1v2>;
+		vdd-supply = <&ldo_24m_reg>;
+		avdd-supply = <&ldo_26m_reg>;
+		reset-gpios = <&da9188_gpio 0x12 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&pinctrl_aoc>;
+		interrupts = <0x42 IRQ_TYPE_LEVEL_LOW>;
+		touchscreen-size-x = <2076>;
+		touchscreen-size-y = <2152>;
+		touchscreen-inverted-x;
+	};
+};
+
+&gpio_keys {
+	pinctrl-0 = <&vol_dn_l &vol_up_l &pmicm2ap_gsc_pwron_od_l &hall1_2_aoc_ap_l>;
+	status = "okay";
+
+	lid-switch {
+		label = "SW_LID";
+		linux,input-type = <EV_SW>;
+		linux,code = <SW_LID>;
+		gpios = <&pinctrl_cpm 0x38 GPIO_ACTIVE_LOW>;
+		wakeup-source;
+		status = "okay";
+	};
+};
