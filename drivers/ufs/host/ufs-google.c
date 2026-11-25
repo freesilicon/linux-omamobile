@@ -27,18 +27,18 @@
 #include "ufshcd-pltfrm.h"
 
 /* UFS top wrapper registers */
-#define UFS_TOP_STATUS				0x0008
-#define UFS_TOP_STATUS_READY			BIT(4)
+#define UFS_TOP_ENC_STAT			0x0008
+#define UFS_TOP_CRYPTO_KAT_STAT			BIT(4)
 #define UFS_TOP_PHY_CTRL			0x0100
 #define UFS_TOP_PHY_PATCH_MODE_MASK		GENMASK(19, 16)
 #define UFS_TOP_PHY_PATCH_MODE_ROM		0xf
 #define UFS_TOP_PHY_SRAM_INIT_DONE		BIT(21)
-#define UFS_TOP_PM_CTRL				0x0110
-#define UFS_TOP_PM_CTRL_ISOLATE			BIT(6)
-#define UFS_TOP_LINK_STARTUP			0x0200
-#define UFS_TOP_CFG_0				0x0208
-#define UFS_TOP_CFG_1				0x0210
-#define UFS_TOP_CFG_2				0x0214
+#define UFS_TOP_REXT_CTRL			0x0110
+#define UFS_TOP_REXT_EN				BIT(6)
+#define UFS_TOP_AWUSER_VC			0x0200
+#define UFS_TOP_PHYCLK_SEL			0x0208
+#define UFS_TOP_CFG_CLKSEL			0x0210
+#define UFS_TOP_MPHY_CFG			0x0214
 
 /* Laguna HCI vendor registers */
 #define UFS_HC_VENDOR_CTRL			0x00c0
@@ -371,17 +371,16 @@ static int ufs_google_power_up(struct ufs_google_host *ufs, bool reset_hw)
 				    FIELD_PREP(UFS_TOP_PHY_PATCH_MODE_MASK,
 					       UFS_TOP_PHY_PATCH_MODE_ROM),
 				    UFS_TOP_PHY_CTRL);
-		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_0);
-		ufs_google_rmwl_top(ufs, BIT(0), BIT(0), UFS_TOP_CFG_2);
-		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_1);
-		ufs_google_rmwl_top(ufs, UFS_TOP_PM_CTRL_ISOLATE, 0,
-				    UFS_TOP_PM_CTRL);
+		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_PHYCLK_SEL);
+		ufs_google_rmwl_top(ufs, BIT(0), BIT(0), UFS_TOP_MPHY_CFG);
+		ufs_google_rmwl_top(ufs, BIT(1), BIT(1), UFS_TOP_CFG_CLKSEL);
+		ufs_google_rmwl_top(ufs, UFS_TOP_REXT_EN, 0, UFS_TOP_REXT_CTRL);
 
-		ret = readl_poll_timeout(ufs->ufs_top + UFS_TOP_STATUS, val,
-					 val & UFS_TOP_STATUS_READY, 10,
+		ret = readl_poll_timeout(ufs->ufs_top + UFS_TOP_ENC_STAT, val,
+					 val & UFS_TOP_CRYPTO_KAT_STAT, 10,
 					 UFS_GOOGLE_TOP_TIMEOUT_US);
 		if (ret) {
-			dev_err(hba->dev, "ufs_top ready timeout (0x%x)\n", val);
+			dev_err(hba->dev, "ufs_top KAT timeout (0x%x)\n", val);
 			goto err_dis_vdd0p75;
 		}
 	}
@@ -628,21 +627,24 @@ static int ufs_google_init(struct ufs_hba *hba)
 	}
 
 	if (!ufs->pd_on) {
-		bool boot_active =
-			(readl(ufs->ufs_top + UFS_TOP_STATUS) &
-			 UFS_TOP_STATUS_READY) &&
-			(readl(ufs->ufs_top + UFS_TOP_PHY_CTRL) &
-			 UFS_TOP_PHY_SRAM_INIT_DONE) &&
-			!(readl(ufs->ufs_top + UFS_TOP_PM_CTRL) &
-			  UFS_TOP_PM_CTRL_ISOLATE);
-
-		ufs->need_phy_init = !boot_active;
+		u32 enc_stat = readl(ufs->ufs_top + UFS_TOP_ENC_STAT);
+		u32 pwr_ctrl = readl(ufs->ufs_top + UFS_TOP_PHY_CTRL);
+		u32 rext_ctrl = readl(ufs->ufs_top + UFS_TOP_REXT_CTRL);
 
 		/*
-		 * Preserve ABL's initialized PHY/UFS state when the domain had
-		 * on-at-init, only taking Linux clock/regulator references.
+		 * ABL leaves hsio_s_ufs_prep_pd and hsio_s_ufs_pd on-at-init
+		 * with the UFS PHY SRAM FW and REXT calibration active, so
+		 * pm_runtime_resume_and_get() does not fire GENPD_NOTIFY_ON.
+		 * Preserve that bootloader state at cold boot: REXT_CTRL[6]
+		 * is REXT_EN (1 internal, 0 external), not an isolation bit,
+		 * and forcing a reset without the proprietary SRAM FW patch
+		 * destroys ABL's calibrated PHY state.
 		 */
-		ret = ufs_google_power_up(ufs, !boot_active);
+		dev_info(dev, "on-at-init PHY (enc=0x%08x pwr=0x%08x rext=0x%08x)\n",
+			 enc_stat, pwr_ctrl, rext_ctrl);
+		ufs->need_phy_init = false;
+
+		ret = ufs_google_power_up(ufs, false);
 		if (ret)
 			goto err_put_pd;
 	}
@@ -778,7 +780,7 @@ static int ufs_google_link_startup_notify(struct ufs_hba *hba,
 
 	if (status == PRE_CHANGE) {
 		ufshcd_writel(hba, UFS_HC_HCLK_DIV_200MHZ, UFS_HC_HCLK_DIV);
-		writel(0x101, ufs->ufs_top + UFS_TOP_LINK_STARTUP);
+		writel(0x101, ufs->ufs_top + UFS_TOP_AWUSER_VC);
 
 		return ufshcd_vops_phy_initialization(hba);
 	}
