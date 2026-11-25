@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/google/google,s5910-spmi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google S5910 SPMI Modem Clock Buffer
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+properties:
+  compatible:
+    const: google,s5910-spmi
+
+  reg:
+    items:
+      - items:
+          - minimum: 0
+            maximum: 0xf
+          - const: 0
+
+  s5910,seq:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Shutdown register write sequence encoded as (delay_ms, reg, val) triples.
+
+  s5910,on_seq:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Power-on register write sequence encoded as (delay_ms, reg, val) triples.
+
+required:
+  - compatible
+  - reg
+  - s5910,seq
+  - s5910,on_seq
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/spmi/spmi.h>
+
+    spmi-bitbang {
+        #address-cells = <2>;
+        #size-cells = <0>;
+
+        s5910@5 {
+            compatible = "google,s5910-spmi";
+            reg = <5 SPMI_USID>;
+            s5910,seq = <0 0x215 0x0f 1000 0x20e 0x04>;
+            s5910,on_seq = <0 0x211 0x47 0 0x20e 0x00>;
+        };
+    };
