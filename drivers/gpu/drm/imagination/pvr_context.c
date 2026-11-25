@@ -371,7 +371,8 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	if (err)
 		goto err_destroy_queues;
 
-	err = pvr_fw_object_create(pvr_dev, ctx_size, PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+	err = pvr_fw_object_create(pvr_dev, ctx_size,
+				   pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 				   ctx_fw_data_init, ctx, &ctx->fw_obj);
 	if (err)
 		goto err_destroy_queues;

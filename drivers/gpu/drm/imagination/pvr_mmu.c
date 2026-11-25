@@ -141,7 +141,7 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
 		goto err_drm_dev_exit;
 
-	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev)) {
+	if (pvr_dev->laguna && !pvr_laguna_fw_ready(pvr_dev)) {
 		atomic_set(&pvr_dev->mmu_flush_cache_flags, 0);
 		goto err_drm_dev_exit;
 	}

@@ -200,6 +200,8 @@ struct pvr_laguna_data {
 	struct pvr_laguna_fwif_sysdata *fwif_sysdata;
 	struct pvr_laguna_fwif_runtime_cfg *fwif_runtime_cfg;
 	struct pvr_laguna_fwif_tracebuf *fwif_tracebuf;
+	u32 *fwif_trace_data;
+	struct pvr_laguna_fwif_hwrinfobuf *fwif_hwrinfobuf;
 	struct pvr_laguna_fwif_ccb_ctl *kccb_ctl;
 	struct pvr_laguna_fwif_kccb_cmd *kccb;
 	u32 *kccb_rtn;
@@ -226,9 +228,11 @@ unsigned long pvr_laguna_get_core_clk_rate(const struct pvr_device *pvr_dev);
 
 void *pvr_laguna_fw_shared_vaddr(struct pvr_device *pvr_dev, u32 fw_offset);
 phys_addr_t pvr_laguna_fw_shared_paddr(struct pvr_device *pvr_dev, u32 fw_offset);
+bool pvr_laguna_fw_ready(const struct pvr_device *pvr_dev);
 bool pvr_laguna_kccb_ready(const struct pvr_device *pvr_dev);
 bool pvr_laguna_power_is_idle(struct pvr_device *pvr_dev);
 void pvr_laguna_clear_hwr_flags(struct pvr_device *pvr_dev);
+void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason);
 u32 pvr_laguna_kccb_used_slot_count_locked(struct pvr_device *pvr_dev);
 void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 					       struct rogue_fwif_kccb_cmd *cmd,

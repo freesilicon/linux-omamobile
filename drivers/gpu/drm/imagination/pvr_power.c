@@ -100,28 +100,27 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 
 		if (pvr_dev->fw_dev.power_sync &&
 		    (!pvr_dev->laguna || pvr_laguna_kccb_ready(pvr_dev))) {
-			err = pvr_power_request_idle(pvr_dev);
-			if (err) {
-				if (!pvr_dev->laguna)
-					return err;
-				drm_warn(from_pvr_device(pvr_dev),
-					 "Laguna FW forced-idle timed out (%d); proceeding with STOP\n",
-					 err);
-			} else {
+			if (pvr_dev->laguna) {
 				err = pvr_power_request_pwr_off(pvr_dev);
 				if (err) {
-					if (!pvr_dev->laguna)
-						return err;
 					drm_warn(from_pvr_device(pvr_dev),
 						 "Laguna FW pow-off ack timed out (%d); proceeding with STOP\n",
 						 err);
-				} else if (pvr_dev->laguna) {
+				} else {
 					err = pvr_laguna_wait_pow_off(pvr_dev);
 					if (err)
 						drm_warn(from_pvr_device(pvr_dev),
 							 "Laguna FW did not reach POW_OFF (%d); proceeding with STOP\n",
 							 err);
 				}
+			} else {
+				err = pvr_power_request_idle(pvr_dev);
+				if (err)
+					return err;
+
+				err = pvr_power_request_pwr_off(pvr_dev);
+				if (err)
+					return err;
 			}
 		}
 	}
@@ -151,7 +150,12 @@ pvr_power_fw_enable(struct pvr_device *pvr_dev, bool rpm_resume)
 		goto out;
 
 	if (pvr_dev->laguna) {
-		pvr_laguna_fw_wait_boot(pvr_dev);
+		err = pvr_laguna_fw_wait_boot(pvr_dev);
+		if (err) {
+			drm_err(from_pvr_device(pvr_dev), "Laguna firmware failed to boot\n");
+			pvr_fw_stop(pvr_dev);
+			goto out;
+		}
 	} else if (pvr_dev->fw_dev.fwif_sysinit) {
 		err = pvr_wait_for_fw_boot(pvr_dev);
 		if (err) {

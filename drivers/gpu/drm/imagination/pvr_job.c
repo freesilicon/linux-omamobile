@@ -718,7 +718,7 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 	if (!args->jobs.count)
 		return -EINVAL;
 
-	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev))
+	if (pvr_dev->laguna && !pvr_laguna_fw_ready(pvr_dev))
 		return -EOPNOTSUPP;
 
 	err = PVR_UOBJ_GET_ARRAY(job_args, &args->jobs);

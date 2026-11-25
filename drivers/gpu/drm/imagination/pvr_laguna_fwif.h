@@ -43,11 +43,15 @@
 #define PVR_LAGUNA_KCCB_RTN_CMD_EXECUTED	BIT(0)
 #define PVR_LAGUNA_KCCB_RTN_CLEANUP_BUSY	BIT(1)
 
-/* DDK 25.3 FWCCB command types. */
+/* DDK 25.3 FWCCB command types (RGXCheckFirmwareCCB jump table). */
+#define PVR_LAGUNA_FWCCB_CMD_ZSBUFFER_BACKING		(101U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_FWCCB_CMD_ZSBUFFER_UNBACKING		(102U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_FREELIST_GROW		(103U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_FREELISTS_RECONSTRUCT	(104U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_CONTEXT_RESET		(105U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_FWCCB_CMD_DEBUG_DUMP			(106U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_UPDATE_STATS		(107U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_FWCCB_CMD_CORECLK_RATE_CHANGE	(108U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_REQUEST_GPU_RESTART	(109U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_FW_PAGEFAULT		(112U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 
@@ -75,12 +79,12 @@
 /* DDK 25.3 context compatibility flags. */
 #define PVR_LAGUNA_CTX_COMPAT_HAS_DEFER_COUNT	BIT(1)
 
-/* DDK 25.3 RGXFWIF_CLEANUP_TYPE (differs from upstream at FREELIST = 3). */
+/* DDK 25.3 RGXFWIF_CLEANUP_TYPE (verified against RGXFWRequest*CleanUp). */
 #define PVR_LAGUNA_CLEANUP_FWCOMMONCONTEXT	0U
 #define PVR_LAGUNA_CLEANUP_HWRTDATA		1U
-#define PVR_LAGUNA_CLEANUP_HWRTDATA_AND_FL	2U
-#define PVR_LAGUNA_CLEANUP_FREELIST		3U
-#define PVR_LAGUNA_CLEANUP_ZSBUFFER		4U
+#define PVR_LAGUNA_CLEANUP_FREELIST		2U
+#define PVR_LAGUNA_CLEANUP_ZSBUFFER		3U
+#define PVR_LAGUNA_CLEANUP_HWRTDATA_AND_FL	4U
 
 /* DDK 25.3 Volcanic 40-bit GPU execution heap bases passed in SYSINIT. */
 #define PVR_LAGUNA_PDS_EXEC_BASE		0xDA00000000ULL
@@ -104,9 +108,15 @@
 #define PVR_LAGUNA_FWIF_HWRINFOBUF_SIZE		2464U
 #define PVR_LAGUNA_FWIF_GPU_UTIL_FW_SIZE	10256U
 #define PVR_LAGUNA_FWIF_HWPERFDATA_SIZE		40U
-#define PVR_LAGUNA_FWIF_RUNTIME_HWPERFCFG_SIZE	24U
+#define PVR_LAGUNA_FWIF_RUNTIME_HWPERFCFG_SIZE	40U
 #define PVR_LAGUNA_FWIF_HWPERF_CTL_SIZE		4096U
 #define PVR_LAGUNA_FWIF_TRACE_BUF_DWORDS	4096U
+
+/* DDK 25.3 HWRINFOBUF counter offsets (2464 bytes total, 9 DMs). */
+#define PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF	0x910U
+#define PVR_LAGUNA_HWRINFOBUF_OVERRUN_OFF	0x934U
+#define PVR_LAGUNA_HWRINFOBUF_REJECTED_OFF	0x958U
+#define PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF	0x97cU
 
 struct pvr_laguna_fwif_connection_ctl {
 	u32 connection_fw_state;
@@ -183,14 +193,14 @@ struct pvr_laguna_fwif_sysinit {
 	u8 remap_tables[132];
 	u32 marker_val;
 	u32 firmware_started_timestamp;
-	u64 coremem_data_store_deprecated;
+	u8 coremem_data_store[16];
 	u32 firmware_perf;
-	u32 pad_15c;
-	u8 opp_info[392];
+	u32 pad_164;
+	u8 opp_info[384];
 	u32 opp_reserved;
 	u32 gpio_validation_mode;
+	u64 pad_2f0;
 	u8 bvnc_km_feature_flags[192];
-	u64 uvb_spill_mem_ctx_cat_base;
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_sysinit) == 952);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, clk_ctrl0) == 0x80);
@@ -200,9 +210,10 @@ static_assert(offsetof(struct pvr_laguna_fwif_sysinit, fw_sys_data) == 0xa0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, align_checks) == 0xb0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, firmware_started) == 0xc0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, marker_val) == 0x148);
-static_assert(offsetof(struct pvr_laguna_fwif_sysinit, opp_info) == 0x160);
+static_assert(offsetof(struct pvr_laguna_fwif_sysinit, firmware_perf) == 0x160);
+static_assert(offsetof(struct pvr_laguna_fwif_sysinit, opp_info) == 0x168);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, gpio_validation_mode) == 0x2ec);
-static_assert(offsetof(struct pvr_laguna_fwif_sysinit, uvb_spill_mem_ctx_cat_base) == 0x3b0);
+static_assert(offsetof(struct pvr_laguna_fwif_sysinit, bvnc_km_feature_flags) == 0x2f8);
 
 struct pvr_laguna_fwif_osdata {
 	u32 fw_os_config_flags;
@@ -256,9 +267,55 @@ struct pvr_laguna_fwif_tracebuf_space {
 	u32 wrap_count;
 	u32 trace_buffer_fw_addr;
 	u32 pad_0c;
-	u8 assert_buf[408];
+	char assert_path[200];
+	char assert_info[200];
+	u32 assert_line;
+	u32 assert_pad;
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_tracebuf_space) == 424);
+
+struct pvr_laguna_fwif_hwrinfobuf {
+	u8 hwr_info[PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF];
+	u32 dm_lockup_cnt[PVR_LAGUNA_DM_MAX];
+	u32 dm_overrun_cnt[PVR_LAGUNA_DM_MAX];
+	u32 dm_rejected_cnt[PVR_LAGUNA_DM_MAX];
+	u32 write_index;
+	u8 reserved_980[0x20];
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_hwrinfobuf) == PVR_LAGUNA_FWIF_HWRINFOBUF_SIZE);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_lockup_cnt) ==
+	      PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_overrun_cnt) ==
+	      PVR_LAGUNA_HWRINFOBUF_OVERRUN_OFF);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_rejected_cnt) ==
+	      PVR_LAGUNA_HWRINFOBUF_REJECTED_OFF);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, write_index) ==
+	      PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF);
+
+/* DDK 25.3 Volcanic RGXFWIF_FREELIST (72 bytes, verified against RGXCreateFreeList). */
+struct pvr_laguna_fwif_freelist {
+	u64 freelist_dev_addr;
+	u64 current_dev_addr;
+	u64 current_stack_top;
+	u32 max_pages;
+	u32 grow_pages;
+	u32 current_pages;
+	u32 allocated_page_count;
+	u32 freelist_id;
+	u32 allocated_mmu_page_count;
+	u8 grow_pending;
+	u8 pad_31[3];
+	u32 ready_pages;
+	u32 freelist_flags;
+	u8 pm_global_pb;
+	u8 pad_3d[3];
+	u64 cleanup_state;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_freelist) == 72);
+static_assert(offsetof(struct pvr_laguna_fwif_freelist, max_pages) == 0x18);
+static_assert(offsetof(struct pvr_laguna_fwif_freelist, freelist_id) == 0x28);
+static_assert(offsetof(struct pvr_laguna_fwif_freelist, ready_pages) == 0x34);
+static_assert(offsetof(struct pvr_laguna_fwif_freelist, cleanup_state) == 0x40);
 
 struct pvr_laguna_fwif_tracebuf {
 	u32 log_type;
@@ -314,6 +371,21 @@ struct pvr_laguna_fwif_kccb_cmd {
 static_assert(sizeof(struct pvr_laguna_fwif_kccb_cmd) == 112);
 static_assert(offsetof(struct pvr_laguna_fwif_kccb_cmd, data) == 8);
 
+struct pvr_laguna_fwif_fwccb_zsbuf {
+	u32 zs_buffer_id;
+} __aligned(8);
+
+struct pvr_laguna_fwif_fwccb_fl_grow {
+	u32 freelist_id;
+	u32 pad_04;
+} __aligned(8);
+
+struct pvr_laguna_fwif_fwccb_fl_reconstruct {
+	u32 freelist_count;
+	u32 pad_04;
+	u32 freelist_ids[24];
+} __aligned(8);
+
 struct pvr_laguna_fwif_fwccb_ctx_reset {
 	u32 server_common_context_id;
 	u32 reset_reason;
@@ -325,6 +397,16 @@ struct pvr_laguna_fwif_fwccb_ctx_reset {
 	u64 mmu_status[2];
 } __aligned(8);
 
+struct pvr_laguna_fwif_fwccb_update_stats {
+	u32 element_to_update;
+	s32 adjustment_value;
+	u32 pid_owner;
+} __aligned(8);
+
+struct pvr_laguna_fwif_fwccb_coreclk {
+	u32 core_clk_rate;
+} __aligned(8);
+
 struct pvr_laguna_fwif_fwccb_fw_pf {
 	u64 fw_fault_addr;
 } __aligned(8);
@@ -333,7 +415,12 @@ struct pvr_laguna_fwif_fwccb_cmd {
 	u32 cmd_type;
 	u32 fwccb_flags;
 	union {
+		struct pvr_laguna_fwif_fwccb_zsbuf zsbuf;
+		struct pvr_laguna_fwif_fwccb_fl_grow fl_grow;
+		struct pvr_laguna_fwif_fwccb_fl_reconstruct fl_reconstruct;
 		struct pvr_laguna_fwif_fwccb_ctx_reset ctx_reset;
+		struct pvr_laguna_fwif_fwccb_update_stats update_stats;
+		struct pvr_laguna_fwif_fwccb_coreclk coreclk;
 		struct pvr_laguna_fwif_fwccb_fw_pf fw_pf;
 		u8 raw[104];
 	} data __aligned(8);

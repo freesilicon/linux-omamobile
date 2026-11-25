@@ -23,6 +23,7 @@
 #include <linux/firmware.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
+#include <linux/pm_runtime.h>
 #include <linux/sizes.h>
 
 #define FW_MAX_SUPPORTED_MAJOR_VERSION 1
@@ -1114,7 +1115,9 @@ pvr_fw_structure_cleanup(struct pvr_device *pvr_dev, u32 type, struct pvr_fw_obj
 
 	struct rogue_fwif_cleanup_request *cleanup_req = &cmd.cmd_data.cleanup_data;
 
-	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev))
+	if (pvr_dev->laguna &&
+	    (!pvr_laguna_fw_ready(pvr_dev) ||
+	     pm_runtime_status_suspended(from_pvr_device(pvr_dev)->dev)))
 		return 0;
 
 	down_read(&pvr_dev->reset_sem);

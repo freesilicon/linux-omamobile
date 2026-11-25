@@ -593,7 +593,7 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 			sizeof(struct rogue_fwif_fwmemcontext);
 
 		err = pvr_fw_object_create(pvr_dev, fw_mem_ctx_size,
-					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+					   pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
 
 		if (err)

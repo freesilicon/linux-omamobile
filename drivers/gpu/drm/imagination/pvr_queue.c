@@ -912,6 +912,30 @@ pvr_queue_timedout_job(struct drm_sched_job *s_job)
 
 	drm_sched_stop(sched, s_job);
 
+	if (pvr_dev->laguna) {
+		pvr_laguna_dump_fw_state(pvr_dev, "job-timeout");
+		atomic_set(&queue->ctx->faulty, 1);
+		WRITE_ONCE(*queue->timeline_ufo.value,
+			   atomic_read(&queue->job_fence_ctx.seqno));
+
+		list_for_each_entry(job, &sched->pending_list, base.list) {
+			if (!dma_fence_is_signaled(job->done_fence)) {
+				dma_fence_set_error(job->done_fence, -ETIMEDOUT);
+				dma_fence_signal(job->done_fence);
+				pvr_job_release_pm_ref(job);
+				atomic_dec(&queue->in_flight_job_count);
+			}
+			job->base.s_fence->parent = dma_fence_get(job->done_fence);
+		}
+
+		mutex_lock(&pvr_dev->queues.lock);
+		list_move_tail(&queue->node, &pvr_dev->queues.idle);
+		mutex_unlock(&pvr_dev->queues.lock);
+
+		drm_sched_start(sched, 0);
+		return DRM_GPU_SCHED_STAT_RESET;
+	}
+
 	/* Re-assign job parent fences. */
 	list_for_each_entry(job, &sched->pending_list, base.list) {
 		job->base.s_fence->parent = dma_fence_get(job->done_fence);
@@ -1368,7 +1392,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
 		goto err_free_queue;
 
 	err = pvr_fw_object_create(pvr_dev, ctx_state_size,
-				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+				   pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 				   reg_state_init, queue, &queue->reg_state_obj);
 	if (err)
 		goto err_cccb_fini;
