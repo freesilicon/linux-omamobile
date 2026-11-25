@@ -4,6 +4,7 @@
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_fw_startstop.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_queue.h"
 #include "pvr_rogue_fwif.h"
@@ -97,7 +98,8 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 	if (!hard_reset) {
 		cancel_delayed_work_sync(&pvr_dev->watchdog.work);
 
-		if (pvr_dev->fw_dev.power_sync) {
+		if (pvr_dev->fw_dev.power_sync &&
+		    (!pvr_dev->laguna || pvr_laguna_kccb_ready(pvr_dev))) {
 			err = pvr_power_request_idle(pvr_dev);
 			if (err)
 				return err;
@@ -132,7 +134,9 @@ pvr_power_fw_enable(struct pvr_device *pvr_dev, bool rpm_resume)
 	if (err)
 		goto out;
 
-	if (pvr_dev->fw_dev.fwif_sysinit) {
+	if (pvr_dev->laguna) {
+		pvr_laguna_fw_wait_boot(pvr_dev);
+	} else if (pvr_dev->fw_dev.fwif_sysinit) {
 		err = pvr_wait_for_fw_boot(pvr_dev);
 		if (err) {
 			drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
@@ -158,6 +162,9 @@ out:
 bool
 pvr_power_is_idle(struct pvr_device *pvr_dev)
 {
+	if (pvr_dev->laguna)
+		return pvr_laguna_power_is_idle(pvr_dev);
+
 	if (!pvr_dev->fw_dev.fwif_sysdata)
 		return true;
 
@@ -568,6 +575,8 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 				WRITE_ONCE(pvr_dev->fw_dev.initialised, true);
 				if (err)
 					goto err_device_lost;
+			} else if (pvr_dev->laguna) {
+				pvr_laguna_clear_hwr_flags(pvr_dev);
 			} else {
 				/* Clear the FW faulted flags. */
 				pvr_dev->fw_dev.fwif_sysdata->hwr_state_flags &=

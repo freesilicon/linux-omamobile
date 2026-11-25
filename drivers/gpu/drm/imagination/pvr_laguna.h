@@ -13,6 +13,10 @@
 #ifndef PVR_LAGUNA_H
 #define PVR_LAGUNA_H
 
+#include "pvr_laguna_fwif.h"
+
+#include <drm/drm_mm.h>
+
 #include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -20,7 +24,9 @@
 struct clk;
 struct firmware;
 struct pvr_device;
+struct pvr_fw_object;
 struct pvr_power_sequence_ops;
+struct rogue_fwif_kccb_cmd;
 struct tipc_chan;
 
 /* Laguna PowerVR firmware carveout layout (gpu_fw@b9f00000, 33 MiB no-map). */
@@ -155,6 +161,48 @@ struct pvr_laguna_data {
 	u64 fw_hdr_carveout_off;
 	bool fw_authenticated;
 	bool fw_running;
+	bool fw_kccb_ready;
+
+	/* Shared FW heap (gpu_fw@b9f00000 + 2 MiB, 30 MiB pre-mapped by Trusty). */
+	void *fw_shared_cpu;
+	struct drm_mm_node fw_secure_rsvd;
+
+	/* DDK 25.3 FWIF objects allocated in the Trusty pre-mapped FW heap. */
+	struct pvr_fw_object *fwif_connection_ctl_obj;
+	struct pvr_fw_object *fwif_osinit_obj;
+	struct pvr_fw_object *fwif_sysinit_obj;
+	struct pvr_fw_object *fwif_osdata_obj;
+	struct pvr_fw_object *fwif_sysdata_obj;
+	struct pvr_fw_object *fwif_runtime_cfg_obj;
+	struct pvr_fw_object *fwif_tracebuf_obj;
+	struct pvr_fw_object *fwif_trace_data_obj;
+	struct pvr_fw_object *fwif_hwrinfobuf_obj;
+	struct pvr_fw_object *fwif_gpu_util_obj;
+	struct pvr_fw_object *fwif_hwperf_data_obj;
+	struct pvr_fw_object *fwif_hwperf_rtcfg_obj;
+	struct pvr_fw_object *fwif_hwperf_ctl_obj;
+	struct pvr_fw_object *fwif_fault_page_obj;
+	struct pvr_fw_object *fwif_power_sync_obj;
+	struct pvr_fw_object *fwif_mmucache_sync_obj;
+	struct pvr_fw_object *kccb_ctl_obj;
+	struct pvr_fw_object *kccb_obj;
+	struct pvr_fw_object *kccb_rtn_obj;
+	struct pvr_fw_object *fwccb_ctl_obj;
+	struct pvr_fw_object *fwccb_obj;
+
+	struct pvr_laguna_fwif_connection_ctl *fwif_connection_ctl;
+	struct pvr_laguna_fwif_osinit *fwif_osinit;
+	struct pvr_laguna_fwif_sysinit *fwif_sysinit;
+	struct pvr_laguna_fwif_osdata *fwif_osdata;
+	struct pvr_laguna_fwif_sysdata *fwif_sysdata;
+	struct pvr_laguna_fwif_runtime_cfg *fwif_runtime_cfg;
+	struct pvr_laguna_fwif_tracebuf *fwif_tracebuf;
+	struct pvr_laguna_fwif_ccb_ctl *kccb_ctl;
+	struct pvr_laguna_fwif_kccb_cmd *kccb;
+	u32 *kccb_rtn;
+	struct pvr_laguna_fwif_ccb_ctl *fwccb_ctl;
+	struct pvr_laguna_fwif_fwccb_cmd *fwccb;
+	u32 *power_sync;
 
 	struct pvr_laguna_tz tz;
 };
@@ -166,8 +214,21 @@ int pvr_laguna_fw_init(struct pvr_device *pvr_dev);
 void pvr_laguna_fw_fini(struct pvr_device *pvr_dev);
 int pvr_laguna_fw_start(struct pvr_device *pvr_dev);
 int pvr_laguna_fw_stop(struct pvr_device *pvr_dev);
+int pvr_laguna_fw_wait_boot(struct pvr_device *pvr_dev);
 void pvr_laguna_slc_program_lut(struct pvr_device *pvr_dev);
 int pvr_laguna_mba_send_msg(struct pvr_device *pvr_dev, u32 client_idx, u32 msg);
 unsigned long pvr_laguna_get_core_clk_rate(const struct pvr_device *pvr_dev);
+
+void *pvr_laguna_fw_shared_vaddr(struct pvr_device *pvr_dev, u32 fw_offset);
+phys_addr_t pvr_laguna_fw_shared_paddr(struct pvr_device *pvr_dev, u32 fw_offset);
+bool pvr_laguna_kccb_ready(const struct pvr_device *pvr_dev);
+bool pvr_laguna_power_is_idle(struct pvr_device *pvr_dev);
+void pvr_laguna_clear_hwr_flags(struct pvr_device *pvr_dev);
+u32 pvr_laguna_kccb_used_slot_count_locked(struct pvr_device *pvr_dev);
+void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
+					       struct rogue_fwif_kccb_cmd *cmd,
+					       u32 *kccb_slot);
+bool pvr_laguna_kccb_is_idle(struct pvr_device *pvr_dev);
+void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev);
 
 #endif /* PVR_LAGUNA_H */

@@ -7,6 +7,7 @@
 #include "pvr_gem.h"
 #include "pvr_hwrt.h"
 #include "pvr_job.h"
+#include "pvr_laguna.h"
 #include "pvr_mmu.h"
 #include "pvr_power.h"
 #include "pvr_rogue_fwif.h"
@@ -716,6 +717,9 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 
 	if (!args->jobs.count)
 		return -EINVAL;
+
+	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev))
+		return -EOPNOTSUPP;
 
 	err = PVR_UOBJ_GET_ARRAY(job_args, &args->jobs);
 	if (err)

@@ -33,6 +33,18 @@ struct pvr_fw_object {
 	/** @gem: GEM object backing the FW object. */
 	struct pvr_gem_object *gem;
 
+	/** @carveout_cpu: CPU mapping when backed by a static FW carveout (Laguna). */
+	void *carveout_cpu;
+
+	/** @carveout_phys: Physical address when backed by a static FW carveout. */
+	phys_addr_t carveout_phys;
+
+	/** @carveout_size: Allocation size when backed by a static FW carveout. */
+	size_t carveout_size;
+
+	/** @carveout_flags: Allocation flags when backed by a static FW carveout. */
+	u64 carveout_flags;
+
 	/**
 	 * @fw_mm_node: Node representing mapping in FW address space. @pvr_obj->lock must
 	 *              be held when writing.
@@ -438,12 +450,18 @@ pvr_fw_object_create_and_map_offset(struct pvr_device *pvr_dev, u32 dev_offset, 
 static __always_inline void *
 pvr_fw_object_vmap(struct pvr_fw_object *fw_obj)
 {
+	if (fw_obj->carveout_cpu)
+		return fw_obj->carveout_cpu;
+
 	return pvr_gem_object_vmap(fw_obj->gem);
 }
 
 static __always_inline void
 pvr_fw_object_vunmap(struct pvr_fw_object *fw_obj)
 {
+	if (fw_obj->carveout_cpu)
+		return;
+
 	pvr_gem_object_vunmap(fw_obj->gem);
 }
 
@@ -471,6 +489,13 @@ pvr_fw_object_unmap_and_destroy(struct pvr_fw_object *fw_obj)
 static __always_inline int
 pvr_fw_object_get_dma_addr(struct pvr_fw_object *fw_obj, u32 offset, dma_addr_t *dma_addr_out)
 {
+	if (fw_obj->carveout_cpu) {
+		if (offset >= fw_obj->carveout_size)
+			return -EINVAL;
+		*dma_addr_out = (dma_addr_t)(fw_obj->carveout_phys + offset);
+		return 0;
+	}
+
 	return pvr_gem_get_dma_addr(fw_obj->gem, offset, dma_addr_out);
 }
 
@@ -488,6 +513,9 @@ pvr_fw_obj_get_gpu_addr(struct pvr_fw_object *fw_obj);
 static __always_inline size_t
 pvr_fw_obj_get_object_size(struct pvr_fw_object *fw_obj)
 {
+	if (fw_obj->carveout_cpu)
+		return fw_obj->carveout_size;
+
 	return pvr_gem_object_size(fw_obj->gem);
 }
 

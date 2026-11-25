@@ -7,6 +7,7 @@
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_mmu_defs.h"
@@ -139,6 +140,11 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
 	/* Can't flush MMU if the firmware hasn't been initialised yet. */
 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
 		goto err_drm_dev_exit;
+
+	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev)) {
+		atomic_set(&pvr_dev->mmu_flush_cache_flags, 0);
+		goto err_drm_dev_exit;
+	}
 
 	cmd_mmu_cache_data->cache_flags =
 		atomic_xchg(&pvr_dev->mmu_flush_cache_flags, 0);

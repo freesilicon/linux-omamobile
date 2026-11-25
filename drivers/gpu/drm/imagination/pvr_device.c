@@ -229,7 +229,8 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
 		pvr_fw_irq_clear(pvr_dev);
 
 		if (READ_ONCE(pvr_dev->fw_dev.initialised) &&
-		    pvr_dev->fw_dev.fwif_osdata) {
+		    (pvr_dev->fw_dev.fwif_osdata ||
+		     pvr_laguna_kccb_ready(pvr_dev))) {
 			pvr_fwccb_process(pvr_dev);
 			pvr_kccb_wake_up_waiters(pvr_dev);
 			pvr_device_process_active_queues(pvr_dev);
@@ -303,7 +304,8 @@ pvr_device_irq_init(struct pvr_device *pvr_dev)
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct platform_device *plat_dev = to_platform_device(drm_dev->dev);
 
-	init_waitqueue_head(&pvr_dev->kccb.rtn_q);
+	if (!pvr_dev->laguna)
+		init_waitqueue_head(&pvr_dev->kccb.rtn_q);
 
 	pvr_device_safety_irq_init(pvr_dev);
 

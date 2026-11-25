@@ -1114,6 +1114,9 @@ pvr_fw_structure_cleanup(struct pvr_device *pvr_dev, u32 type, struct pvr_fw_obj
 
 	struct rogue_fwif_cleanup_request *cleanup_req = &cmd.cmd_data.cleanup_data;
 
+	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev))
+		return 0;
+
 	down_read(&pvr_dev->reset_sem);
 
 	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx)) {
@@ -1181,6 +1184,8 @@ pvr_fw_object_fw_map(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj, u
 	struct pvr_gem_object *pvr_obj = fw_obj->gem;
 	struct drm_gem_object *gem_obj = gem_from_pvr_gem(pvr_obj);
 	struct pvr_fw_device *fw_dev = &pvr_dev->fw_dev;
+	size_t alloc_size = fw_obj->carveout_size ? fw_obj->carveout_size : gem_obj->size;
+	u64 align = fw_obj->carveout_size ? PAGE_SIZE : 0;
 
 	int err;
 
@@ -1197,7 +1202,7 @@ pvr_fw_object_fw_map(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj, u
 		 * config space).
 		 */
 		err = drm_mm_insert_node_in_range(&fw_dev->fw_mm, &fw_obj->fw_mm_node,
-						  gem_obj->size, 0, 0,
+						  alloc_size, align, 0,
 						  fw_dev->fw_heap_info.gpu_addr,
 						  fw_dev->fw_heap_info.gpu_addr +
 						  fw_dev->fw_heap_info.size, 0);
@@ -1205,7 +1210,7 @@ pvr_fw_object_fw_map(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj, u
 			goto err_unlock;
 	} else {
 		fw_obj->fw_mm_node.start = dev_addr;
-		fw_obj->fw_mm_node.size = gem_obj->size;
+		fw_obj->fw_mm_node.size = alloc_size;
 		err = drm_mm_reserve_node(&fw_dev->fw_mm, &fw_obj->fw_mm_node);
 		if (err)
 			goto err_unlock;
@@ -1213,12 +1218,12 @@ pvr_fw_object_fw_map(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj, u
 
 	spin_unlock(&fw_dev->fw_mm_lock);
 
+	fw_obj->fw_addr_offset = (u32)(fw_obj->fw_mm_node.start - fw_dev->fw_mm_base);
+
 	/* Map object on GPU. */
 	err = fw_dev->defs->vm_map(pvr_dev, fw_obj);
 	if (err)
 		goto err_remove_node;
-
-	fw_obj->fw_addr_offset = (u32)(fw_obj->fw_mm_node.start - fw_dev->fw_mm_base);
 
 	return 0;
 
@@ -1285,7 +1290,13 @@ pvr_fw_object_create_and_map_common(struct pvr_device *pvr_dev, size_t size,
 	fw_obj->init = init;
 	fw_obj->init_priv = init_priv;
 
-	fw_obj->gem = pvr_gem_object_create(pvr_dev, size, flags);
+	if (pvr_dev->laguna) {
+		fw_obj->carveout_size = PAGE_ALIGN(size);
+		fw_obj->carveout_flags = flags;
+		fw_obj->gem = pvr_gem_object_create(pvr_dev, PAGE_SIZE, flags);
+	} else {
+		fw_obj->gem = pvr_gem_object_create(pvr_dev, size, flags);
+	}
 	if (IS_ERR(fw_obj->gem)) {
 		err = PTR_ERR(fw_obj->gem);
 		fw_obj->gem = NULL;
@@ -1306,6 +1317,9 @@ pvr_fw_object_create_and_map_common(struct pvr_device *pvr_dev, size_t size,
 
 	if (fw_obj->init)
 		fw_obj->init(cpu_ptr, fw_obj->init_priv);
+
+	if (fw_obj->carveout_cpu)
+		wmb(); /* Ensure WC carveout writes are visible to FW. */
 
 	mutex_lock(&pvr_dev->fw_dev.fw_objs.lock);
 	list_add_tail(&fw_obj->node, &pvr_dev->fw_dev.fw_objs.list);
@@ -1497,11 +1511,12 @@ pvr_fw_hard_reset(struct pvr_device *pvr_dev)
 	list_for_each(pos, &pvr_dev->fw_dev.fw_objs.list) {
 		struct pvr_fw_object *fw_obj = container_of(pos, struct pvr_fw_object, node);
 		void *cpu_ptr = pvr_fw_object_vmap(fw_obj);
+		u64 obj_flags = fw_obj->carveout_cpu ? fw_obj->carveout_flags : fw_obj->gem->flags;
 
 		WARN_ON(IS_ERR(cpu_ptr));
 
-		if (!(fw_obj->gem->flags & PVR_BO_FW_NO_CLEAR_ON_RESET)) {
-			memset(cpu_ptr, 0, pvr_gem_object_size(fw_obj->gem));
+		if (!(obj_flags & PVR_BO_FW_NO_CLEAR_ON_RESET)) {
+			memset(cpu_ptr, 0, pvr_fw_obj_get_object_size(fw_obj));
 
 			if (fw_obj->init)
 				fw_obj->init(cpu_ptr, fw_obj->init_priv);
@@ -1511,6 +1526,11 @@ pvr_fw_hard_reset(struct pvr_device *pvr_dev)
 	}
 
 	mutex_unlock(&pvr_dev->fw_dev.fw_objs.lock);
+
+	if (pvr_dev->laguna) {
+		wmb(); /* Ensure WC carveout resets reach DRAM before FW restart. */
+		return 0;
+	}
 
 	err = pvr_fw_reinit_code_data(pvr_dev);
 	if (err)
