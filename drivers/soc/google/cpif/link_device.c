@@ -18,6 +18,11 @@
 #include <linux/reboot.h>
 #include <linux/pci.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/icmpv6.h>
+#include <net/icmp.h>
+#include <net/xfrm.h>
 #if IS_ENABLED(CONFIG_ECT)
 #include <soc/google/ect_parser.h>
 #endif
@@ -229,7 +234,8 @@ static void link_trigger_cp_crash(struct mem_link_device *mld, u32 crash_type,
 	}
 
 	if (!reason_done && reason && reason[0] != '\0') {
-		strscpy(ld->crash_reason.string, reason, CP_CRASH_INFO_SIZE);
+		strscpy(ld->crash_reason.string, reason,
+			sizeof(ld->crash_reason.string));
 		reason_done = true;
 	}
 
@@ -946,8 +952,9 @@ exit:
 		return 1;
 }
 
-static inline void start_tx_timer(struct mem_link_device *mld,
-				  struct hrtimer *timer)
+static inline void start_tx_timer_custom(struct mem_link_device *mld,
+					 struct hrtimer *timer,
+					 unsigned int interval)
 {
 	struct link_device *ld = &mld->link_dev;
 	struct modem_ctl *mc = ld->mc;
@@ -962,11 +969,17 @@ static inline void start_tx_timer(struct mem_link_device *mld,
 
 	spin_lock_irqsave(&mc->tx_timer_lock, flags);
 	if (!hrtimer_is_queued(timer)) {
-		ktime_t ktime = ktime_set(0, mld->tx_period_ns);
+		ktime_t ktime = ktime_set(0, interval);
 
 		hrtimer_start(timer, ktime, HRTIMER_MODE_REL);
 	}
 	spin_unlock_irqrestore(&mc->tx_timer_lock, flags);
+}
+
+static inline void start_tx_timer(struct mem_link_device *mld,
+				  struct hrtimer *timer)
+{
+	start_tx_timer_custom(mld, timer, mld->tx_period_ns);
 }
 
 static inline void shmem_start_timers(struct mem_link_device *mld)
@@ -1175,6 +1188,9 @@ static enum hrtimer_restart pktproc_tx_timer_func(struct hrtimer *timer)
 	unsigned int count;
 	int ret, i;
 
+	if (mc->device_suspended)
+		return HRTIMER_NORESTART;
+
 	for (i = 0; i < ppa_ul->num_queue; i++) {
 		struct pktproc_queue_ul *q = ppa_ul->q[i];
 
@@ -1232,14 +1248,46 @@ static enum hrtimer_restart pktproc_tx_timer_func(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+static inline bool is_icmp_pkt(struct sk_buff *skb)
+{
+	struct iphdr *iph;
+	unsigned int hdr_len;
+
+	if (!skb || skb_headlen(skb) < sizeof(*iph))
+		return false;
+
+	iph = (struct iphdr *)skb->data;
+	switch (iph->version) {
+	case 4:
+		if (iph->protocol != IPPROTO_ICMP)
+			return false;
+		hdr_len = iph->ihl * 4;
+		if (hdr_len < sizeof(*iph) ||
+		    skb_headlen(skb) < hdr_len + sizeof(struct icmphdr))
+			return false;
+		return ((const struct icmphdr *)(skb->data + hdr_len))->type == ICMP_ECHO;
+	case 6:
+		if (skb_headlen(skb) < sizeof(struct ipv6hdr) + sizeof(struct icmp6hdr))
+			return false;
+		if (((const struct ipv6hdr *)skb->data)->nexthdr != IPPROTO_ICMPV6)
+			return false;
+		return ((const struct icmp6hdr *)(skb->data + sizeof(struct ipv6hdr)))->icmp6_type ==
+		       ICMPV6_ECHO_REQUEST;
+	default:
+		return false;
+	}
+}
+
 static int xmit_ipc_to_pktproc(struct mem_link_device *mld, struct sk_buff *skb)
 {
 	struct pktproc_adaptor_ul *ppa_ul = &mld->pktproc_ul;
 	// Set the ul queue to high priority by default.
 	struct pktproc_queue_ul *q = ppa_ul->q[PKTPROC_UL_HIPRIO];
+	struct sec_path *sp = skb_sec_path(skb);
 	int len;
 	int ret = -EBUSY;
 	unsigned long flags;
+	bool icmp_pkt = is_icmp_pkt(skb);
 
 	if (ppa_ul->padding_required)
 		len = skb->len + CP_PADDING;
@@ -1255,7 +1303,8 @@ static int xmit_ipc_to_pktproc(struct mem_link_device *mld, struct sk_buff *skb)
 	 * 4) If queue_mapping of skb is 1(high priority), and skb length larger then
 	 *    the maximum packet size of high priority queue, set queue to
 	 *    PKTPROC_UL_NORM.
-	 * 5) Check again if the skb length exceeds the maximum size of
+	 * 5) For packets with IPsec headers, always use normal priority buffers.
+	 * 6) Check again if the skb length exceeds the maximum size of
 	 *    PKTPROC_UL_NORM queue.
 	 */
 #if IS_ENABLED(CONFIG_CP_PKTPROC_UL_SINGLE_QUEUE)
@@ -1264,7 +1313,8 @@ static int xmit_ipc_to_pktproc(struct mem_link_device *mld, struct sk_buff *skb)
 	else
 #endif
 	if (skb->queue_mapping != 1 ||
-		(skb->queue_mapping == 1 && len > q->max_packet_size)) {
+		(skb->queue_mapping == 1 && len > q->max_packet_size) ||
+		(sp && sp->len > 0)) {
 		q = ppa_ul->q[PKTPROC_UL_NORM];
 		if (len > q->max_packet_size) {
 			mif_err_limited("ERR!PKTPROC UL QUEUE:%d skb len:%d too large (max:%u)\n",
@@ -1295,8 +1345,11 @@ static int xmit_ipc_to_pktproc(struct mem_link_device *mld, struct sk_buff *skb)
 		dev_consume_skb_any(skb);
 
 exit:
-	/* start timer even on error */
-	if (ret)
+	/* start tx timer with 0 interval for icmp packets only to reduce ping latency */
+	if (ret > 0 && icmp_pkt)
+		start_tx_timer_custom(mld, &mld->pktproc_tx_timer, 0);
+	else if (ret)
+		/* start timer even on error */
 		start_tx_timer(mld, &mld->pktproc_tx_timer);
 
 	return ret;
@@ -2131,10 +2184,11 @@ static int link_load_gnss_image(struct link_device *ld,
 
 	int ret = 0;
 	struct mem_link_device *mld = to_mem_link_device(ld);
+	size_t gnss_region_size = cp_shmem_get_size(0, SHMEM_GNSS_FW);
 
 	memset(&img, 0, sizeof(struct gnss_image));
 
-	mif_info("Load GNSS images\n");
+	mif_info_limited("Load GNSS images\n");
 
 	if (!mld->gnss_v_base) {
 		mif_err("No gnss_fw vmap region\n");
@@ -2145,6 +2199,23 @@ static int link_load_gnss_image(struct link_device *ld,
 	if (ret) {
 		mif_err("copy_from_user() fail:%d\n", ret);
 		return ret;
+	}
+
+	if (!img.firmware_bin) {
+		mif_err("firmware_bin is NULL!\n");
+		return -EINVAL;
+	}
+
+	if (img.firmware_size == 0) {
+		mif_err("firmware_size is zero!\n");
+		return -EINVAL;
+	}
+
+	if (img.firmware_size > gnss_region_size ||
+	    img.offset > gnss_region_size - img.firmware_size) {
+		mif_err("Invalid GNSS image parameters (offset=%u, size=%u)!\n",
+			img.offset, img.firmware_size);
+		return -EFAULT;
 	}
 
 	dst = (void __iomem *)(mld->gnss_v_base + img.offset);
@@ -2164,6 +2235,7 @@ static int link_read_gnss_image(struct link_device *ld,
 	struct gnss_image img;
 	int err = 0;
 	struct mem_link_device *mld = to_mem_link_device(ld);
+	size_t gnss_region_size = cp_shmem_get_size(0, SHMEM_GNSS_FW);
 
 	memset(&img, 0, sizeof(struct gnss_image));
 
@@ -2179,8 +2251,19 @@ static int link_read_gnss_image(struct link_device *ld,
 		return err;
 	}
 
-	if (img.offset + img.firmware_size > cp_shmem_get_size(0, SHMEM_GNSS_FW)) {
-		mif_err("offset:%d size:%d error\n",
+	if (!img.firmware_bin) {
+		mif_err("firmware_bin is NULL!\n");
+		return -EINVAL;
+	}
+
+	if (img.firmware_size == 0) {
+		mif_err("firmware_size is zero!\n");
+		return -EINVAL;
+	}
+
+	if (img.firmware_size > gnss_region_size ||
+	    img.offset > gnss_region_size - img.firmware_size) {
+		mif_err("offset:%u size:%u error\n",
 			img.offset, img.firmware_size);
 		return -EFAULT;
 	}
@@ -2620,6 +2703,41 @@ static int link_start_dump_boot(struct link_device *ld, struct io_device *iod)
 	return 0;
 }
 
+static int link_start_partial_boot(struct link_device *ld, struct io_device *iod)
+{
+	struct mem_link_device *mld = to_mem_link_device(ld);
+
+#if IS_ENABLED(CONFIG_LINK_DEVICE_WITH_SBD_ARCH)
+	if (ld->sbd_ipc && (mld->attrs & LINK_ATTR_MEM_DUMP))
+		sbd_deactivate(&mld->sbd_link_dev);
+#endif
+
+	sync_net_dev(ld);
+
+	init_legacy_link(&mld->legacy_link_dev);
+	skb_queue_purge(&iod->sk_rx_q);
+
+	if (mld->attrs & LINK_ATTR_BOOT_ALIGNED)
+		ld->aligned = true;
+	else
+		ld->aligned = false;
+
+	if (mld->dpram_magic) {
+		unsigned int magic;
+
+		iowrite32(ld->magic_dump, mld->legacy_link_dev.magic);
+		magic = ioread32(mld->legacy_link_dev.magic);
+		if (magic != ld->magic_dump) {
+			mif_err("%s: ERR! magic 0x%08X != DUMP_MAGIC 0x%08X\n",
+				ld->name, magic, ld->magic_dump);
+			return -EFAULT;
+		}
+		mif_info("%s: magic == 0x%08X\n", ld->name, magic);
+	}
+
+	return 0;
+}
+
 static void shmem_close_tx(struct link_device *ld)
 {
 	struct mem_link_device *mld = to_mem_link_device(ld);
@@ -2709,7 +2827,10 @@ static void pcie_send_ap2cp_irq(struct mem_link_device *mld, u16 mask)
 		mif_info_limited("Reserve doorbell interrupt: PCI not powered on\n");
 		set_ctrl_msg(&mld->ap2cp_msg, mask);
 		mc->reserve_doorbell_int = true;
-		s5100_try_gpio_cp_wakeup(mc);
+		if (mc->variant == MODEM_SEC_5400 && mc->ap2cp_wakeup_wq)
+			queue_work(mc->ap2cp_wakeup_wq, &mc->ap2cp_wakeup_work);
+		else
+			s5100_try_gpio_cp_wakeup(mc);
 		goto exit;
 	}
 
@@ -2935,6 +3056,9 @@ static irqreturn_t shmem_cp2ap_wakelock_handler(int irq, void *data)
 static irqreturn_t shmem_cp2ap_rat_mode_handler(int irq, void *data)
 {
 	struct mem_link_device *mld = data;
+	struct modem_ctl *mc = mld->link_dev.mc;
+	struct s51xx_pcie *s51xx_pcie =
+		(mc && mc->s51xx_pdev) ? pci_get_drvdata(mc->s51xx_pdev) : NULL;
 	unsigned int req;
 
 	req = extract_ctrl_msg(&mld->cp2ap_united_status, mld->sbi_cp_rat_mode_mask,
@@ -2943,10 +3067,12 @@ static irqreturn_t shmem_cp2ap_rat_mode_handler(int irq, void *data)
 	mif_info("value: %u\n", req);
 
 	if (req) {
-		s51xx_pcie_l1ss_ctrl(0);
+		if (s51xx_pcie)
+			s51xx_pcie_l1ss_ctrl(0, s51xx_pcie);
 		mif_info("cp requests pcie l1ss disable\n");
 	} else {
-		s51xx_pcie_l1ss_ctrl(1);
+		if (s51xx_pcie)
+			s51xx_pcie_l1ss_ctrl(1, s51xx_pcie);
 		mif_info("cp requests pcie l1ss enable\n");
 	}
 
@@ -3382,7 +3508,7 @@ static ssize_t rx_int_count_store(struct device *dev,
 		mif_err("kstrtouint() failed, rc:%d\n", ret);
 	}
 
-	if (val == 0)
+	if (ret == 0 && val == 0)
 		modem->mld->rx_int_count = 0;
 	return count;
 }
@@ -3436,7 +3562,7 @@ static ssize_t rx_int_disabled_time_store(struct device *dev,
 		mif_err("kstrtouint() failed, rc:%d", ret);
 	}
 
-	if (val == 0)
+	if (ret == 0 && val == 0)
 		modem->mld->rx_int_disabled_time = 0;
 	return count;
 }
@@ -3777,6 +3903,7 @@ static int set_ld_attr(struct platform_device *pdev,
 			break;
 
 		ld->link_start_normal_boot = link_start_normal_boot;
+		ld->link_start_partial_boot = link_start_partial_boot;
 		if (link_type == LINKDEV_SHMEM)
 			ld->security_req = shmem_security_request;
 
@@ -3894,6 +4021,7 @@ static int init_shmem_maps(u32 link_type, struct modem_data *modem,
 
 		of_property_read_u32(np_acpm, "dump-size", &mld->acpm_size);
 		of_property_read_u32(np_acpm, "dump-base", &acpm_addr);
+		of_node_put(np_acpm);
 		mld->acpm_base = cp_shmem_get_nc_region(acpm_addr, mld->acpm_size);
 		if (!mld->acpm_base) {
 			mif_err("Failed to vmap acpm_region\n");
@@ -4157,6 +4285,7 @@ struct link_device *create_link_device(struct platform_device *pdev, u32 link_ty
 	struct link_device *ld;
 	int err;
 	u32 cp_num;
+	bool pktproc_created = false;
 
 	mif_info("+++\n");
 
@@ -4373,6 +4502,7 @@ struct link_device *create_link_device(struct platform_device *pdev, u32 link_ty
 		mif_err("pktproc_create() error %d\n", err);
 		goto error;
 	}
+	pktproc_created = true;
 #endif
 
 #if IS_ENABLED(CONFIG_CP_PKTPROC_UL)
@@ -4390,6 +4520,9 @@ struct link_device *create_link_device(struct platform_device *pdev, u32 link_ty
 	err = tpmon_create(pdev, ld);
 	if (err < 0) {
 		mif_err("tpmon_create() error %d\n", err);
+#if IS_ENABLED(CONFIG_CP_PKTPROC_UL)
+		pktproc_destroy_ul(pdev, mld);
+#endif
 		goto error;
 	}
 #endif
@@ -4417,8 +4550,13 @@ struct link_device *create_link_device(struct platform_device *pdev, u32 link_ty
 error:
 	if (mld->dummy_net) {
 		napi_disable(&mld->mld_napi);
+		netif_napi_del(&mld->mld_napi);
 		free_netdev(mld->dummy_net);
 	}
+	if (pktproc_created)
+		pktproc_destroy(&mld->pktproc);
+	if (modem->mld == mld)
+		modem->mld = NULL;
 	kfree(mld);
 	mif_err("xxx\n");
 	return NULL;

@@ -225,6 +225,24 @@ static long bootdump_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 			ret = mc->ops.power_reset_dump(mc, 1);
 			break;
 
+		case CP_BOOT_MODE_DUMP_PARTIAL:
+			mif_info("%s: dump partial boot mode\n", iod->name);
+			if (!mc->ops.power_reset_partial) {
+				mif_err("%s: power_reset_partial is null\n", iod->name);
+				return -EINVAL;
+			}
+			ret = mc->ops.power_reset_partial(mc);
+			break;
+
+		case CP_BOOT_MODE_DUMP_WARM:
+			mif_info("%s: dump warm boot mode\n", iod->name);
+			if (!mc->ops.power_reset_warm) {
+				mif_err("%s: power_reset_warm is null\n", iod->name);
+				return -EINVAL;
+			}
+			ret = mc->ops.power_reset_warm(mc);
+			break;
+
 		default:
 			mif_err("boot_mode is invalid:%d\n", mode.idx);
 			return -EINVAL;
@@ -292,6 +310,46 @@ static long bootdump_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 				return -EINVAL;
 			}
 			return mc->ops.start_dump_boot(mc);
+
+		case CP_BOOT_MODE_NORMAL_BL1:
+			mif_info("%s: bl1 boot mode\n", iod->name);
+			if (!mc->ops.start_normal_boot_bl1) {
+				mif_err("%s: start_normal_boot_bl1 is null\n", iod->name);
+				return -EINVAL;
+			}
+			return mc->ops.start_normal_boot_bl1(mc);
+
+		case CP_BOOT_MODE_NORMAL_BOOTLOADER:
+			mif_info("%s: bootloader boot mode\n", iod->name);
+			if (!mc->ops.start_normal_boot_bootloader) {
+				mif_err("%s: start_normal_boot_bootloader is null\n", iod->name);
+				return -EINVAL;
+			}
+			return mc->ops.start_normal_boot_bootloader(mc);
+
+		case CP_BOOT_MODE_DUMP_BL1:
+			mif_info("%s: bl1 dump boot mode\n", iod->name);
+			if (!mc->ops.start_dump_boot_bl1) {
+				mif_err("%s: start_dump_boot_bl1 is null\n", iod->name);
+				return -EINVAL;
+			}
+			return mc->ops.start_dump_boot_bl1(mc);
+
+		case CP_BOOT_MODE_DUMP_BOOTLOADER:
+			mif_info("%s: bootloader dump boot mode\n", iod->name);
+			if (!mc->ops.start_dump_boot_bootloader) {
+				mif_err("%s: start_dump_boot_bootloader is null\n", iod->name);
+				return -EINVAL;
+			}
+			return mc->ops.start_dump_boot_bootloader(mc);
+
+		case CP_BOOT_MODE_DUMP_PARTIAL:
+			mif_info("%s: partial dump boot mode\n", iod->name);
+			if (!mc->ops.start_dump_boot_partial) {
+				mif_err("%s: start_dump_boot_partial is null\n", iod->name);
+				return -EINVAL;
+			}
+			return mc->ops.start_dump_boot_partial(mc);
 
 		default:
 			mif_err("boot_mode is invalid:%d\n", mode.idx);

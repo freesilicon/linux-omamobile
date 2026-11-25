@@ -49,6 +49,9 @@
 #include "modem_prj.h"
 #include "modem_variation.h"
 #include "modem_utils.h"
+#if IS_REACHABLE(CONFIG_CP_PMIC)
+#include <soc/google/cp_pmic.h>
+#endif
 #include "modem_toe_device.h"
 
 #if IS_ENABLED(CONFIG_MODEM_IF_LEGACY_QOS)
@@ -115,6 +118,10 @@ static struct modem_ctl *create_modemctl_device(struct platform_device *pdev,
 	modemctl->dev = dev;
 	modemctl->name = pdata->name;
 	modemctl->mdm_data = pdata;
+	if (!strncmp(modemctl->name, "s5400", 5))
+		modemctl->variant = MODEM_SEC_5400;
+	else
+		modemctl->variant = MODEM_SEC_5300;
 
 	modemctl->msd = msd;
 
@@ -125,6 +132,9 @@ static struct modem_ctl *create_modemctl_device(struct platform_device *pdev,
 	spin_lock_init(&modemctl->tx_timer_lock);
 	init_completion(&modemctl->init_cmpl);
 	init_completion(&modemctl->off_cmpl);
+#if IS_ENABLED(CONFIG_LINK_DEVICE_PCIE)
+	init_completion(&modemctl->pcie_power_on_cmpl);
+#endif
 
 	/* init modemctl device for getting modemctl operations */
 	ret = call_modem_init_func(modemctl, pdata);
@@ -804,12 +814,35 @@ static int cpif_probe(struct platform_device *pdev)
 		np = of_parse_phandle(dev->of_node, "google,clk-buffer", 0);
 		if (np) {
 			dp = s5910_get_device(np);
+			of_node_put(np);
 			if (dp) {
 				modemctl->s5910_dev = dp;
 				link = device_link_add(dev, dp, 0);
 				if (link)
 					mif_info("%s s5910 linked\n",
 							pdata->name);
+			}
+		}
+	}
+#endif
+
+#if IS_REACHABLE(CONFIG_CP_PMIC)
+	modemctl->pmic_dev = NULL;
+	if (dev->of_node) {
+		struct device_node *np;
+		struct device *dp;
+		struct device_link *link;
+
+		np = of_parse_phandle(dev->of_node, "google,cp-pmic-spmi", 0);
+		if (np) {
+			dp = pmic_get_device(np);
+			of_node_put(np);
+			if (dp) {
+				modemctl->pmic_dev = dp;
+				link = device_link_add(dev, dp, 0);
+				if (link)
+					mif_info("%s cp pmic device linked\n",
+						 pdata->name);
 			}
 		}
 	}
@@ -969,7 +1002,53 @@ static int modem_resume(struct device *pdev)
 	return 0;
 }
 
+static int suspend_prepare(struct device *pdev)
+{
+	struct modem_ctl *mc = dev_get_drvdata(pdev);
+	struct link_device *ld;
+	struct mem_link_device *mld;
+
+	if (!mc || !mc->iod)
+		return 0;
+
+	ld = get_current_link(mc->iod);
+	mld = to_mem_link_device(ld);
+	mc->device_suspended = true;
+#if IS_ENABLED(CONFIG_CP_PKTPROC_UL)
+	if (mld && hrtimer_active(&mld->pktproc_tx_timer))
+		hrtimer_cancel(&mld->pktproc_tx_timer);
+#endif
+
+	return 0;
+}
+
+static int resume_done(struct device *pdev)
+{
+	struct modem_ctl *mc = dev_get_drvdata(pdev);
+	struct link_device *ld;
+	struct mem_link_device *mld;
+
+	if (!mc || !mc->iod)
+		return 0;
+
+	ld = get_current_link(mc->iod);
+	mld = to_mem_link_device(ld);
+	mc->device_suspended = false;
+#if IS_ENABLED(CONFIG_CP_PKTPROC_UL)
+	if (mld && pktproc_check_support_ul(&mld->pktproc_ul) && mld->tx_period_ns) {
+		ktime_t ktime = ktime_set(0, mld->tx_period_ns);
+
+		hrtimer_start(&mld->pktproc_tx_timer, ktime, HRTIMER_MODE_REL);
+	}
+#else
+	(void)mld;
+#endif
+
+	return 0;
+}
+
 static const struct dev_pm_ops cpif_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(suspend_prepare, resume_done)
 	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(modem_suspend, modem_resume)
 };
 

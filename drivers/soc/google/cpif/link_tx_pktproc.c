@@ -384,6 +384,34 @@ static int pktproc_get_info_ul(struct pktproc_adaptor_ul *ppa_ul,
 	return 0;
 }
 
+static void pktproc_free_ul(struct pktproc_adaptor_ul *ppa_ul)
+{
+	int i;
+
+	for (i = 0; i < ppa_ul->num_queue; i++) {
+		kfree(ppa_ul->q[i]);
+		ppa_ul->q[i] = NULL;
+	}
+
+	pktproc_unmap_rgn(ppa_ul->info_vbase);
+	pktproc_unmap_rgn(ppa_ul->desc_vbase);
+	pktproc_unmap_rgn(ppa_ul->buff_vbase);
+	ppa_ul->info_vbase = NULL;
+	ppa_ul->desc_vbase = NULL;
+	ppa_ul->buff_vbase = NULL;
+	ppa_ul->num_queue = 0;
+}
+
+void pktproc_destroy_ul(struct platform_device *pdev, struct mem_link_device *mld)
+{
+	if (!mld->pktproc_ul.support)
+		return;
+
+	sysfs_remove_group(&pdev->dev.kobj, &pktproc_ul_group);
+	pktproc_free_ul(&mld->pktproc_ul);
+	mld->pktproc_ul.support = 0;
+}
+
 int pktproc_create_ul(struct platform_device *pdev, struct mem_link_device *mld,
 		unsigned long memaddr, u32 memsize)
 {
@@ -661,18 +689,6 @@ int pktproc_create_ul(struct platform_device *pdev, struct mem_link_device *mld,
 	return 0;
 
 create_error:
-	for (i = 0; i < ppa_ul->num_queue; i++) {
-		kfree(ppa_ul->q[i]);
-		ppa_ul->q[i] = NULL;
-	}
-
-	pktproc_unmap_rgn(ppa_ul->info_vbase);
-	pktproc_unmap_rgn(ppa_ul->desc_vbase);
-	pktproc_unmap_rgn(ppa_ul->buff_vbase);
-	ppa_ul->info_vbase = NULL;
-	ppa_ul->desc_vbase = NULL;
-	ppa_ul->buff_vbase = NULL;
-	ppa_ul->num_queue = 0;
-
+	pktproc_free_ul(ppa_ul);
 	return ret;
 }

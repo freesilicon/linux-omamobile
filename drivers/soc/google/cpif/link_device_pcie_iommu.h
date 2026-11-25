@@ -8,6 +8,8 @@
 #define __LINK_DEVICE_PCIE_IOMMU_H__
 
 #include "link_device_memory.h"
+#include "cpif_pcie_shim.h"
+#include "s51xx_pcie.h"
 
 void cpif_pcie_iommu_enable_regions(struct mem_link_device *mld);
 int cpif_pcie_iommu_init(struct pktproc_queue *q);

@@ -17,7 +17,19 @@ cpif-y += modem_utils.o modem_dump.o
 cpif-y += link_device.o link_device_memory_flow_control.o
 cpif-y += link_device_memory_debug.o
 cpif-y += link_device_memory_snapshot.o link_device_memory_legacy.o
-cpif-$(CONFIG_LINK_DEVICE_PCIE) += s51xx_pcie.o pcie-gs201-compat.o
+cpif-$(CONFIG_LINK_DEVICE_PCIE) += s51xx_pcie.o
+ifeq ($(CONFIG_EXYNOS_MODEM_IF),m)
+ifneq ($(CONFIG_PCIE_GS201_CP),)
+cpif-$(CONFIG_LINK_DEVICE_PCIE) += pcie-gs201-compat.o
+endif
+ifneq ($(CONFIG_PCIE_GOOGLE_LGA),)
+cpif-$(CONFIG_LINK_DEVICE_PCIE) += link_device_pcie_google.o
+endif
+else
+cpif-$(CONFIG_PCIE_GS201_CP) += pcie-gs201-compat.o
+cpif-$(CONFIG_PCIE_GOOGLE_LGA) += link_device_pcie_google.o
+endif
+cpif-$(CONFIG_LINK_DEVICE_PCIE_IOMMU) += link_device_pcie_iommu.o
 cpif-$(CONFIG_SEC_MODEM_S5100) += modem_ctrl_s5100.o modem_ctrl.o
 cpif-$(CONFIG_CP_PKTPROC) += link_rx_pktproc.o
 cpif-$(CONFIG_CP_PKTPROC_UL) += link_tx_pktproc.o

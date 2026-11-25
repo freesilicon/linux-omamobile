@@ -45,6 +45,8 @@ static struct device_node *cp_rmem_node(struct device_node *np)
 	if (of_property_present(np, "memory-region"))
 		return of_node_get(np);
 	modem = of_find_compatible_node(NULL, NULL, "samsung,s5300-modem");
+	if (!modem)
+		modem = of_find_compatible_node(NULL, NULL, "samsung,s5400-modem");
 	return modem ?: of_node_get(np);
 }
 
@@ -74,15 +76,22 @@ static int cp_rmem_setup_latecall(struct platform_device *pdev)
 			mif_err("of_reserved_mem_lookup() failed\n");
 			break;
 		}
+		if (rmem_index >= MAX_CP_RMEM) {
+			mif_err("rmem_index %u out of bounds for %s\n",
+				rmem_index, rmem->name);
+			of_node_put(owner);
+			return -ENOMEM;
+		}
 
-		_cp_rmem[i].index = rmem_index;
-		_cp_rmem[i].name = (char *)rmem->name;
-		_cp_rmem[i].p_base = rmem->base;
-		_cp_rmem[i].size = rmem->size;
+		_cp_rmem[rmem_index].index = rmem_index;
+		_cp_rmem[rmem_index].name = (char *)rmem->name;
+		_cp_rmem[rmem_index].p_base = rmem->base;
+		_cp_rmem[rmem_index].size = rmem->size;
+		_rmem_count++;
 
 		mif_info("rmem %d %s 0x%08lx 0x%08x\n",
-				_cp_rmem[i].index, _cp_rmem[i].name,
-				_cp_rmem[i].p_base, _cp_rmem[i].size);
+				_cp_rmem[rmem_index].index, _cp_rmem[rmem_index].name,
+				_cp_rmem[rmem_index].p_base, _cp_rmem[rmem_index].size);
 	}
 
 	of_node_put(owner);
