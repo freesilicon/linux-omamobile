@@ -843,9 +843,6 @@ static int dw8250_runtime_suspend(struct device *dev)
 
 	clk_disable_unprepare(data->pclk);
 
-	if (cli_pm)
-		reset_control_assert(data->rst);
-
 	return 0;
 }
 
