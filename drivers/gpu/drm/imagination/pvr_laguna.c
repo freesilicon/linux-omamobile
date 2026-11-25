@@ -12,6 +12,7 @@
 
 #include <drm/drm_print.h>
 
+#include <linux/align.h>
 #include <linux/arm-smccc.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
@@ -20,9 +21,11 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -65,24 +68,89 @@
 #define PVR_LAGUNA_PFSM_STATE_OFF		0x04U
 #define PVR_LAGUNA_PFSM_STATUS_OFF		0x08U
 
-/* Trusty IPC timeouts. */
-#define PVR_LAGUNA_TZ_CON_TIMEOUT_MS		5000U
-#define PVR_LAGUNA_TZ_BUF_TIMEOUT_MS		5000U
-#define PVR_LAGUNA_TZ_MSG_TIMEOUT_MS		5000U
+/* Trusty IPC timeouts (ms). */
+#define PVR_LAGUNA_TZ_CON_TIMEOUT_MS		30000U
+#define PVR_LAGUNA_TZ_BUF_TIMEOUT_MS		30000U
+#define PVR_LAGUNA_TZ_MSG_TIMEOUT_MS		30000U
 
-struct pvr_laguna_gpu_secure_req {
-	u32 cmd;
+/* Firmware trailer constants (DDK 25.x layout table at body_end - 4 KiB). */
+#define PVR_LAGUNA_FW_BLOCK_SIZE		SZ_4K
+#define PVR_LAGUNA_FW_LAYOUT_MAX_ENTRIES	16U
+#define PVR_LAGUNA_FW_BUILD_ID_LEN		24U
+
+enum pvr_laguna_fw_sec_type {
+	PVR_LAGUNA_FW_SEC_NONE = 0,
+	PVR_LAGUNA_FW_SEC_CODE = 1,
+	PVR_LAGUNA_FW_SEC_RWDATA = 2,
+	PVR_LAGUNA_FW_SEC_RODATA = 3,
+	PVR_LAGUNA_FW_SEC_COREMEM_CODE = 4,
+	PVR_LAGUNA_FW_SEC_COREMEM_DATA = 5,
+};
+
+struct pvr_laguna_fw_footer_hdr {
+	__le32 fwabi_version;
+	__le32 magic;
+	__le32 footer_version;
+	__le32 pa_range_count;
+	char fw_build_id[PVR_LAGUNA_FW_BUILD_ID_LEN];
+} __packed;
+
+struct pvr_laguna_fw_info_hdr {
+	__le32 info_version;
+	__le32 header_len;
+	__le32 layout_entry_num;
+	__le32 layout_entry_size;
+	__le64 bvnc;
+	__le32 fw_page_size;
+	__le32 flags;
+} __packed;
+
+struct pvr_laguna_fw_layout_entry {
+	__le32 id;
+	__le32 type;
+	__le32 base_addr;
+	__le32 max_size;
+	__le32 alloc_size;
+	__le32 alloc_offset;
+} __packed;
+
+struct pvr_laguna_tz_req_base {
+	u32 command;
 	u32 version;
+};
+
+struct pvr_laguna_tz_rsp_base {
+	u32 command;
+	u32 result;
+};
+
+struct pvr_laguna_tz_mem {
+	u64 pa;
+	u32 fw_va;
+	u32 size;
+};
+
+struct pvr_laguna_tz_req_fw {
+	struct pvr_laguna_tz_req_base base;
+	struct pvr_laguna_tz_mem image_body;
+	struct pvr_laguna_tz_mem image_header;
+	struct pvr_laguna_tz_mem section[PVR_LAGUNA_GPU_SECURE_SEC_COUNT];
 	u32 use_tf_a;
 	u32 host_page_shift;
-	u64 fw_ipa;
-	u64 fw_size;
-} __packed;
+	u8 reserved[384];
+} __packed __aligned(8);
 
-struct pvr_laguna_gpu_secure_rsp {
-	u32 cmd;
-	s32 status;
-} __packed;
+static_assert(sizeof(struct pvr_laguna_tz_req_fw) ==
+	      PVR_LAGUNA_GPU_SECURE_MAX_MSG_SIZE / 2);
+static_assert(sizeof(struct pvr_laguna_tz_rsp_base) == 8);
+static_assert(PVR_LAGUNA_FW_CODE_HEAP_SIZE +
+	      PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE +
+	      PVR_LAGUNA_FW_RODATA_HEAP_SIZE ==
+	      PVR_LAGUNA_SECURE_FW_MEM_SIZE);
+static_assert(PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET ==
+	      PVR_LAGUNA_FW_CODE_HEAP_SIZE);
+static_assert(PVR_LAGUNA_FW_RODATA_HEAP_OFFSET ==
+	      PVR_LAGUNA_FW_CODE_HEAP_SIZE + PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE);
 
 static int pvr_laguna_pvtc_sdif_cmd(struct pvr_laguna_data *laguna,
 				    u8 addr, u32 data)
@@ -375,9 +443,17 @@ again:
 	}
 
 	txbuf = tipc_chan_get_txbuf_timeout(tz->chan,
-					    msecs_to_jiffies(PVR_LAGUNA_TZ_BUF_TIMEOUT_MS));
+					    PVR_LAGUNA_TZ_BUF_TIMEOUT_MS);
 	if (IS_ERR(txbuf)) {
 		ret = PTR_ERR(txbuf);
+		goto out_unlock;
+	}
+	if (mb_avail_space(txbuf) < req_len) {
+		dev_err(tz->dev,
+			"pixel_gpu TZ: txbuf too small (%zu < %zu)\n",
+			mb_avail_space(txbuf), req_len);
+		tipc_chan_put_txbuf(tz->chan, txbuf);
+		ret = -EMSGSIZE;
 		goto out_unlock;
 	}
 	memcpy(mb_put_data(txbuf, req_len), req, req_len);
@@ -447,54 +523,272 @@ static void pvr_laguna_tz_init(struct pvr_laguna_tz *tz, struct device *dev)
 }
 
 static int pvr_laguna_smc_gpu_control(struct pvr_device *pvr_dev,
-				      unsigned long subcmd,
-				      unsigned long arg2)
+				      unsigned long subcmd)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
-	struct arm_smccc_res res = { 0 };
-	long smc_ret;
+	struct arm_smccc_1_2_regs args = {
+		.a0 = PVR_LAGUNA_SMC_OEM_GPU_CONTROL,
+		.a1 = subcmd,
+	};
+	struct arm_smccc_1_2_regs res = {
+		.a0 = 0xFFFFFFFFUL,
+	};
 
-	arm_smccc_smc(PVR_LAGUNA_SMC_OEM_GPU_CONTROL, subcmd, arg2,
-		      0, 0, 0, 0, 0, &res);
+	arm_smccc_1_2_smc(&args, &res);
 
-	smc_ret = (long)res.a0;
-	if (smc_ret < 0) {
+	if (res.a0) {
 		drm_err(drm_dev,
-			"TF-A SMC_OEM_GPU_CONTROL subcmd=%lu failed (%ld)\n",
-			subcmd, smc_ret);
+			"TF-A SMC_OEM_GPU_CONTROL subcmd=%lu failed (%#lx)\n",
+			subcmd, res.a0);
 		return -EIO;
 	}
 
 	return 0;
 }
 
-static int pvr_laguna_validate_signed_fw(const struct firmware *fw,
-					 u32 *hdr_off_out)
-{
-	static const u32 offsets[] = {
-		PVR_LAGUNA_SIGNED_FW_HDR_OFF_0,
-		PVR_LAGUNA_SIGNED_FW_HDR_OFF_1,
-	};
+struct pvr_laguna_fw_parsed {
+	u32 hdr_file_off;
+	u32 hdr_size;
+	u32 hdr_magic_off;
+	u32 body_file_off;
+	u32 body_size;
+	u32 abi_version;
+	u32 code_alloc_size;
+	u32 data_alloc_size;
+	u32 rodata_alloc_size;
+	u64 body_carveout_off;
+	u64 hdr_carveout_off;
+	u64 bvnc;
+};
 
-	if (!fw || !fw->data || fw->size == 0 ||
-	    fw->size > PVR_LAGUNA_SECURE_FW_MEM_SIZE)
+static int pvr_laguna_detect_signed_hdr(const u8 *entry, u32 entry_len,
+					u32 *hdr_size_out, u32 *magic_off_out)
+{
+	__le32 magic, version;
+
+	if (entry_len < PVR_LAGUNA_SIGNED_FW_WHI_HDR_SIZE)
 		return -EINVAL;
 
-	for (size_t i = 0; i < ARRAY_SIZE(offsets); i++) {
-		u32 off = offsets[i];
-		u32 magic;
+	memcpy(&magic, entry + PVR_LAGUNA_SIGNED_FW_WHI_MAGIC_OFF, sizeof(magic));
+	if (le32_to_cpu(magic) == PVR_LAGUNA_SIGNED_FW_MAGIC) {
+		*hdr_size_out = PVR_LAGUNA_SIGNED_FW_WHI_HDR_SIZE;
+		*magic_off_out = PVR_LAGUNA_SIGNED_FW_WHI_MAGIC_OFF;
+		return 0;
+	}
 
-		if (off + sizeof(magic) > fw->size)
+	memcpy(&version, entry, sizeof(version));
+	switch (le32_to_cpu(version)) {
+	case PVR_LAGUNA_SIGNED_FW_LGA_VERSION:
+		if (entry_len < PVR_LAGUNA_SIGNED_FW_LGA_HDR_SIZE)
+			return -EINVAL;
+		memcpy(&magic, entry + PVR_LAGUNA_SIGNED_FW_LGA_MAGIC_OFF,
+		       sizeof(magic));
+		if (le32_to_cpu(magic) != PVR_LAGUNA_SIGNED_FW_MAGIC)
+			return -EINVAL;
+		*hdr_size_out = PVR_LAGUNA_SIGNED_FW_LGA_HDR_SIZE;
+		*magic_off_out = PVR_LAGUNA_SIGNED_FW_LGA_MAGIC_OFF;
+		return 0;
+
+	case PVR_LAGUNA_SIGNED_FW_MBU_VERSION:
+		if (entry_len < PVR_LAGUNA_SIGNED_FW_MBU_HDR_SIZE)
+			return -EINVAL;
+		memcpy(&magic, entry + PVR_LAGUNA_SIGNED_FW_MBU_MAGIC_OFF,
+		       sizeof(magic));
+		if (le32_to_cpu(magic) != PVR_LAGUNA_SIGNED_FW_MAGIC)
+			return -EINVAL;
+		*hdr_size_out = PVR_LAGUNA_SIGNED_FW_MBU_HDR_SIZE;
+		*magic_off_out = PVR_LAGUNA_SIGNED_FW_MBU_MAGIC_OFF;
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+static int pvr_laguna_parse_fw_layout(const u8 *body, u32 body_size,
+				      struct pvr_laguna_fw_parsed *out)
+{
+	struct pvr_laguna_fw_info_hdr info;
+	u32 hdr_len, entry_num, entry_size;
+	u64 code_sz = 0, data_sz = 0, rodata_sz = 0;
+	u64 code_alloc, data_alloc, rodata_alloc;
+	u64 body_off, hdr_off, end_off;
+	const u8 *trailer;
+
+	if (body_size <= PVR_LAGUNA_FW_BLOCK_SIZE)
+		return -EINVAL;
+
+	trailer = body + body_size - PVR_LAGUNA_FW_BLOCK_SIZE;
+	memcpy(&info, trailer, sizeof(info));
+
+	if (le32_to_cpu(info.info_version) == 0)
+		return -EINVAL;
+
+	hdr_len = le32_to_cpu(info.header_len);
+	entry_num = le32_to_cpu(info.layout_entry_num);
+	entry_size = le32_to_cpu(info.layout_entry_size);
+
+	if (hdr_len < sizeof(info) || hdr_len > PVR_LAGUNA_FW_BLOCK_SIZE ||
+	    entry_size < sizeof(struct pvr_laguna_fw_layout_entry) ||
+	    entry_num == 0 || entry_num > PVR_LAGUNA_FW_LAYOUT_MAX_ENTRIES ||
+	    (u64)hdr_len + (u64)entry_num * entry_size > PVR_LAGUNA_FW_BLOCK_SIZE)
+		return -EINVAL;
+
+	for (u32 i = 0; i < entry_num; i++) {
+		struct pvr_laguna_fw_layout_entry ent;
+		u32 alloc_sz;
+
+		memcpy(&ent, trailer + hdr_len + i * entry_size, sizeof(ent));
+		alloc_sz = le32_to_cpu(ent.alloc_size);
+		if (!alloc_sz)
 			continue;
 
-		memcpy(&magic, fw->data + off, sizeof(magic));
-		if (le32_to_cpu((__force __le32)magic) == PVR_LAGUNA_SIGNED_FW_MAGIC) {
-			*hdr_off_out = off;
-			return 0;
+		switch (le32_to_cpu(ent.type)) {
+		case PVR_LAGUNA_FW_SEC_CODE:
+			code_sz += alloc_sz;
+			break;
+		case PVR_LAGUNA_FW_SEC_RWDATA:
+			data_sz += alloc_sz;
+			break;
+		case PVR_LAGUNA_FW_SEC_RODATA:
+			rodata_sz += alloc_sz;
+			break;
+		case PVR_LAGUNA_FW_SEC_COREMEM_CODE:
+		case PVR_LAGUNA_FW_SEC_COREMEM_DATA:
+			/* Volcanic RISC-V has no META DMA coremem sections. */
+			break;
+		default:
+			return -EINVAL;
 		}
 	}
 
-	return -EINVAL;
+	if (!code_sz || !data_sz)
+		return -EINVAL;
+
+	code_alloc = PAGE_ALIGN(code_sz);
+	data_alloc = PAGE_ALIGN(data_sz);
+	rodata_alloc = PAGE_ALIGN(rodata_sz);
+
+	if (code_alloc > PVR_LAGUNA_FW_CODE_HEAP_SIZE ||
+	    data_alloc > PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE ||
+	    rodata_alloc > PVR_LAGUNA_FW_RODATA_HEAP_SIZE)
+		return -EFBIG;
+
+	/*
+	 * Place image_body and image_header page-aligned inside FW_CODE_HEAP
+	 * right after section[CODE] so GSA authentication pages never overlap
+	 * any other firmware section.
+	 */
+	body_off = PVR_LAGUNA_FW_CODE_HEAP_OFFSET + code_alloc;
+	hdr_off = body_off + PAGE_ALIGN((u64)body_size);
+	end_off = hdr_off + PAGE_ALIGN((u64)out->hdr_size);
+	if (end_off > PVR_LAGUNA_FW_CODE_HEAP_OFFSET + PVR_LAGUNA_FW_CODE_HEAP_SIZE)
+		return -EFBIG;
+
+	out->code_alloc_size = (u32)code_alloc;
+	out->data_alloc_size = (u32)data_alloc;
+	out->rodata_alloc_size = (u32)rodata_alloc;
+	out->body_carveout_off = body_off;
+	out->hdr_carveout_off = hdr_off;
+	out->bvnc = le64_to_cpu(info.bvnc);
+
+	return 0;
+}
+
+static int pvr_laguna_parse_signed_entry(const u8 *entry, u32 entry_len,
+					 u32 entry_file_off, u32 abi_version,
+					 struct pvr_laguna_fw_parsed *out)
+{
+	u32 hdr_size = 0, magic_off = 0;
+	int err;
+
+	err = pvr_laguna_detect_signed_hdr(entry, entry_len,
+					   &hdr_size, &magic_off);
+	if (err)
+		return err;
+
+	if (entry_len <= hdr_size)
+		return -EINVAL;
+
+	memset(out, 0, sizeof(*out));
+	out->hdr_file_off = entry_file_off;
+	out->hdr_size = hdr_size;
+	out->hdr_magic_off = magic_off;
+	out->body_file_off = entry_file_off + hdr_size;
+	out->body_size = entry_len - hdr_size;
+	out->abi_version = abi_version;
+
+	return pvr_laguna_parse_fw_layout(entry + hdr_size,
+					  entry_len - hdr_size, out);
+}
+
+static int pvr_laguna_validate_signed_fw(struct pvr_device *pvr_dev,
+					 const struct firmware *fw,
+					 struct pvr_laguna_fw_parsed *out)
+{
+	u64 target_bvnc = pvr_gpu_id_to_packed_bvnc(&pvr_dev->gpu_id);
+	struct pvr_laguna_fw_parsed fallback = { 0 };
+	bool have_fallback = false;
+	size_t pos = 0;
+	int err;
+
+	if (!fw || !fw->data || fw->size == 0 || fw->size > SZ_8M)
+		return -EINVAL;
+
+	/*
+	 * Production rgx.fw.signed is a catalogue of one or more length-prefixed
+	 * signed firmware images (u32 LE entry_len followed by entry bytes with
+	 * a 2 KiB Pixel footer at entry_end - 0x800).
+	 */
+	while (pos + sizeof(__le32) <= fw->size) {
+		struct pvr_laguna_fw_footer_hdr footer;
+		struct pvr_laguna_fw_parsed cand;
+		const u8 *entry;
+		__le32 raw_len;
+		u32 entry_len;
+
+		memcpy(&raw_len, fw->data + pos, sizeof(raw_len));
+		entry_len = le32_to_cpu(raw_len);
+		if (entry_len < PVR_LAGUNA_FW_FOOTER_OFF_FROM_END ||
+		    !IS_ALIGNED(entry_len, sizeof(u32)) ||
+		    entry_len > fw->size - (pos + sizeof(raw_len)))
+			break;
+
+		entry = fw->data + pos + sizeof(raw_len);
+		memcpy(&footer,
+		       entry + entry_len - PVR_LAGUNA_FW_FOOTER_OFF_FROM_END,
+		       sizeof(footer));
+
+		if (le32_to_cpu(footer.magic) != PVR_LAGUNA_FW_FOOTER_MAGIC ||
+		    le32_to_cpu(footer.footer_version) != PVR_LAGUNA_FW_FOOTER_VERSION ||
+		    le32_to_cpu(footer.pa_range_count) > PVR_LAGUNA_FW_FOOTER_MAX_PA_RANGES)
+			break;
+
+		err = pvr_laguna_parse_signed_entry(entry, entry_len,
+						    (u32)(pos + sizeof(raw_len)),
+						    le32_to_cpu(footer.fwabi_version),
+						    &cand);
+		if (!err) {
+			if (cand.bvnc == target_bvnc) {
+				*out = cand;
+				return 0;
+			}
+			if (!have_fallback) {
+				fallback = cand;
+				have_fallback = true;
+			}
+		}
+
+		pos += sizeof(raw_len) + entry_len;
+	}
+
+	if (have_fallback) {
+		*out = fallback;
+		return 0;
+	}
+
+	/* Fallback: standalone signed image without 4-byte catalogue prefix. */
+	return pvr_laguna_parse_signed_entry(fw->data, (u32)fw->size, 0, 0, out);
 }
 
 static void pvr_laguna_release_firmware(void *data)
@@ -519,8 +813,8 @@ int pvr_laguna_request_signed_firmware(struct pvr_device *pvr_dev)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	struct pvr_laguna_fw_parsed parsed;
 	const struct firmware *fw;
-	u32 hdr_offset = 0;
 	int err;
 
 	if (!laguna)
@@ -533,21 +827,36 @@ int pvr_laguna_request_signed_firmware(struct pvr_device *pvr_dev)
 		return err;
 	}
 
-	err = pvr_laguna_validate_signed_fw(fw, &hdr_offset);
+	err = pvr_laguna_validate_signed_fw(pvr_dev, fw, &parsed);
 	if (err) {
 		drm_err(drm_dev,
-			"invalid signed firmware %s (size=%zu, missing GPUF header)\n",
-			PVR_LAGUNA_SIGNED_FW_NAME, fw->size);
+			"invalid signed firmware %s (size=%zu, err=%d)\n",
+			PVR_LAGUNA_SIGNED_FW_NAME, fw->size, err);
 		release_firmware(fw);
 		return err;
 	}
 
-	laguna->signed_fw_hdr_offset = hdr_offset;
+	laguna->fw_hdr_file_off = parsed.hdr_file_off;
+	laguna->fw_hdr_size = parsed.hdr_size;
+	laguna->fw_hdr_magic_off = parsed.hdr_magic_off;
+	laguna->fw_body_file_off = parsed.body_file_off;
+	laguna->fw_body_size = parsed.body_size;
+	laguna->fw_abi_version = parsed.abi_version;
+	laguna->fw_code_alloc_size = parsed.code_alloc_size;
+	laguna->fw_data_alloc_size = parsed.data_alloc_size;
+	laguna->fw_rodata_alloc_size = parsed.rodata_alloc_size;
+	laguna->fw_body_carveout_off = parsed.body_carveout_off;
+	laguna->fw_hdr_carveout_off = parsed.hdr_carveout_off;
 	pvr_dev->fw_dev.firmware = fw;
 
 	drm_info(drm_dev,
-		 "validated signed Volcanic firmware %s (size=%zu, GPUF@%#x)\n",
-		 PVR_LAGUNA_SIGNED_FW_NAME, fw->size, hdr_offset);
+		 "validated signed Volcanic firmware %s (size=%zu, hdr=%#x@%#x, GPUF@%#x, body=%#x@%#x, abi=%#x, code=%#x, data=%#x, rodata=%#x)\n",
+		 PVR_LAGUNA_SIGNED_FW_NAME, fw->size,
+		 parsed.hdr_size, parsed.hdr_file_off,
+		 parsed.hdr_file_off + parsed.hdr_magic_off,
+		 parsed.body_size, parsed.body_file_off, parsed.abi_version,
+		 parsed.code_alloc_size, parsed.data_alloc_size,
+		 parsed.rodata_alloc_size);
 
 	return devm_add_action_or_reset(drm_dev->dev,
 					pvr_laguna_release_firmware, pvr_dev);
@@ -558,13 +867,14 @@ static int pvr_laguna_stage_signed_fw(struct pvr_device *pvr_dev)
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
 	const struct firmware *fw = pvr_dev->fw_dev.firmware;
-	void *carveout;
+	u8 *carveout;
 
-	if (!laguna || !fw)
+	if (!laguna || !fw || !laguna->fw_body_size || !laguna->fw_hdr_size)
 		return -EINVAL;
 
-	if (fw->size > laguna->fw_carveout_size ||
-	    fw->size > PVR_LAGUNA_SECURE_FW_MEM_SIZE)
+	if (laguna->fw_carveout_size < PVR_LAGUNA_SECURE_FW_MEM_SIZE ||
+	    laguna->fw_hdr_carveout_off + PAGE_ALIGN((u64)laguna->fw_hdr_size) >
+	    PVR_LAGUNA_SECURE_FW_MEM_SIZE)
 		return -EFBIG;
 
 	carveout = memremap(laguna->fw_carveout_phys,
@@ -574,8 +884,13 @@ static int pvr_laguna_stage_signed_fw(struct pvr_device *pvr_dev)
 		return -ENOMEM;
 	}
 
-	memcpy(carveout, fw->data, fw->size);
-	/* Ensure signed firmware bytes reach DRAM before EL3 SMC setup. */
+	memset(carveout, 0, PVR_LAGUNA_SECURE_FW_MEM_SIZE);
+	memcpy(carveout + laguna->fw_body_carveout_off,
+	       fw->data + laguna->fw_body_file_off, laguna->fw_body_size);
+	memcpy(carveout + laguna->fw_hdr_carveout_off,
+	       fw->data + laguna->fw_hdr_file_off, laguna->fw_hdr_size);
+
+	/* Ensure staged firmware and zeroed sections reach DRAM before Trusty IPC. */
 	wmb();
 	memunmap(carveout);
 
@@ -586,33 +901,65 @@ static int pvr_laguna_trusty_send_fw(struct pvr_device *pvr_dev)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
-	const struct firmware *fw = pvr_dev->fw_dev.firmware;
-	struct pvr_laguna_gpu_secure_req req = {
-		.cmd = PVR_LAGUNA_GPU_SECURE_REQ_SEND_FW,
-		.version = PVR_LAGUNA_GPU_SECURE_REQ_VERSION,
-		.use_tf_a = 1,
-		.host_page_shift = PAGE_SHIFT,
-		.fw_ipa = (u64)laguna->fw_carveout_phys,
-		.fw_size = (u64)fw->size,
-	};
-	struct pvr_laguna_gpu_secure_rsp rsp = { 0 };
+	struct pvr_laguna_tz_req_fw req = { 0 };
+	struct pvr_laguna_tz_rsp_base rsp = { 0 };
+	u64 base = (u64)laguna->fw_carveout_phys;
 	int ret;
+
+	req.base.command = PVR_LAGUNA_GPU_SECURE_CMD_SEND_FW;
+	req.base.version = PVR_LAGUNA_GPU_SECURE_FW_VER_25_2;
+
+	req.image_body.pa = base + laguna->fw_body_carveout_off;
+	req.image_body.fw_va = 0;
+	req.image_body.size = laguna->fw_body_size;
+
+	req.image_header.pa = base + laguna->fw_hdr_carveout_off;
+	req.image_header.fw_va = 0;
+	req.image_header.size = laguna->fw_hdr_size;
+
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_CODE].pa =
+		base + PVR_LAGUNA_FW_CODE_HEAP_OFFSET;
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_CODE].fw_va = 0;
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_CODE].size =
+		laguna->fw_code_alloc_size;
+
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_DATA].pa =
+		base + PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET;
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_DATA].fw_va = 0;
+	req.section[PVR_LAGUNA_GPU_SECURE_SEC_DATA].size =
+		laguna->fw_data_alloc_size;
+
+	if (laguna->fw_rodata_alloc_size) {
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_RODATA].pa =
+			base + PVR_LAGUNA_FW_RODATA_HEAP_OFFSET;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_RODATA].fw_va = 0;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_RODATA].size =
+			laguna->fw_rodata_alloc_size;
+	}
+
+	req.use_tf_a = 1;
+	req.host_page_shift = PAGE_SHIFT;
 
 	ret = pvr_laguna_tz_xchg(&laguna->tz, &req, sizeof(req),
 				 &rsp, sizeof(rsp));
 	if (ret < 0) {
-		drm_err(drm_dev, "Trusty %s FW auth failed (%d)\n",
+		drm_err(drm_dev, "Trusty %s SEND_FIRMWARE_IMAGE failed (%d)\n",
 			PVR_LAGUNA_TRUSTY_GPU_PORT, ret);
 		return ret;
 	}
 
-	if (ret != sizeof(rsp) || rsp.status != 0) {
-		drm_err(drm_dev, "Trusty %s rejected FW (len=%d, status=%d)\n",
-			PVR_LAGUNA_TRUSTY_GPU_PORT, ret, rsp.status);
+	if (ret != sizeof(rsp) || rsp.command != req.base.command ||
+	    rsp.result != 0) {
+		drm_err(drm_dev,
+			"Trusty %s rejected FW (len=%d, cmd=%u, result=%u)\n",
+			PVR_LAGUNA_TRUSTY_GPU_PORT, ret,
+			rsp.command, rsp.result);
 		return -EACCES;
 	}
 
 	laguna->fw_authenticated = true;
+	drm_info(drm_dev, "Trusty %s authenticated Volcanic firmware\n",
+		 PVR_LAGUNA_TRUSTY_GPU_PORT);
 	return 0;
 }
 
@@ -624,22 +971,23 @@ int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
 	if (!laguna)
 		return -ENODEV;
 
-	err = pvr_laguna_stage_signed_fw(pvr_dev);
-	if (err)
-		return err;
+	/*
+	 * Stage and authenticate once per boot: Trusty locks the 2 MiB secure
+	 * carveout and invokes TF-A OEM_GPU_CONTROL_SETUP during
+	 * SEND_FIRMWARE_IMAGE. Subsequent starts only invoke TF-A START.
+	 */
+	if (!laguna->fw_authenticated) {
+		err = pvr_laguna_stage_signed_fw(pvr_dev);
+		if (err)
+			return err;
+
+		err = pvr_laguna_trusty_send_fw(pvr_dev);
+		if (err)
+			return err;
+	}
 
 	err = pvr_laguna_smc_gpu_control(pvr_dev,
-					 PVR_LAGUNA_OEM_GPU_CONTROL_SETUP,
-					 (unsigned long)laguna->fw_carveout_phys);
-	if (err)
-		return err;
-
-	err = pvr_laguna_trusty_send_fw(pvr_dev);
-	if (err)
-		return err;
-
-	err = pvr_laguna_smc_gpu_control(pvr_dev,
-					 PVR_LAGUNA_OEM_GPU_CONTROL_START, 0);
+					 PVR_LAGUNA_OEM_GPU_CONTROL_START);
 	if (err)
 		return err;
 
@@ -656,7 +1004,7 @@ int pvr_laguna_fw_stop(struct pvr_device *pvr_dev)
 		return 0;
 
 	err = pvr_laguna_smc_gpu_control(pvr_dev,
-					 PVR_LAGUNA_OEM_GPU_CONTROL_STOP, 0);
+					 PVR_LAGUNA_OEM_GPU_CONTROL_STOP);
 	if (!err)
 		laguna->fw_running = false;
 

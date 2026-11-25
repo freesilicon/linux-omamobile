@@ -26,27 +26,54 @@ struct tipc_chan;
 /* Laguna PowerVR firmware carveout layout (gpu_fw@b9f00000, 33 MiB no-map). */
 #define PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE		0x02100000ULL /* 33 MiB */
 #define PVR_LAGUNA_SECURE_FW_MEM_SIZE		0x00200000ULL /* 2 MiB (Trusty isolated) */
-#define PVR_LAGUNA_FW_CODE_HEAP_SIZE		0x00120000ULL
-#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE	0x000C0000ULL
+#define PVR_LAGUNA_FW_CODE_HEAP_OFFSET		0x00000000ULL
+#define PVR_LAGUNA_FW_CODE_HEAP_SIZE		0x00130000ULL
+#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET	0x00130000ULL
+#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE	0x000B0000ULL
+#define PVR_LAGUNA_FW_RODATA_HEAP_OFFSET	0x001E0000ULL
 #define PVR_LAGUNA_FW_RODATA_HEAP_SIZE		0x00020000ULL
 #define PVR_LAGUNA_FW_SHARED_HEAP_OFFSET	0x00200000ULL
 #define PVR_LAGUNA_FW_SHARED_HEAP_SIZE		0x01E00000ULL /* 30 MiB */
 #define PVR_LAGUNA_FW_PT_HEAP_OFFSET		0x02000000ULL
 #define PVR_LAGUNA_FW_PT_HEAP_SIZE		0x00100000ULL /* 1 MiB */
 
-/* Signed firmware ("rgx.fw.signed") header validation ("GPUF" little-endian). */
+/* Signed firmware ("rgx.fw.signed") catalogue, footer, and auth header ABI. */
 #define PVR_LAGUNA_SIGNED_FW_NAME		"google/rgx.fw.signed"
 #define PVR_LAGUNA_SIGNED_FW_MAGIC		0x46555047U /* "GPUF" */
-#define PVR_LAGUNA_SIGNED_FW_HDR_OFF_0		0x0400U
-#define PVR_LAGUNA_SIGNED_FW_HDR_OFF_1		0x0864U
+#define PVR_LAGUNA_SIGNED_FW_WHI_HDR_SIZE	0x1000U
+#define PVR_LAGUNA_SIGNED_FW_WHI_MAGIC_OFF	0x0400U
+#define PVR_LAGUNA_SIGNED_FW_LGA_VERSION	1U
+#define PVR_LAGUNA_SIGNED_FW_LGA_HDR_SIZE	0x1000U
+#define PVR_LAGUNA_SIGNED_FW_LGA_MAGIC_OFF	0x0864U
+#define PVR_LAGUNA_SIGNED_FW_MBU_VERSION	2U
+#define PVR_LAGUNA_SIGNED_FW_MBU_HDR_SIZE	0x5000U
+#define PVR_LAGUNA_SIGNED_FW_MBU_MAGIC_OFF	0x463CU
+
+#define PVR_LAGUNA_FW_FOOTER_OFF_FROM_END	0x0800U
+#define PVR_LAGUNA_FW_FOOTER_MAGIC		0x1BADD00DU
+#define PVR_LAGUNA_FW_FOOTER_VERSION		0U
+#define PVR_LAGUNA_FW_FOOTER_MAX_PA_RANGES	64U
 
 /* Trusty IPC port and TF-A EL3 SMC_OEM_GPU_CONTROL ABI. */
 #define PVR_LAGUNA_TRUSTY_GPU_PORT		"com.android.trusty.pixel_gpu"
-#define PVR_LAGUNA_GPU_SECURE_REQ_VERSION	1U
-#define PVR_LAGUNA_GPU_SECURE_REQ_SEND_FW	1U
+#define PVR_LAGUNA_GPU_SECURE_MAX_MSG_SIZE	1024U
+#define PVR_LAGUNA_GPU_SECURE_CMD_PING		0U
+#define PVR_LAGUNA_GPU_SECURE_CMD_SEND_FW	1U
+#define PVR_LAGUNA_GPU_SECURE_CMD_START		2U
+#define PVR_LAGUNA_GPU_SECURE_CMD_STOP		3U
+#define PVR_LAGUNA_GPU_SECURE_CMD_FAULT		4U
+
+#define PVR_LAGUNA_GPU_SECURE_FW_VER_PRE_25_2	0U
+#define PVR_LAGUNA_GPU_SECURE_FW_VER_25_2	1U
+
+#define PVR_LAGUNA_GPU_SECURE_SEC_CODE		0U
+#define PVR_LAGUNA_GPU_SECURE_SEC_DATA		1U
+#define PVR_LAGUNA_GPU_SECURE_SEC_RODATA	2U
+#define PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_CODE	3U
+#define PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_DATA	4U
+#define PVR_LAGUNA_GPU_SECURE_SEC_COUNT		5U
 
 #define PVR_LAGUNA_SMC_OEM_GPU_CONTROL		0xC300000CUL
-#define PVR_LAGUNA_OEM_GPU_CONTROL_SETUP	0UL
 #define PVR_LAGUNA_OEM_GPU_CONTROL_START	1UL
 #define PVR_LAGUNA_OEM_GPU_CONTROL_STOP		2UL
 
@@ -107,8 +134,18 @@ struct pvr_laguna_data {
 	phys_addr_t fw_carveout_phys;
 	size_t fw_carveout_size;
 
-	/* Signed firmware header offset validated in rgx.fw.signed. */
-	u32 signed_fw_hdr_offset;
+	/* Parsed signed firmware entry & carveout staging metadata. */
+	u32 fw_hdr_file_off;
+	u32 fw_hdr_size;
+	u32 fw_hdr_magic_off;
+	u32 fw_body_file_off;
+	u32 fw_body_size;
+	u32 fw_abi_version;
+	u32 fw_code_alloc_size;
+	u32 fw_data_alloc_size;
+	u32 fw_rodata_alloc_size;
+	u64 fw_body_carveout_off;
+	u64 fw_hdr_carveout_off;
 	bool fw_authenticated;
 	bool fw_running;
 
