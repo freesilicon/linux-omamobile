@@ -1230,6 +1230,14 @@
 				output-disable;
 				input-enable;
 			};
+
+			cli14_2_wire_sleep: cli14_2_wire_sleep {
+				pins = "XLSIOE_CLI14_PIN0", "XLSIOE_CLI14_PIN1";
+				function = "lsioe_gpio";
+				bias-pull-up;
+				output-disable;
+				input-enable;
+			};
 		};
 
 		pinctrl_lsios: pinctrl@3be00000 {
@@ -1285,6 +1293,14 @@
 			cli4_2_wire_func: cli4_2_wire_func {
 				pins = "XLSIOS_CLI4_PIN0", "XLSIOS_CLI4_PIN1";
 				function = "lsios_cli4";
+				output-disable;
+				input-enable;
+			};
+
+			cli4_2_wire_sleep: cli4_2_wire_sleep {
+				pins = "XLSIOS_CLI4_PIN0", "XLSIOS_CLI4_PIN1";
+				function = "lsios_gpio";
+				bias-pull-up;
 				output-disable;
 				input-enable;
 			};
@@ -1413,7 +1429,9 @@
 			reset-names = "ic_rst";
 			power-domains = <&lsio_s_cli_gpio_pd>;
 			pinctrl-0 = <&cli4_2_wire_func &cli4_i2c_conf>;
-			pinctrl-names = "default";
+			pinctrl-1 = <&cli4_2_wire_sleep>;
+			pinctrl-2 = <&cli4_i2c_conf>;
+			pinctrl-names = "default", "sleep", "cli";
 			clock-frequency = <400000>;
 			status = "disabled";
 		};
@@ -1430,7 +1448,9 @@
 			reset-names = "ic_rst";
 			power-domains = <&lsio_e_cli_gpio_pd>;
 			pinctrl-0 = <&cli14_2_wire_func &cli14_i2c_conf>;
-			pinctrl-names = "default";
+			pinctrl-1 = <&cli14_2_wire_sleep>;
+			pinctrl-2 = <&cli14_i2c_conf>;
+			pinctrl-names = "default", "sleep", "cli";
 			clock-frequency = <400000>;
 			status = "disabled";
 		};
