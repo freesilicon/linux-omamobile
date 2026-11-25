@@ -1457,6 +1457,16 @@ config GPIO_DA9055
 
 	  If driver is built as a module it will be called gpio-da9055.
 
+config GPIO_DA9188
+	tristate "Dialog Semiconductor DA9188/DA9189 CPM PMIC GPIO"
+	depends on MFD_DA9188 && OF
+	select PINMUX
+	select PINCONF
+	select GENERIC_PINCONF
+	help
+	  Say Y here to enable GPIO and pinconf support for the Dialog
+	  DA9188 and DA9189 PMICs managed via Google CPM MBA.
+
 config GPIO_DLN2
 	tristate "Diolan DLN2 GPIO support"
 	depends on MFD_DLN2

@@ -92,3 +92,68 @@
 &buenos {
 	status = "okay";
 };
+
+&lsion_level_gia_4 {
+	status = "okay";
+};
+
+&lsioe_level_gia_0 {
+	status = "okay";
+};
+
+&lsioe_level_gia_4 {
+	status = "okay";
+};
+
+&pinctrl_cpm {
+	status = "okay";
+};
+
+&pinctrl_aoc {
+	status = "okay";
+};
+
+&pinctrl_lsioe {
+	status = "okay";
+};
+
+&pinctrl_lsios {
+	gpio-reserved-ranges = <0x28 0x4 0x36 0x1>;
+};
+
+&i2c14 {
+	status = "okay";
+
+	s2dos07x02_outer: regulator@60 {
+		compatible = "samsung,s2dos07x02";
+		reg = <0x60>;
+		regulator-name = "s2dos07x02-pmic";
+		regulator-min-microvolt = <850000>;
+		regulator-max-microvolt = <2100000>;
+	};
+};
+
+&spi20 {
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "synaptics,tcm-spi";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		rx-sample-delay-ns = <25>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts0_2_aoc_int_l_1v2>;
+		vdd-supply = <&ldo_27s_reg>;
+		avdd-supply = <&ldo_26s_reg>;
+		reset-gpios = <&da9188_gpio 0x11 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&pinctrl_aoc>;
+		interrupts = <0x41 IRQ_TYPE_LEVEL_LOW>;
+		power-delay-ms = <200>;
+		reset-active-ms = <1>;
+		reset-delay-ms = <70>;
+	};
+};
+
+&gpio_keys {
+	status = "okay";
+};

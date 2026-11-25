@@ -503,6 +503,14 @@ config MFD_DA9150
 	select REGMAP_IRQ
 	help
 	  This adds support for the DA9150 integrated charger and fuel-gauge
+
+config MFD_DA9188
+	tristate "Dialog Semiconductor DA9188/DA9189 CPM PMIC Support"
+	depends on GOOGLE_MBA_CPM_INTERFACE && OF
+	select MFD_CORE
+	help
+	  Say yes here for support for the DA9188 and DA9189 PMICs managed
+	  through the Google Tensor CPM mailbox service.
 	  chip. This driver provides common support for accessing the device.
 	  Additional drivers must be enabled in order to use the specific
 	  features of the device.

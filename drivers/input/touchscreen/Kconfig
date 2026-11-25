@@ -1270,6 +1270,16 @@ config TOUCHSCREEN_SALIXP
 	  To compile this driver as a module, choose M here: the
 	  module will be called salixp.
 
+config TOUCHSCREEN_FST2
+	tristate "STMicroelectronics FST2 SPI touchscreens"
+	depends on SPI_MASTER
+	help
+	  Say Y here to enable support for STMicroelectronics FingerTip S
+	  FST2 SPI touch controllers.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called st_fst2.
+
 config TOUCHSCREEN_STMPE
 	tristate "STMicroelectronics STMPE touchscreens"
 	depends on MFD_STMPE

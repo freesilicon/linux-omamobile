@@ -164,6 +164,9 @@ struct tcm_ts {
 
 	struct tcm_identify id;
 	struct tcm_app_info app;
+	u32 power_delay_ms;
+	u32 reset_active_ms;
+	u32 reset_delay_ms;
 	unsigned int max_x;
 	unsigned int max_y;
 	unsigned int max_objects;
@@ -666,7 +669,9 @@ out:
 
 static int tcm_wait_identify(struct tcm_ts *ts)
 {
-	unsigned long timeout = msecs_to_jiffies(TCM_IDENTIFY_TIMEOUT_MS);
+	unsigned int timeout_ms = max_t(unsigned int, TCM_IDENTIFY_TIMEOUT_MS,
+					ts->reset_delay_ms + 500);
+	unsigned long timeout = msecs_to_jiffies(timeout_ms);
 
 	if (wait_for_completion_timeout(&ts->identify_done, timeout))
 		return 0;
@@ -684,7 +689,7 @@ static int tcm_reset_and_identify(struct tcm_ts *ts)
 	reinit_completion(&ts->identify_done);
 
 	gpiod_set_value_cansleep(ts->reset_gpio, 1);
-	msleep(20);
+	msleep(ts->reset_active_ms);
 	gpiod_set_value_cansleep(ts->reset_gpio, 0);
 
 	error = tcm_wait_identify(ts);
@@ -883,6 +888,19 @@ static int tcm_probe(struct spi_device *spi)
 		return -ENOMEM;
 
 	ts->spi = spi;
+	ts->power_delay_ms = 200;
+	ts->reset_active_ms = 20;
+	ts->reset_delay_ms = 100;
+	if (device_property_read_u32(dev, "power-delay-ms", &ts->power_delay_ms))
+		device_property_read_u32(dev, "synaptics,power-delay-ms",
+					 &ts->power_delay_ms);
+	if (device_property_read_u32(dev, "reset-active-ms", &ts->reset_active_ms))
+		device_property_read_u32(dev, "synaptics,reset-active-ms",
+					 &ts->reset_active_ms);
+	if (device_property_read_u32(dev, "reset-delay-ms", &ts->reset_delay_ms))
+		device_property_read_u32(dev, "synaptics,reset-delay-ms",
+					 &ts->reset_delay_ms);
+
 	mutex_init(&ts->io_lock);
 	mutex_init(&ts->cmd_lock);
 	init_completion(&ts->cmd_done);
@@ -913,7 +931,10 @@ static int tcm_probe(struct spi_device *spi)
 	error = devm_regulator_get_enable(dev, "vdd");
 	if (error)
 		return dev_err_probe(dev, error, "failed to enable digital supply\n");
-	msleep(200);
+	msleep(ts->power_delay_ms);
+
+	if (spi->irq <= 0)
+		return dev_err_probe(dev, -EINVAL, "missing touch interrupt\n");
 
 	error = devm_request_threaded_irq(dev, spi->irq, NULL, tcm_irq,
 					  IRQF_ONESHOT | IRQF_NO_AUTOEN,
@@ -926,6 +947,11 @@ static int tcm_probe(struct spi_device *spi)
 	error = tcm_reset_and_identify(ts);
 	if (error)
 		return dev_err_probe(dev, error, "device did not identify\n");
+
+	if (ts->id.version && ts->id.version != 1)
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "unsupported TouchComm protocol v%u\n",
+				     ts->id.version);
 
 	/* Able to wake the system on a touch; off until user space asks. */
 	device_set_wakeup_capable(dev, true);
@@ -1009,12 +1035,14 @@ static DEFINE_SIMPLE_DEV_PM_OPS(tcm_pm_ops, tcm_suspend, tcm_resume);
 
 static const struct of_device_id tcm_of_match[] = {
 	{ .compatible = "syna,s3908" },
+	{ .compatible = "synaptics,tcm-spi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, tcm_of_match);
 
 static const struct spi_device_id tcm_spi_ids[] = {
 	{ "s3908" },
+	{ "tcm-spi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, tcm_spi_ids);

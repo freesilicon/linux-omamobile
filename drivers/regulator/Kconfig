@@ -387,6 +387,13 @@ config REGULATOR_DA9121
 	  This driver can also be built as a module. If so, the module
 	  will be called da9121-regulator.
 
+config REGULATOR_DA9188
+	tristate "Dialog Semiconductor DA9188/DA9189 CPM PMIC regulators"
+	depends on MFD_DA9188 && OF
+	help
+	  Say Y here to support the buck, buck-boost, and LDO regulators
+	  of the Dialog DA9188 and DA9189 PMICs controlled via CPM MBA.
+
 config REGULATOR_DA9210
 	tristate "Dialog Semiconductor DA9210 regulator"
 	depends on I2C
@@ -1452,6 +1459,13 @@ config REGULATOR_S2DOS05
 	  This driver provides support for the voltage regulators of the S2DOS05.
 	  The S2DOS05 is a companion power management IC for the smart phones.
 	  The S2DOS05 has 4 LDOs and 1 BUCK outputs.
+
+config REGULATOR_S2DOS07X02
+	tristate "Samsung S2DOS07X02 buck regulator"
+	depends on I2C && OF
+	help
+	  Say Y here to support the Samsung S2DOS07X02 display companion buck
+	  regulator controlled over I2C/SMBus.
 
 config REGULATOR_S2MPA01
 	tristate "Samsung S2MPA01 voltage regulator"

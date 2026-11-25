@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config PINCTRL_GOOGLE
+	tristate
+	select PINMUX
+	select PINCONF
+	select GENERIC_PINCONF
+	select GPIOLIB
+	select GPIOLIB_IRQCHIP
+	select OF_GPIO
+	help
+	  Core pin controller and GPIO library for Google Tensor SoCs.
+
+config PINCTRL_LGA
+	tristate "Google LGA (Pixel 10) pin controller driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	select PINCTRL_GOOGLE
+	default ARCH_EXYNOS
+	help
+	  Say Y here to enable the pin controller and GPIO driver for the
+	  Google Tensor G5 (LGA / Laguna) SoC blocks including CPM, AOC,
+	  LSIOE, LSIOS, LSION, HSION, HSIOS, DPU, and GDMC.

@@ -14,6 +14,8 @@
  *   reference.
  */
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 
@@ -422,11 +424,35 @@
 			rpm-always-on;
 		};
 
+		lsio_s_cli_gpio_pd: lsio_s_cli_gpio_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1e>;
+			power-domains = <&sswrp_lsio_s_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+		};
+
 		sswrp_lsio_e_pd: sswrp_lsio_e_pd {
 			#power-domain-cells = <0>;
 			sswrp-id = <0x1c>;
 			on-at-init;
 			rpm-always-on;
+		};
+
+		lsio_e_cli_gpio_pd: lsio_e_cli_gpio_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x1c>;
+			power-domains = <&sswrp_lsio_e_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+			rpm-always-on;
+			use-smc;
+		};
+
+		sswrp_aoc_pd: sswrp_aoc_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x0>;
+			on-at-init;
 		};
 
 		sswrp_lsio_n_pd: sswrp_lsio_n_pd {
@@ -488,7 +514,77 @@
 	cpm_clk: clock-controller {
 		compatible = "google,cpm-clk";
 		mboxes = <&goog_mba_cpm_iface>;
-		power-domains = <&sswrp_lsio_n_pd>, <&sswrp_hsio_n_pd>;
+		power-domains = <&sswrp_lsio_n_pd>, <&sswrp_lsio_e_pd>,
+				<&sswrp_lsio_s_pd>, <&sswrp_hsio_n_pd>;
+
+		lsioe_gpio_clk: lsioe_gpio_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x2>;
+			clock-id = <0x0>;
+			use-smc;
+		};
+
+		lsios_gpio_clk: lsios_gpio_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x4>;
+			clock-id = <0x0>;
+		};
+
+		lsioe_cli14_cfg_clk: lsioe_cli14_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x2>;
+			clock-id = <0x8>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
+
+		lsioe_cli14_i2c_clk: lsioe_cli14_i2c_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x2>;
+			clock-id = <0x18>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
+		};
+
+		lsios_cli4_cfg_clk: lsios_cli4_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x4>;
+			clock-id = <0x8>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
+
+		lsios_cli4_i2c_clk: lsios_cli4_i2c_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x4>;
+			clock-id = <0x16>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
+		};
+
+		lsion_cli_int2_spi_clk: lsion_cli_int2_spi_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0xe>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
+		};
+
+		lsion_cli_int2_cfg_clk: lsion_cli_int2_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0xf>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
+
+		lsion_cli_int3_spi_clk: lsion_cli_int3_spi_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0x13>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
+		};
+
+		lsion_cli_int3_cfg_clk: lsion_cli_int3_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x3>;
+			clock-id = <0x14>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
 
 		lsion_cli16_cfg_clk: lsion_cli16_cfg_clk {
 			#clock-cells = <0>;
@@ -552,6 +648,18 @@
 			reset-num = <0x2b>;
 		};
 
+		lsioe_resets: lsioe_resets {
+			#reset-cells = <1>;
+			lpcm-id = <0x2>;
+			reset-num = <0x32>;
+		};
+
+		lsios_resets: lsios_resets {
+			#reset-cells = <1>;
+			lpcm-id = <0x4>;
+			reset-num = <0x2d>;
+		};
+
 		hsion_resets: hsion_resets {
 			#reset-cells = <1>;
 			lpcm-id = <0x5>;
@@ -562,6 +670,110 @@
 			#reset-cells = <1>;
 			lpcm-id = <0x6>;
 			reset-num = <0x5>;
+		};
+	};
+
+	da9188mfd: pmic {
+		compatible = "google,da9188mfd";
+
+		da9188_regulator: da9188-regulator {
+			compatible = "google,da9188-regulator";
+			mba-dest-channel = <0xa>;
+			mboxes = <&goog_mba_cpm_iface>;
+
+			regulators {
+				da9188 {
+					ldo_10m_reg: ldo_10m {
+						regulator-name = "ldo_10m";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+						regulator-always-on;
+					};
+
+					ldo_11m_reg: ldo_11m {
+						regulator-name = "ldo_11m";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+						regulator-always-on;
+					};
+
+					ldo_14m_reg: ldo_14m {
+						regulator-name = "ldo_14m";
+						regulator-min-microvolt = <3100000>;
+						regulator-max-microvolt = <3100000>;
+					};
+
+					ldo_24m_reg: ldo_24m {
+						regulator-name = "ldo_24m";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <1800000>;
+					};
+
+					ldo_26m_reg: ldo_26m {
+						regulator-name = "ldo_26m";
+						regulator-min-microvolt = <3300000>;
+						regulator-max-microvolt = <3300000>;
+					};
+				};
+
+				da9189 {
+					ldo_18s_reg: ldo_18s {
+						regulator-name = "ldo_18s";
+						regulator-min-microvolt = <3100000>;
+						regulator-max-microvolt = <3100000>;
+					};
+
+					ldo_26s_reg: ldo_26s {
+						regulator-name = "ldo_26s";
+						regulator-min-microvolt = <3300000>;
+						regulator-max-microvolt = <3300000>;
+					};
+
+					ldo_27s_reg: ldo_27s {
+						regulator-name = "ldo_27s";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <1800000>;
+					};
+				};
+			};
+		};
+
+		da9188_gpio: da9188-gpio {
+			compatible = "google,da9188-gpio";
+			mba-dest-channel = <0xa>;
+			mboxes = <&goog_mba_cpm_iface>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <19>;
+			gpio-ranges = <&da9188_gpio 0 0 19>;
+		};
+	};
+
+	gpio_keys: gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&vol_dn_l &vol_up_l &pmicm2ap_gsc_pwron_od_l>;
+		status = "disabled";
+
+		button-voldn {
+			label = "KEY_VOLUMEDOWN";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&pinctrl_cpm 0x33 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		button-volup {
+			label = "KEY_VOLUMEUP";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&pinctrl_cpm 0x34 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		button-power {
+			label = "KEY_POWER";
+			linux,code = <KEY_POWER>;
+			gpios = <&pinctrl_cpm 0x30 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 	};
 
@@ -753,12 +965,55 @@
 			status = "disabled";
 		};
 
+		lsioe_level_gia_0: interrupt-controller@3a160000 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3a160000 0x0 0x10>;
+			interrupts = <GIC_SPI 700 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&lsio_e_cli_gpio_pd>;
+			status = "disabled";
+		};
+
 		lsioe_level_gia_4: interrupt-controller@3a160400 {
 			compatible = "google,level-gia";
 			interrupt-controller;
 			#interrupt-cells = <1>;
 			reg = <0x0 0x3a160400 0x0 0x10>;
 			interrupts = <GIC_SPI 704 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&lsio_e_cli_gpio_pd>;
+			status = "disabled";
+		};
+
+		lsion_level_gia_4: interrupt-controller@d960400 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x0d960400 0x0 0x10>;
+			interrupts = <GIC_SPI 684 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&lsio_n_cli_gpio_pd>;
+			status = "disabled";
+		};
+
+		lsios_level_gia_0: interrupt-controller@3bd60000 {
+			compatible = "google,wide-level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3bd60000 0x0 0x20>;
+			nr-irq-chips = <2>;
+			next-bank-offset = <0x10>;
+			interrupts = <GIC_SPI 690 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&lsio_s_cli_gpio_pd>;
+			status = "disabled";
+		};
+
+		lsios_level_gia_4: interrupt-controller@3bd60400 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3bd60400 0x0 0x10>;
+			interrupts = <GIC_SPI 694 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&lsio_s_cli_gpio_pd>;
 			status = "disabled";
 		};
 
@@ -775,18 +1030,322 @@
 			compatible = "google,lga-cpm-pinctrl";
 			reg = <0x0 0x05280000 0x0 0x39000>;
 			gpio-controller;
+			gpio-ranges = <&pinctrl_cpm 0 0 0x39>;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x0 0x6>;
+			sswrp-wakeup-capable;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts = <GIC_SPI 0x27f IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x27e IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x27d IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x27c IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x27b IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x27a IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x279 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x278 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x277 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x276 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x275 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x274 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x273 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x272 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x271 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26f IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26e IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26d IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26c IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26b IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x26a IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x262 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x261 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x264 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x263 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25d IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25c IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25b IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x269 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x268 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x267 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x266 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x265 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x270 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x260 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25f IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25e IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x25a IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x259 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x258 IRQ_TYPE_LEVEL_HIGH 0>;
+			irq-pad-mapping = <0x6 0x7 0xa 0xb 0x11 0x12 0x13 0x14
+					   0x15 0x16 0x17 0x18 0x19 0x1a 0x1b 0x1c
+					   0x1d 0x1e 0x1f 0x20 0x21 0x24 0x25 0x26
+					   0x27 0x28 0x29 0x2a 0x2c 0x2d 0x2e 0x2f
+					   0x30 0x31 0x33 0x34 0x35 0x36 0x37 0x38>;
+			status = "disabled";
+
+			pmicm2ap_gsc_pwron_od_l: pmicm2ap_gsc_pwron_od_l {
+				pins = "XCPM_GPI0";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
+
+			vol_dn_l: vol_dn_l {
+				pins = "XCPM_GPI1";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
+
+			vol_up_l: vol_up_l {
+				pins = "XCPM_EINT_12";
+				bias-disable;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
+
+			hall1_2_aoc_ap_l: hall1_2_aoc_ap_l {
+				pins = "XCPM_EINT_16";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
+		};
+
+		pinctrl_aoc: pinctrl@b400000 {
+			compatible = "google,lga-aoc-pinctrl";
+			reg = <0x0 0x0b400000 0x0 0x5b000>,
+			      <0x0 0x052b9000 0x0 0x12000>;
+			power-domains = <&sswrp_aoc_pd>;
+			power-domain-names = "pad_function_pd";
+			gpio-controller;
+			gpio-ranges = <&pinctrl_aoc 0 0 0x5b>;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x1 0x1 0x3 0x1 0x5 0x1 0x7 0x1
+						0x8 0x1 0x1e 0x1 0x22 0x1 0x3b 0x1>;
+			sswrp-wakeup-capable;
+			shared-pads = <0xc 0xd 0xe 0xf 0x10 0x11 0x16 0x17 0x18
+				       0x19 0x29 0x2a 0x37 0x38 0x39 0x3a 0x41 0x42>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts = <GIC_SPI 0x28e IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x28d IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x28c IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x28b IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x28a IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x289 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x288 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x287 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x284 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x283 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x282 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x281 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x286 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 0x285 IRQ_TYPE_LEVEL_HIGH 0>;
+			irq-pad-mapping = <0xc 0xd 0x16 0x17 0x18 0x19 0x29 0x2a
+					   0x37 0x38 0x39 0x3a 0x41 0x42>;
+			status = "disabled";
+
+			ts0_2_aoc_int_l_1v2: ts0_2_aoc_int_l_1v2 {
+				pins = "XAOC_GPIO12";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "aoc_cpm_eint";
+			};
+
+			ts1_2_aoc_int_l_1v2: ts1_2_aoc_int_l_1v2 {
+				pins = "XAOC_GPIO13";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "aoc_cpm_eint";
+			};
+
+			cli19_int2_spi_clk_mosi_miso_func: cli19_int2_spi_clk_mosi_miso_func {
+				pins = "XAOC_SPI2_SCLK", "XAOC_SPI2_MOSI", "XAOC_SPI2_MISO";
+				function = "aoc_cli_int_2";
+				bias-pull-down;
+				output-disable;
+				input-enable;
+			};
+
+			cli19_int2_spi_cs_gpio_func: cli19_int2_spi_cs_gpio_func {
+				pins = "XAOC_SPI2_SSB";
+				function = "aoc_int_gpio";
+				bias-disable;
+				drive-strength = <0x4>;
+				input-enable;
+				output-enable;
+			};
+
+			cli20_int3_spi_clk_mosi_miso_func: cli20_int3_spi_clk_mosi_miso_func {
+				pins = "XAOC_SPI3_SCLK", "XAOC_SPI3_MOSI", "XAOC_SPI3_MISO";
+				function = "aoc_cli_int_3";
+				bias-pull-down;
+				output-disable;
+				input-enable;
+			};
+
+			cli20_int3_spi_cs_gpio_func: cli20_int3_spi_cs_gpio_func {
+				pins = "XAOC_SPI3_SSB";
+				function = "aoc_int_gpio";
+				bias-disable;
+				drive-strength = <0x4>;
+				input-enable;
+				output-enable;
+			};
+		};
+
+		pinctrl_lsioe: pinctrl@3a200000 {
+			compatible = "google,lga-lsioe-pinctrl";
+			reg = <0x0 0x3a200000 0x0 0x20000>;
+			clocks = <&lsioe_gpio_clk>;
+			clock-names = "gpio_clk";
+			power-domains = <&lsio_e_cli_gpio_pd>, <&sswrp_lsio_e_pd>;
+			power-domain-names = "csr_access_pd", "pad_function_pd";
+			gpio-controller;
+			gpio-ranges = <&pinctrl_lsioe 0 0 0x20>;
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
+			interrupts-extended = <&lsioe_level_gia_0 0x0>, <&lsioe_level_gia_0 0x1>,
+					      <&lsioe_level_gia_0 0x2>, <&lsioe_level_gia_0 0x3>,
+					      <&lsioe_level_gia_0 0x4>, <&lsioe_level_gia_0 0x5>,
+					      <&lsioe_level_gia_0 0x6>, <&lsioe_level_gia_0 0x7>,
+					      <&lsioe_level_gia_0 0x18>, <&lsioe_level_gia_0 0x19>,
+					      <&lsioe_level_gia_0 0x1a>, <&lsioe_level_gia_0 0x1b>,
+					      <&lsioe_level_gia_0 0x8>, <&lsioe_level_gia_0 0x9>,
+					      <&lsioe_level_gia_0 0xa>, <&lsioe_level_gia_0 0xb>,
+					      <&lsioe_level_gia_0 0xc>, <&lsioe_level_gia_0 0xd>,
+					      <&lsioe_level_gia_0 0xe>, <&lsioe_level_gia_0 0xf>,
+					      <&lsioe_level_gia_0 0x10>, <&lsioe_level_gia_0 0x11>,
+					      <&lsioe_level_gia_0 0x12>, <&lsioe_level_gia_0 0x13>,
+					      <&lsioe_level_gia_0 0x14>, <&lsioe_level_gia_0 0x15>,
+					      <&lsioe_level_gia_0 0x16>, <&lsioe_level_gia_0 0x17>,
+					      <&lsioe_level_gia_0 0x1c>, <&lsioe_level_gia_0 0x1d>,
+					      <&lsioe_level_gia_0 0x1e>, <&lsioe_level_gia_0 0x1f>;
+			irq-pad-mapping = <0x0 0x1 0x2 0x3 0x4 0x5 0x6 0x7
+					   0x8 0x9 0xa 0xb 0xc 0xd 0xe 0xf
+					   0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17
+					   0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f>;
 			status = "disabled";
+
+			cli14_2_wire_func: cli14_2_wire_func {
+				pins = "XLSIOE_CLI14_PIN0", "XLSIOE_CLI14_PIN1";
+				function = "lsioe_cli14";
+				drive-strength = <0x0>;
+				output-disable;
+				input-enable;
+			};
+
+			cli14_2_wire_sleep: cli14_2_wire_sleep {
+				pins = "XLSIOE_CLI14_PIN0", "XLSIOE_CLI14_PIN1";
+				function = "lsioe_gpio";
+				bias-pull-up;
+				output-disable;
+				input-enable;
+			};
+		};
+
+		pinctrl_lsios: pinctrl@3be00000 {
+			compatible = "google,lga-lsios-pinctrl";
+			reg = <0x0 0x3be00000 0x0 0x37000>;
+			clocks = <&lsios_gpio_clk>;
+			clock-names = "gpio_clk";
+			power-domains = <&lsio_s_cli_gpio_pd>;
+			power-domain-names = "csr_access_pd";
+			runtime-pm-capable;
+			gpio-controller;
+			gpio-ranges = <&pinctrl_lsios 0 0 0x37>;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x36 0x1>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&lsios_level_gia_0 0x23>, <&lsios_level_gia_0 0x24>,
+					      <&lsios_level_gia_0 0x25>, <&lsios_level_gia_0 0x26>,
+					      <&lsios_level_gia_0 0x27>, <&lsios_level_gia_0 0x28>,
+					      <&lsios_level_gia_0 0x29>, <&lsios_level_gia_0 0x0>,
+					      <&lsios_level_gia_0 0x1>, <&lsios_level_gia_0 0x2>,
+					      <&lsios_level_gia_0 0x3>, <&lsios_level_gia_0 0x4>,
+					      <&lsios_level_gia_0 0x5>, <&lsios_level_gia_0 0x6>,
+					      <&lsios_level_gia_0 0x7>, <&lsios_level_gia_0 0x8>,
+					      <&lsios_level_gia_0 0x9>, <&lsios_level_gia_0 0xa>,
+					      <&lsios_level_gia_0 0xb>, <&lsios_level_gia_0 0xc>,
+					      <&lsios_level_gia_0 0xd>, <&lsios_level_gia_0 0xe>,
+					      <&lsios_level_gia_0 0xf>, <&lsios_level_gia_0 0x2a>,
+					      <&lsios_level_gia_0 0x2b>, <&lsios_level_gia_0 0x2e>,
+					      <&lsios_level_gia_0 0x2f>, <&lsios_level_gia_0 0x30>,
+					      <&lsios_level_gia_0 0x33>, <&lsios_level_gia_0 0x34>,
+					      <&lsios_level_gia_0 0x2c>, <&lsios_level_gia_0 0x1c>,
+					      <&lsios_level_gia_0 0x1d>, <&lsios_level_gia_0 0x1e>,
+					      <&lsios_level_gia_0 0x14>, <&lsios_level_gia_0 0x15>,
+					      <&lsios_level_gia_0 0x16>, <&lsios_level_gia_0 0x17>,
+					      <&lsios_level_gia_0 0x1f>, <&lsios_level_gia_0 0x22>,
+					      <&lsios_level_gia_0 0x10>, <&lsios_level_gia_0 0x11>,
+					      <&lsios_level_gia_0 0x12>, <&lsios_level_gia_0 0x13>,
+					      <&lsios_level_gia_0 0x2d>, <&lsios_level_gia_0 0x20>,
+					      <&lsios_level_gia_0 0x21>, <&lsios_level_gia_0 0x35>,
+					      <&lsios_level_gia_0 0x36>, <&lsios_level_gia_0 0x32>,
+					      <&lsios_level_gia_0 0x18>, <&lsios_level_gia_0 0x19>,
+					      <&lsios_level_gia_0 0x1a>, <&lsios_level_gia_0 0x1b>;
+			irq-pad-mapping = <0x0 0x1 0x2 0x3 0x4 0x5 0x6 0x7
+					   0x8 0x9 0xa 0xb 0xc 0xd 0xe 0xf
+					   0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17
+					   0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f
+					   0x20 0x21 0x22 0x23 0x24 0x25 0x26 0x27
+					   0x28 0x29 0x2a 0x2b 0x2c 0x2d 0x2e 0x2f
+					   0x30 0x31 0x32 0x33 0x34 0x35>;
+			status = "disabled";
+
+			cli4_2_wire_func: cli4_2_wire_func {
+				pins = "XLSIOS_CLI4_PIN0", "XLSIOS_CLI4_PIN1";
+				function = "lsios_cli4";
+				output-disable;
+				input-enable;
+			};
+
+			cli4_2_wire_sleep: cli4_2_wire_sleep {
+				pins = "XLSIOS_CLI4_PIN0", "XLSIOS_CLI4_PIN1";
+				function = "lsios_gpio";
+				bias-pull-up;
+				output-disable;
+				input-enable;
+			};
 		};
 
 		pinctrl_hsion: pinctrl@c580000 {
 			compatible = "google,lga-hsion-pinctrl";
 			reg = <0x0 0x0c580000 0x0 0xc000>;
 			gpio-controller;
+			gpio-ranges = <&pinctrl_hsion 0 0 0xc>;
 			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0xb 0x1>;
 			power-domains = <&sswrp_hsio_n_pd>;
+			power-domain-names = "csr_access_pd";
+			status = "disabled";
+		};
+
+		pinctrl_hsios_stby: pinctrl@3c568000 {
+			compatible = "google,lga-hsios-stby-pinctrl";
+			reg = <0x0 0x3c568000 0x0 0x2000>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			power-domain-names = "pad_function_pd";
+			status = "disabled";
+		};
+
+		pinctrl_hsios: pinctrl@3c590000 {
+			compatible = "google,lga-hsios-pinctrl";
+			reg = <0x0 0x3c590000 0x0 0xf000>;
+			gpio-controller;
+			gpio-ranges = <&pinctrl_hsios 0 0 0xf>;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x9 0x1>;
+			power-domains = <&sswrp_hsio_s_pd>;
 			power-domain-names = "csr_access_pd";
 			status = "disabled";
 		};
@@ -798,6 +1357,157 @@
 			#gpio-cells = <2>;
 			power-domains = <&lsio_n_cli_gpio_pd>;
 			power-domain-names = "csr_access_pd";
+			status = "disabled";
+		};
+
+		pinctrl_gdmc: pinctrl@6480000 {
+			compatible = "google,lga-gdmc-pinctrl";
+			reg = <0x0 0x06480000 0x0 0x15000>;
+			gpio-controller;
+			gpio-ranges = <&pinctrl_gdmc 0 0 0x15>;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0x6 0x7>;
+			status = "disabled";
+		};
+
+		pinctrl_dpu: pinctrl@ec7e000 {
+			compatible = "google,lga-dpu-pinctrl";
+			reg = <0x0 0x0ec7e000 0x0 0x2000>;
+			gpio-controller;
+			gpio-ranges = <&pinctrl_dpu 0 0 0x2>;
+			#gpio-cells = <2>;
+			power-domains = <&sswrp_dpu_pd>;
+			power-domain-names = "csr_access_pd";
+			status = "disabled";
+		};
+
+		lsioe_cli14: pinctrl@3a370000 {
+			compatible = "pinctrl-single";
+			reg = <0x0 0x3a370000 0x0 0x10>;
+			pinctrl-single,register-width = <0x20>;
+			pinctrl-single,function-mask = <0xffffffff>;
+			#pinctrl-cells = <1>;
+
+			cli14_i2c_conf: cli14_i2c {
+				pinctrl-single,pins = <0x0 0x1 0x4 0x3 0x8 0x3>;
+			};
+		};
+
+		lsios_cli4: pinctrl@3bf40000 {
+			compatible = "pinctrl-single";
+			reg = <0x0 0x3bf40000 0x0 0x10>;
+			pinctrl-single,register-width = <0x20>;
+			pinctrl-single,function-mask = <0xffffffff>;
+			#pinctrl-cells = <1>;
+
+			cli4_i2c_conf: cli4_i2c {
+				pinctrl-single,pins = <0x0 0x1 0x4 0x3 0x8 0x3>;
+			};
+		};
+
+		lsion_cli_int2: pinctrl@db20000 {
+			compatible = "pinctrl-single";
+			reg = <0x0 0x0db20000 0x0 0x10>;
+			pinctrl-single,register-width = <0x20>;
+			pinctrl-single,function-mask = <0xffffffff>;
+			#pinctrl-cells = <1>;
+
+			cli_int2_spi_conf: cli_int2_spi {
+				pinctrl-single,pins = <0x0 0x4 0x4 0x0 0x8 0x0>;
+			};
+		};
+
+		lsion_cli_int3: pinctrl@db30000 {
+			compatible = "pinctrl-single";
+			reg = <0x0 0x0db30000 0x0 0x10>;
+			pinctrl-single,register-width = <0x20>;
+			pinctrl-single,function-mask = <0xffffffff>;
+			#pinctrl-cells = <1>;
+
+			cli_int3_spi_conf: cli_int3_spi {
+				pinctrl-single,pins = <0x0 0x4 0x4 0x0 0x8 0x0>;
+			};
+		};
+
+		i2c4: i2c@3bf41000 {
+			compatible = "google,i2c";
+			reg = <0x0 0x3bf41000 0x0 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			interrupts-extended = <&lsios_level_gia_4 4>;
+			clocks = <&lsios_cli4_i2c_clk>, <&lsios_cli4_cfg_clk>;
+			clock-names = "ic_clk", "pclk";
+			resets = <&lsios_resets 0x10>;
+			reset-names = "ic_rst";
+			power-domains = <&lsio_s_cli_gpio_pd>;
+			pinctrl-0 = <&cli4_2_wire_func &cli4_i2c_conf>;
+			pinctrl-1 = <&cli4_2_wire_sleep>;
+			pinctrl-2 = <&cli4_i2c_conf>;
+			pinctrl-names = "default", "sleep", "cli";
+			clock-frequency = <400000>;
+			status = "disabled";
+		};
+
+		i2c14: i2c@3a371000 {
+			compatible = "google,i2c";
+			reg = <0x0 0x3a371000 0x0 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			interrupts-extended = <&lsioe_level_gia_4 7>;
+			clocks = <&lsioe_cli14_i2c_clk>, <&lsioe_cli14_cfg_clk>;
+			clock-names = "ic_clk", "pclk";
+			resets = <&lsioe_resets 0x1c>;
+			reset-names = "ic_rst";
+			power-domains = <&lsio_e_cli_gpio_pd>;
+			pinctrl-0 = <&cli14_2_wire_func &cli14_i2c_conf>;
+			pinctrl-1 = <&cli14_2_wire_sleep>;
+			pinctrl-2 = <&cli14_i2c_conf>;
+			pinctrl-names = "default", "sleep", "cli";
+			clock-frequency = <400000>;
+			status = "disabled";
+		};
+
+		spi19: spi@db23000 {
+			compatible = "google,spi";
+			reg = <0x0 0x0db23000 0x0 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			num-cs = <1>;
+			interrupts-extended = <&lsion_level_gia_4 2>;
+			clocks = <&lsion_cli_int2_spi_clk>, <&lsion_cli_int2_cfg_clk>;
+			clock-names = "ssi_clk", "pclk";
+			resets = <&lsion_resets 0x13>;
+			reset-names = "spi";
+			power-domains = <&lsio_n_cli_gpio_pd>;
+			pinctrl-0 = <&cli19_int2_spi_clk_mosi_miso_func
+				     &cli19_int2_spi_cs_gpio_func
+				     &cli_int2_spi_conf>;
+			pinctrl-names = "default";
+			cs-gpios = <&pinctrl_aoc 0x4e GPIO_ACTIVE_LOW>;
+			google,cs-clock-delay-us = <10>;
+			polling-busy-wait-mode;
+			status = "disabled";
+		};
+
+		spi20: spi@db33000 {
+			compatible = "google,spi";
+			reg = <0x0 0x0db33000 0x0 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			num-cs = <1>;
+			interrupts-extended = <&lsion_level_gia_4 3>;
+			clocks = <&lsion_cli_int3_spi_clk>, <&lsion_cli_int3_cfg_clk>;
+			clock-names = "ssi_clk", "pclk";
+			resets = <&lsion_resets 0x17>;
+			reset-names = "spi";
+			power-domains = <&lsio_n_cli_gpio_pd>;
+			pinctrl-0 = <&cli20_int3_spi_clk_mosi_miso_func
+				     &cli20_int3_spi_cs_gpio_func
+				     &cli_int3_spi_conf>;
+			pinctrl-names = "default";
+			cs-gpios = <&pinctrl_aoc 0x4a GPIO_ACTIVE_LOW>;
+			google,cs-clock-delay-us = <10>;
+			polling-busy-wait-mode;
 			status = "disabled";
 		};
 

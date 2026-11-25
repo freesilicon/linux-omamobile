@@ -165,6 +165,7 @@ obj-$(CONFIG_MFD_DA9062)	+= da9062-core.o
 da9063-objs			:= da9063-core.o da9063-irq.o da9063-i2c.o
 obj-$(CONFIG_MFD_DA9063)	+= da9063.o
 obj-$(CONFIG_MFD_DA9150)	+= da9150-core.o
+obj-$(CONFIG_MFD_DA9188)	+= da9188-core.o
 
 obj-$(CONFIG_MFD_MAX14577)	+= max14577.o
 obj-$(CONFIG_MFD_MAX7360)	+= max7360.o

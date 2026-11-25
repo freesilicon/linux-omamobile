@@ -6,6 +6,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -33,6 +34,7 @@ struct dw_spi_mmio {
 	struct reset_control *rstc;
 	void (*platform_suspend)(struct dw_spi_mmio *dwsmmio);
 	int (*platform_resume)(struct dw_spi_mmio *dwsmmio);
+	u32 cs_delay;
 };
 
 #define MSCC_CPU_SYSTEM_CTRL_GENERAL_CTRL	0x24
@@ -366,6 +368,45 @@ static int dw_spi_jhb100_init(struct platform_device *pdev,
 	return 0;
 }
 
+#define GOOGLE_SPI_MAX_CLK_HZ	200000000
+
+static void dw_spi_google_set_cs(struct spi_device *spi, bool enable)
+{
+	struct dw_spi *dws = spi_controller_get_devdata(spi->controller);
+	struct dw_spi_mmio *dwsmmio = container_of(dws, struct dw_spi_mmio, dws);
+	bool cs_high = !!(spi->mode & SPI_CS_HIGH);
+
+	/*
+	 * Google Tensor DW SSI synthesizes SSI_NUM_SLAVES = 1, so always assert
+	 * native slave-enable bit 0 even when GPIO chip selects are used.
+	 */
+	if (cs_high == enable) {
+		dw_writel(dws, DW_SPI_SER, BIT(0));
+		if (dwsmmio->cs_delay)
+			udelay(dwsmmio->cs_delay);
+	} else {
+		dw_writel(dws, DW_SPI_SER, 0);
+	}
+}
+
+static int dw_spi_google_init(struct platform_device *pdev,
+			      struct dw_spi_mmio *dwsmmio)
+{
+	struct dw_spi *dws = &dwsmmio->dws;
+
+	if (device_property_read_bool(&pdev->dev, "polling-busy-wait-mode"))
+		dws->irq = IRQ_NOTCONNECTED;
+
+	device_property_read_u32(&pdev->dev, "google,cs-clock-delay-us",
+				 &dwsmmio->cs_delay);
+
+	if (!clk_set_rate(dwsmmio->clk, GOOGLE_SPI_MAX_CLK_HZ))
+		dws->max_freq = clk_get_rate(dwsmmio->clk);
+
+	dws->set_cs = dw_spi_google_set_cs;
+	return 0;
+}
+
 static int dw_spi_mmio_probe(struct platform_device *pdev)
 {
 	int (*init_func)(struct platform_device *pdev,
@@ -518,6 +559,7 @@ static const struct of_device_id dw_spi_mmio_of_match[] = {
 	{ .compatible = "microchip,sparx5-spi", dw_spi_mscc_sparx5_init},
 	{ .compatible = "canaan,k210-spi", dw_spi_canaan_k210_init},
 	{ .compatible = "amd,pensando-elba-spi", .data = dw_spi_elba_init},
+	{ .compatible = "google,spi", .data = dw_spi_google_init},
 	{ .compatible = "starfive,jhb100-sfc", .data = dw_spi_jhb100_init},
 	{ /* end of table */}
 };
