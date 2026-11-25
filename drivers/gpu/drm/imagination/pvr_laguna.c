@@ -556,6 +556,10 @@ struct pvr_laguna_fw_parsed {
 	u32 code_alloc_size;
 	u32 data_alloc_size;
 	u32 rodata_alloc_size;
+	u32 coremem_code_alloc_size;
+	u32 coremem_data_alloc_size;
+	u64 coremem_code_carveout_off;
+	u64 coremem_data_carveout_off;
 	u64 body_carveout_off;
 	u64 hdr_carveout_off;
 	u64 bvnc;
@@ -611,7 +615,10 @@ static int pvr_laguna_parse_fw_layout(const u8 *body, u32 body_size,
 	struct pvr_laguna_fw_info_hdr info;
 	u32 hdr_len, entry_num, entry_size;
 	u64 code_sz = 0, data_sz = 0, rodata_sz = 0;
+	u64 coremem_code_sz = 0, coremem_data_sz = 0;
 	u64 code_alloc, data_alloc, rodata_alloc;
+	u64 coremem_code_alloc, coremem_data_alloc;
+	u64 coremem_code_off, coremem_data_off;
 	u64 body_off, hdr_off, end_off;
 	const u8 *trailer;
 
@@ -654,8 +661,10 @@ static int pvr_laguna_parse_fw_layout(const u8 *body, u32 body_size,
 			rodata_sz += alloc_sz;
 			break;
 		case PVR_LAGUNA_FW_SEC_COREMEM_CODE:
+			coremem_code_sz += alloc_sz;
+			break;
 		case PVR_LAGUNA_FW_SEC_COREMEM_DATA:
-			/* Volcanic RISC-V has no META DMA coremem sections. */
+			coremem_data_sz += alloc_sz;
 			break;
 		default:
 			return -EINVAL;
@@ -668,18 +677,23 @@ static int pvr_laguna_parse_fw_layout(const u8 *body, u32 body_size,
 	code_alloc = PAGE_ALIGN(code_sz);
 	data_alloc = PAGE_ALIGN(data_sz);
 	rodata_alloc = PAGE_ALIGN(rodata_sz);
+	coremem_code_alloc = PAGE_ALIGN(coremem_code_sz);
+	coremem_data_alloc = PAGE_ALIGN(coremem_data_sz);
 
-	if (code_alloc > PVR_LAGUNA_FW_CODE_HEAP_SIZE ||
-	    data_alloc > PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE ||
+	if (code_alloc + coremem_code_alloc > PVR_LAGUNA_FW_CODE_HEAP_SIZE ||
+	    data_alloc + coremem_data_alloc > PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE ||
 	    rodata_alloc > PVR_LAGUNA_FW_RODATA_HEAP_SIZE)
 		return -EFBIG;
 
 	/*
-	 * Place image_body and image_header page-aligned inside FW_CODE_HEAP
-	 * right after section[CODE] so GSA authentication pages never overlap
-	 * any other firmware section.
+	 * Place COREMEM_CODE right after CODE in FW_CODE_HEAP, COREMEM_DATA
+	 * right after DATA in FW_PRIV_DATA_HEAP, and stage image_body and
+	 * image_header page-aligned after COREMEM_CODE in FW_CODE_HEAP so GSA
+	 * authentication pages never overlap any firmware section.
 	 */
-	body_off = PVR_LAGUNA_FW_CODE_HEAP_OFFSET + code_alloc;
+	coremem_code_off = PVR_LAGUNA_FW_CODE_HEAP_OFFSET + code_alloc;
+	coremem_data_off = PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET + data_alloc;
+	body_off = coremem_code_off + coremem_code_alloc;
 	hdr_off = body_off + PAGE_ALIGN((u64)body_size);
 	end_off = hdr_off + PAGE_ALIGN((u64)out->hdr_size);
 	if (end_off > PVR_LAGUNA_FW_CODE_HEAP_OFFSET + PVR_LAGUNA_FW_CODE_HEAP_SIZE)
@@ -688,6 +702,10 @@ static int pvr_laguna_parse_fw_layout(const u8 *body, u32 body_size,
 	out->code_alloc_size = (u32)code_alloc;
 	out->data_alloc_size = (u32)data_alloc;
 	out->rodata_alloc_size = (u32)rodata_alloc;
+	out->coremem_code_alloc_size = (u32)coremem_code_alloc;
+	out->coremem_data_alloc_size = (u32)coremem_data_alloc;
+	out->coremem_code_carveout_off = coremem_code_off;
+	out->coremem_data_carveout_off = coremem_data_off;
 	out->body_carveout_off = body_off;
 	out->hdr_carveout_off = hdr_off;
 	out->bvnc = le64_to_cpu(info.bvnc);
@@ -845,18 +863,23 @@ int pvr_laguna_request_signed_firmware(struct pvr_device *pvr_dev)
 	laguna->fw_code_alloc_size = parsed.code_alloc_size;
 	laguna->fw_data_alloc_size = parsed.data_alloc_size;
 	laguna->fw_rodata_alloc_size = parsed.rodata_alloc_size;
+	laguna->fw_coremem_code_alloc_size = parsed.coremem_code_alloc_size;
+	laguna->fw_coremem_data_alloc_size = parsed.coremem_data_alloc_size;
+	laguna->fw_coremem_code_carveout_off = parsed.coremem_code_carveout_off;
+	laguna->fw_coremem_data_carveout_off = parsed.coremem_data_carveout_off;
 	laguna->fw_body_carveout_off = parsed.body_carveout_off;
 	laguna->fw_hdr_carveout_off = parsed.hdr_carveout_off;
 	pvr_dev->fw_dev.firmware = fw;
 
 	drm_info(drm_dev,
-		 "validated signed Volcanic firmware %s (size=%zu, hdr=%#x@%#x, GPUF@%#x, body=%#x@%#x, abi=%#x, code=%#x, data=%#x, rodata=%#x)\n",
+		 "validated signed Volcanic firmware %s (size=%zu, hdr=%#x@%#x, GPUF@%#x, body=%#x@%#x, abi=%#x, code=%#x, data=%#x, rodata=%#x, cm_code=%#x, cm_data=%#x)\n",
 		 PVR_LAGUNA_SIGNED_FW_NAME, fw->size,
 		 parsed.hdr_size, parsed.hdr_file_off,
 		 parsed.hdr_file_off + parsed.hdr_magic_off,
 		 parsed.body_size, parsed.body_file_off, parsed.abi_version,
 		 parsed.code_alloc_size, parsed.data_alloc_size,
-		 parsed.rodata_alloc_size);
+		 parsed.rodata_alloc_size, parsed.coremem_code_alloc_size,
+		 parsed.coremem_data_alloc_size);
 
 	return devm_add_action_or_reset(drm_dev->dev,
 					pvr_laguna_release_firmware, pvr_dev);
@@ -937,6 +960,26 @@ static int pvr_laguna_trusty_send_fw(struct pvr_device *pvr_dev)
 			laguna->fw_rodata_alloc_size;
 	}
 
+	if (laguna->fw_coremem_code_alloc_size) {
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_CODE].pa =
+			base + laguna->fw_coremem_code_carveout_off;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_CODE].fw_va =
+			PVR_LAGUNA_RISCV_FW_HEAP_BASE +
+			(u32)laguna->fw_coremem_code_carveout_off;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_CODE].size =
+			laguna->fw_coremem_code_alloc_size;
+	}
+
+	if (laguna->fw_coremem_data_alloc_size) {
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_DATA].pa =
+			base + laguna->fw_coremem_data_carveout_off;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_DATA].fw_va =
+			PVR_LAGUNA_RISCV_FW_HEAP_BASE +
+			(u32)laguna->fw_coremem_data_carveout_off;
+		req.section[PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_DATA].size =
+			laguna->fw_coremem_data_alloc_size;
+	}
+
 	req.use_tf_a = 1;
 	req.host_page_shift = PAGE_SHIFT;
 
@@ -990,6 +1033,10 @@ int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
 					 PVR_LAGUNA_OEM_GPU_CONTROL_START);
 	if (err)
 		return err;
+
+	if (!laguna->fw_running)
+		drm_info(from_pvr_device(pvr_dev),
+			 "TF-A SMC_OEM_GPU_CONTROL START succeeded\n");
 
 	laguna->fw_running = true;
 	return 0;

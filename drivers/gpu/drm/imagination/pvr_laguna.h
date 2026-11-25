@@ -73,6 +73,9 @@ struct tipc_chan;
 #define PVR_LAGUNA_GPU_SECURE_SEC_COREMEM_DATA	4U
 #define PVR_LAGUNA_GPU_SECURE_SEC_COUNT		5U
 
+/* RISC-V FW cached heap base (region 0xC << 28) for COREMEM fw_va mapping. */
+#define PVR_LAGUNA_RISCV_FW_HEAP_BASE		0xC0000000U
+
 #define PVR_LAGUNA_SMC_OEM_GPU_CONTROL		0xC300000CUL
 #define PVR_LAGUNA_OEM_GPU_CONTROL_START	1UL
 #define PVR_LAGUNA_OEM_GPU_CONTROL_STOP		2UL
@@ -144,6 +147,10 @@ struct pvr_laguna_data {
 	u32 fw_code_alloc_size;
 	u32 fw_data_alloc_size;
 	u32 fw_rodata_alloc_size;
+	u32 fw_coremem_code_alloc_size;
+	u32 fw_coremem_data_alloc_size;
+	u64 fw_coremem_code_carveout_off;
+	u64 fw_coremem_data_carveout_off;
 	u64 fw_body_carveout_off;
 	u64 fw_hdr_carveout_off;
 	bool fw_authenticated;
