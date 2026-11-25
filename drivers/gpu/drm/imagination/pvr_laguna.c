@@ -1,0 +1,852 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Clean-room Tensor G5 (Laguna) platform glue for PowerVR Volcanic
+ * (DXT-48-1536, BVNC 71.2.2448.1212).
+ */
+
+#include "pvr_device.h"
+#include "pvr_fw.h"
+#include "pvr_laguna.h"
+#include "pvr_power.h"
+#include "pvr_volcanic_defs.h"
+
+#include <drm/drm_print.h>
+
+#include <linux/arm-smccc.h>
+#include <linux/bits.h>
+#include <linux/clk.h>
+#include <linux/errno.h>
+#include <linux/firmware.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/jiffies.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+
+#if IS_ENABLED(CONFIG_TRUSTY_VIRTIO_IPC)
+#include <linux/trusty/trusty_ipc.h>
+#endif
+
+/* Core-logic power-on/off CSRs (verified in Stage G0 probe on mustang/rango). */
+#define PVR_LAGUNA_GPU_CTRL_POWER_OFF_ACK	BIT(0)
+#define PVR_LAGUNA_GPU_CTRL_POWER_GATE_ACK	BIT(1)
+#define PVR_LAGUNA_GPU_CTRL_ACK_MASK		(PVR_LAGUNA_GPU_CTRL_POWER_OFF_ACK | \
+						 PVR_LAGUNA_GPU_CTRL_POWER_GATE_ACK)
+#define PVR_LAGUNA_GPU_CTRL_POWER_ON_VAL	0x0U
+#define PVR_LAGUNA_GPU_CTRL_POWER_OFF_VAL	0x8U
+
+#define PVR_LAGUNA_GPU_DTS_PWRSWITCH_CTRL	0x00U
+#define PVR_LAGUNA_GPU_DTS_ISO_EN		0x04U
+#define PVR_LAGUNA_GPU_DTS_PWRSTATE		0x08U
+
+#define PVR_LAGUNA_GPU_PVTC_CLK_SYNTH		0x10U
+#define PVR_LAGUNA_GPU_PVTC_SDIF_DISABLE	0x20U
+#define PVR_LAGUNA_GPU_PVTC_SDIF_STATUS		0x24U
+#define PVR_LAGUNA_GPU_PVTC_SDIF		0x28U
+#define PVR_LAGUNA_GPU_PVTC_PWR_STATUS		0x23CU
+
+#define PVR_LAGUNA_GPU_PVTC_PWROFF_REQ		0x00U
+#define PVR_LAGUNA_GPU_PVTC_PWROFF_ACK		0x04U
+
+/* SLC PBHA LUT per-OSID register geometry (OSID 1 only; 32-bit writes only). */
+#define PVR_LAGUNA_REQ_PBHA_OSID_STRIDE		0x200U
+#define PVR_LAGUNA_REQ_PBHA_OSID_ENTRIES	16U
+#define PVR_LAGUNA_REQ_PBHA_OSID1_DEFAULT	0x00000001U
+
+#define PVR_LAGUNA_RA_LUT_OSID_STRIDE		0x40U
+#define PVR_LAGUNA_RA_LUT_OSID_ENTRIES		4U
+#define PVR_LAGUNA_RA_LUT_OSID1_DEFAULT		0x00000001U
+
+/* PFSM CSR offsets (0x34813000, size 0xc). */
+#define PVR_LAGUNA_PFSM_CTRL_OFF		0x00U
+#define PVR_LAGUNA_PFSM_STATE_OFF		0x04U
+#define PVR_LAGUNA_PFSM_STATUS_OFF		0x08U
+
+/* Trusty IPC timeouts. */
+#define PVR_LAGUNA_TZ_CON_TIMEOUT_MS		5000U
+#define PVR_LAGUNA_TZ_BUF_TIMEOUT_MS		5000U
+#define PVR_LAGUNA_TZ_MSG_TIMEOUT_MS		5000U
+
+struct pvr_laguna_gpu_secure_req {
+	u32 cmd;
+	u32 version;
+	u32 use_tf_a;
+	u32 host_page_shift;
+	u64 fw_ipa;
+	u64 fw_size;
+} __packed;
+
+struct pvr_laguna_gpu_secure_rsp {
+	u32 cmd;
+	s32 status;
+} __packed;
+
+static int pvr_laguna_pvtc_sdif_cmd(struct pvr_laguna_data *laguna,
+				    u8 addr, u32 data)
+{
+	u32 status;
+	u32 cmd = BIT(31) | BIT(27) | ((u32)(addr & 0x7U) << 24) |
+		  (data & 0xffffffU);
+
+	writel(cmd, laguna->pvtc + PVR_LAGUNA_GPU_PVTC_SDIF);
+	return readl_poll_timeout(laguna->pvtc + PVR_LAGUNA_GPU_PVTC_SDIF_STATUS,
+				  status, (status & BIT(0)) == 0, 0, 1000);
+}
+
+static int pvr_laguna_set_pvtc_pwroff(struct pvr_laguna_data *laguna,
+				      bool power_on)
+{
+	u32 req = power_on ? 0 : 1;
+	u32 ack;
+
+	writel(req, laguna->pvtc_pwroff + PVR_LAGUNA_GPU_PVTC_PWROFF_REQ);
+	return readl_poll_timeout(laguna->pvtc_pwroff +
+				  PVR_LAGUNA_GPU_PVTC_PWROFF_ACK,
+				  ack, ack == req, 0, 1000);
+}
+
+static int pvr_laguna_core_logic_power_on(struct pvr_laguna_data *laguna)
+{
+	u32 ack, pwr_status;
+	int ret;
+
+	if (!laguna->gpu_control)
+		return 0;
+
+	writel(PVR_LAGUNA_GPU_CTRL_POWER_ON_VAL, laguna->gpu_control);
+	ret = readl_poll_timeout(laguna->gpu_control, ack,
+				 ack & PVR_LAGUNA_GPU_CTRL_ACK_MASK,
+				 0, 10000);
+	if (ret)
+		return ret;
+
+	if (laguna->dts) {
+		writel(0x1, laguna->dts + PVR_LAGUNA_GPU_DTS_PWRSWITCH_CTRL);
+		writel(0x0, laguna->dts + PVR_LAGUNA_GPU_DTS_ISO_EN);
+	}
+
+	if ((ack & PVR_LAGUNA_GPU_CTRL_POWER_OFF_ACK) && laguna->pvtc) {
+		writel(BIT(24) | (1U << 16) | (1U << 8) | 1U,
+		       laguna->pvtc + PVR_LAGUNA_GPU_PVTC_CLK_SYNTH);
+		writel(0x7E, laguna->pvtc + PVR_LAGUNA_GPU_PVTC_SDIF_DISABLE);
+		ret = readl_poll_timeout(laguna->pvtc +
+					 PVR_LAGUNA_GPU_PVTC_PWR_STATUS,
+					 pwr_status, pwr_status == 1, 10, 1000);
+		if (ret)
+			return ret;
+
+		ret = pvr_laguna_pvtc_sdif_cmd(laguna, 0x1, 0xF0000);
+		if (ret)
+			return ret;
+		ret = pvr_laguna_pvtc_sdif_cmd(laguna, 0x4, 0x7);
+		if (ret)
+			return ret;
+		ret = pvr_laguna_pvtc_sdif_cmd(laguna, 0x5, 0x200);
+		if (ret)
+			return ret;
+		ret = pvr_laguna_pvtc_sdif_cmd(laguna, 0x0, 0x508);
+		if (ret)
+			return ret;
+	} else if ((ack & PVR_LAGUNA_GPU_CTRL_POWER_GATE_ACK) &&
+		   laguna->pvtc_pwroff) {
+		ret = pvr_laguna_set_pvtc_pwroff(laguna, true);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void pvr_laguna_core_logic_power_off(struct pvr_laguna_data *laguna)
+{
+	u32 ack;
+
+	if (!laguna->gpu_control)
+		return;
+
+	if (laguna->pvtc_pwroff)
+		pvr_laguna_set_pvtc_pwroff(laguna, false);
+	if (laguna->dts)
+		writel(0x1, laguna->dts + PVR_LAGUNA_GPU_DTS_PWRSTATE);
+
+	writel(PVR_LAGUNA_GPU_CTRL_POWER_OFF_VAL, laguna->gpu_control);
+	readl_poll_timeout(laguna->gpu_control, ack,
+			   ack & PVR_LAGUNA_GPU_CTRL_ACK_MASK, 0, 10000);
+}
+
+/**
+ * pvr_laguna_slc_program_lut() - Program Laguna SLC PBHA & read-allocate LUTs
+ * @pvr_dev: Target PowerVR device.
+ *
+ * Programs req_pbha_lut (0x34e08000, strictly 32-bit writes) and ra_lut_{0..2}
+ * (0x3490{0,1,2}200) ONLY for OSID 1 (Non-Secure Linux). OSID 0 (FW) and
+ * OSID 7 (TrustZone) are explicitly untouched so Trusty PTEs are never
+ * polluted. Must be called after GPU power-on.
+ */
+void pvr_laguna_slc_program_lut(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	u32 osid1_req_base = PVR_LAGUNA_OSID_LINUX *
+			     PVR_LAGUNA_REQ_PBHA_OSID_STRIDE;
+	u32 osid1_ra_base = PVR_LAGUNA_OSID_LINUX *
+			    PVR_LAGUNA_RA_LUT_OSID_STRIDE;
+
+	if (!laguna)
+		return;
+
+	BUILD_BUG_ON(PVR_LAGUNA_OSID_LINUX == PVR_LAGUNA_OSID_FW);
+	BUILD_BUG_ON(PVR_LAGUNA_OSID_LINUX == PVR_LAGUNA_OSID_TZ);
+
+	if (laguna->req_pbha_lut) {
+		for (u32 i = 0; i < PVR_LAGUNA_REQ_PBHA_OSID_ENTRIES; i++) {
+			writel(PVR_LAGUNA_REQ_PBHA_OSID1_DEFAULT,
+			       laguna->req_pbha_lut + osid1_req_base + i * 4U);
+		}
+	}
+
+	for (u32 bank = 0; bank < PVR_LAGUNA_RA_LUT_BANKS; bank++) {
+		if (!laguna->ra_lut[bank])
+			continue;
+
+		for (u32 i = 0; i < PVR_LAGUNA_RA_LUT_OSID_ENTRIES; i++) {
+			writel(PVR_LAGUNA_RA_LUT_OSID1_DEFAULT,
+			       laguna->ra_lut[bank] + osid1_ra_base + i * 4U);
+		}
+	}
+}
+
+static void pvr_laguna_mba_clear_irq(struct pvr_laguna_data *laguna)
+{
+	u32 itr;
+
+	if (!laguna->mba_glue)
+		return;
+
+	itr = readl(laguna->mba_glue + PVR_LAGUNA_MBA_GLUE_INTR_ITR_OFF);
+	if (itr)
+		writel(itr, laguna->mba_glue + PVR_LAGUNA_MBA_GLUE_INTR_ITR_OFF);
+}
+
+/**
+ * pvr_laguna_mba_send_msg() - Write a sideband message to a Laguna GPU MBA client
+ * @pvr_dev: Target PowerVR device.
+ * @client_idx: Client slot index (0..3, 0x1000 stride).
+ * @msg: 32-bit COMMON_MSG payload.
+ *
+ * Returns:
+ *  * 0 on success,
+ *  * -%ENODEV if MBA client MMIO is unavailable, or
+ *  * -%EINVAL if @client_idx is out of range.
+ */
+int pvr_laguna_mba_send_msg(struct pvr_device *pvr_dev, u32 client_idx, u32 msg)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	u32 offset;
+
+	if (!laguna || !laguna->mba_client)
+		return -ENODEV;
+
+	if (client_idx >= PVR_LAGUNA_MBA_CLIENT_MAX)
+		return -EINVAL;
+
+	offset = client_idx * PVR_LAGUNA_MBA_CLIENT_STRIDE +
+		 PVR_LAGUNA_MBA_CLIENT_COMMON_MSG_OFF;
+	writel(msg, laguna->mba_client + offset);
+
+	return 0;
+}
+
+unsigned long pvr_laguna_get_core_clk_rate(const struct pvr_device *pvr_dev)
+{
+	const struct pvr_laguna_data *laguna = pvr_dev->laguna;
+
+	if (laguna && laguna->pf_state_clk) {
+		unsigned long rate = clk_get_rate(laguna->pf_state_clk);
+
+		if (rate)
+			return rate;
+	}
+
+	if (laguna && laguna->core_freq_hz)
+		return laguna->core_freq_hz;
+
+	return PVR_LAGUNA_GPU_INIT_FREQ_HZ;
+}
+
+#if IS_ENABLED(CONFIG_TRUSTY_VIRTIO_IPC)
+static struct tipc_msg_buf *pvr_laguna_tz_handle_msg(void *data,
+						     struct tipc_msg_buf *rxbuf)
+{
+	struct pvr_laguna_tz *tz = data;
+	size_t len = mb_avail_data(rxbuf);
+
+	mutex_lock(&tz->rsp_lock);
+	if (!tz->rsp_buf) {
+		dev_err(tz->dev, "pixel_gpu TZ: unexpected message, dropped\n");
+	} else if (len > tz->rsp_size) {
+		dev_err(tz->dev, "pixel_gpu TZ: reply too large (%zu > %zu)\n",
+			len, tz->rsp_size);
+		tz->rsp_res = -EMSGSIZE;
+	} else {
+		memcpy(tz->rsp_buf, mb_get_data(rxbuf, len), len);
+		tz->rsp_res = (int)len;
+	}
+	mutex_unlock(&tz->rsp_lock);
+	complete(&tz->reply);
+
+	return rxbuf;
+}
+
+static void pvr_laguna_tz_handle_event(void *data, int event)
+{
+	struct pvr_laguna_tz *tz = data;
+
+	complete(&tz->reply);
+}
+
+static const struct tipc_chan_ops pvr_laguna_tz_ops = {
+	.handle_msg = pvr_laguna_tz_handle_msg,
+	.handle_event = pvr_laguna_tz_handle_event,
+};
+
+static void pvr_laguna_tz_close(struct pvr_laguna_tz *tz)
+{
+	if (tz->chan) {
+		tipc_chan_shutdown(tz->chan);
+		tipc_chan_destroy(tz->chan);
+		tz->chan = NULL;
+	}
+}
+
+static int pvr_laguna_tz_connect(struct pvr_laguna_tz *tz)
+{
+	struct tipc_chan *chan;
+	int ret;
+
+	chan = tipc_create_channel(NULL, &pvr_laguna_tz_ops, tz);
+	if (IS_ERR(chan))
+		return PTR_ERR(chan);
+
+	reinit_completion(&tz->reply);
+	ret = tipc_chan_connect(chan, tz->port);
+	if (ret < 0)
+		goto err_destroy;
+
+	if (!wait_for_completion_timeout(&tz->reply,
+					 msecs_to_jiffies(PVR_LAGUNA_TZ_CON_TIMEOUT_MS))) {
+		ret = -ETIMEDOUT;
+		tipc_chan_shutdown(chan);
+		goto err_destroy;
+	}
+
+	tz->chan = chan;
+	return 0;
+
+err_destroy:
+	tipc_chan_destroy(chan);
+	return ret;
+}
+
+static int pvr_laguna_tz_xchg(struct pvr_laguna_tz *tz,
+			      const void *req, size_t req_len,
+			      void *rsp, size_t rsp_size)
+{
+	struct tipc_msg_buf *txbuf;
+	bool retried = false;
+	int ret;
+
+	mutex_lock(&tz->req_lock);
+again:
+	if (!tz->chan) {
+		ret = pvr_laguna_tz_connect(tz);
+		if (ret)
+			goto out_unlock;
+	}
+
+	txbuf = tipc_chan_get_txbuf_timeout(tz->chan,
+					    msecs_to_jiffies(PVR_LAGUNA_TZ_BUF_TIMEOUT_MS));
+	if (IS_ERR(txbuf)) {
+		ret = PTR_ERR(txbuf);
+		goto out_unlock;
+	}
+	memcpy(mb_put_data(txbuf, req_len), req, req_len);
+
+	mutex_lock(&tz->rsp_lock);
+	tz->rsp_buf = rsp;
+	tz->rsp_size = rsp_size;
+	tz->rsp_res = -ENOMSG;
+	mutex_unlock(&tz->rsp_lock);
+
+	reinit_completion(&tz->reply);
+	ret = tipc_chan_queue_msg(tz->chan, txbuf);
+	if (ret < 0) {
+		tipc_chan_put_txbuf(tz->chan, txbuf);
+		pvr_laguna_tz_close(tz);
+		if (!retried) {
+			retried = true;
+			goto again;
+		}
+		goto detach;
+	}
+
+	if (!wait_for_completion_timeout(&tz->reply,
+					 msecs_to_jiffies(PVR_LAGUNA_TZ_MSG_TIMEOUT_MS))) {
+		pvr_laguna_tz_close(tz);
+		ret = -ETIMEDOUT;
+		goto detach;
+	}
+
+	ret = 0;
+detach:
+	mutex_lock(&tz->rsp_lock);
+	if (!ret)
+		ret = tz->rsp_res;
+	tz->rsp_buf = NULL;
+	tz->rsp_size = 0;
+	mutex_unlock(&tz->rsp_lock);
+out_unlock:
+	mutex_unlock(&tz->req_lock);
+	return ret;
+}
+#else
+static void pvr_laguna_tz_close(struct pvr_laguna_tz *tz)
+{
+}
+
+static int pvr_laguna_tz_xchg(struct pvr_laguna_tz *tz,
+			      const void *req, size_t req_len,
+			      void *rsp, size_t rsp_size)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static void pvr_laguna_tz_init(struct pvr_laguna_tz *tz, struct device *dev)
+{
+	tz->dev = dev;
+	tz->port = PVR_LAGUNA_TRUSTY_GPU_PORT;
+	mutex_init(&tz->req_lock);
+	mutex_init(&tz->rsp_lock);
+	init_completion(&tz->reply);
+}
+
+static int pvr_laguna_smc_gpu_control(struct pvr_device *pvr_dev,
+				      unsigned long subcmd,
+				      unsigned long arg2)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct arm_smccc_res res = { 0 };
+	long smc_ret;
+
+	arm_smccc_smc(PVR_LAGUNA_SMC_OEM_GPU_CONTROL, subcmd, arg2,
+		      0, 0, 0, 0, 0, &res);
+
+	smc_ret = (long)res.a0;
+	if (smc_ret < 0) {
+		drm_err(drm_dev,
+			"TF-A SMC_OEM_GPU_CONTROL subcmd=%lu failed (%ld)\n",
+			subcmd, smc_ret);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int pvr_laguna_validate_signed_fw(const struct firmware *fw,
+					 u32 *hdr_off_out)
+{
+	static const u32 offsets[] = {
+		PVR_LAGUNA_SIGNED_FW_HDR_OFF_0,
+		PVR_LAGUNA_SIGNED_FW_HDR_OFF_1,
+	};
+
+	if (!fw || !fw->data || fw->size == 0 ||
+	    fw->size > PVR_LAGUNA_SECURE_FW_MEM_SIZE)
+		return -EINVAL;
+
+	for (size_t i = 0; i < ARRAY_SIZE(offsets); i++) {
+		u32 off = offsets[i];
+		u32 magic;
+
+		if (off + sizeof(magic) > fw->size)
+			continue;
+
+		memcpy(&magic, fw->data + off, sizeof(magic));
+		if (le32_to_cpu((__force __le32)magic) == PVR_LAGUNA_SIGNED_FW_MAGIC) {
+			*hdr_off_out = off;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static void pvr_laguna_release_firmware(void *data)
+{
+	struct pvr_device *pvr_dev = data;
+
+	release_firmware(pvr_dev->fw_dev.firmware);
+	pvr_dev->fw_dev.firmware = NULL;
+}
+
+/**
+ * pvr_laguna_request_signed_firmware() - Load and validate runtime rgx.fw.signed
+ * @pvr_dev: Target PowerVR device.
+ *
+ * Firmware is supplied offline at runtime under /lib/firmware/google/rgx.fw.signed
+ * and is never embedded in kernel sources.
+ *
+ * Returns:
+ *  * 0 on success, or negative errno on failure.
+ */
+int pvr_laguna_request_signed_firmware(struct pvr_device *pvr_dev)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	const struct firmware *fw;
+	u32 hdr_offset = 0;
+	int err;
+
+	if (!laguna)
+		return -ENODEV;
+
+	err = request_firmware(&fw, PVR_LAGUNA_SIGNED_FW_NAME, drm_dev->dev);
+	if (err) {
+		drm_err(drm_dev, "failed to load signed firmware %s (err=%d)\n",
+			PVR_LAGUNA_SIGNED_FW_NAME, err);
+		return err;
+	}
+
+	err = pvr_laguna_validate_signed_fw(fw, &hdr_offset);
+	if (err) {
+		drm_err(drm_dev,
+			"invalid signed firmware %s (size=%zu, missing GPUF header)\n",
+			PVR_LAGUNA_SIGNED_FW_NAME, fw->size);
+		release_firmware(fw);
+		return err;
+	}
+
+	laguna->signed_fw_hdr_offset = hdr_offset;
+	pvr_dev->fw_dev.firmware = fw;
+
+	drm_info(drm_dev,
+		 "validated signed Volcanic firmware %s (size=%zu, GPUF@%#x)\n",
+		 PVR_LAGUNA_SIGNED_FW_NAME, fw->size, hdr_offset);
+
+	return devm_add_action_or_reset(drm_dev->dev,
+					pvr_laguna_release_firmware, pvr_dev);
+}
+
+static int pvr_laguna_stage_signed_fw(struct pvr_device *pvr_dev)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	const struct firmware *fw = pvr_dev->fw_dev.firmware;
+	void *carveout;
+
+	if (!laguna || !fw)
+		return -EINVAL;
+
+	if (fw->size > laguna->fw_carveout_size ||
+	    fw->size > PVR_LAGUNA_SECURE_FW_MEM_SIZE)
+		return -EFBIG;
+
+	carveout = memremap(laguna->fw_carveout_phys,
+			    PVR_LAGUNA_SECURE_FW_MEM_SIZE, MEMREMAP_WC);
+	if (!carveout) {
+		drm_err(drm_dev, "failed to remap gpu_fw secure carveout\n");
+		return -ENOMEM;
+	}
+
+	memcpy(carveout, fw->data, fw->size);
+	/* Ensure signed firmware bytes reach DRAM before EL3 SMC setup. */
+	wmb();
+	memunmap(carveout);
+
+	return 0;
+}
+
+static int pvr_laguna_trusty_send_fw(struct pvr_device *pvr_dev)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	const struct firmware *fw = pvr_dev->fw_dev.firmware;
+	struct pvr_laguna_gpu_secure_req req = {
+		.cmd = PVR_LAGUNA_GPU_SECURE_REQ_SEND_FW,
+		.version = PVR_LAGUNA_GPU_SECURE_REQ_VERSION,
+		.use_tf_a = 1,
+		.host_page_shift = PAGE_SHIFT,
+		.fw_ipa = (u64)laguna->fw_carveout_phys,
+		.fw_size = (u64)fw->size,
+	};
+	struct pvr_laguna_gpu_secure_rsp rsp = { 0 };
+	int ret;
+
+	ret = pvr_laguna_tz_xchg(&laguna->tz, &req, sizeof(req),
+				 &rsp, sizeof(rsp));
+	if (ret < 0) {
+		drm_err(drm_dev, "Trusty %s FW auth failed (%d)\n",
+			PVR_LAGUNA_TRUSTY_GPU_PORT, ret);
+		return ret;
+	}
+
+	if (ret != sizeof(rsp) || rsp.status != 0) {
+		drm_err(drm_dev, "Trusty %s rejected FW (len=%d, status=%d)\n",
+			PVR_LAGUNA_TRUSTY_GPU_PORT, ret, rsp.status);
+		return -EACCES;
+	}
+
+	laguna->fw_authenticated = true;
+	return 0;
+}
+
+int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	int err;
+
+	if (!laguna)
+		return -ENODEV;
+
+	err = pvr_laguna_stage_signed_fw(pvr_dev);
+	if (err)
+		return err;
+
+	err = pvr_laguna_smc_gpu_control(pvr_dev,
+					 PVR_LAGUNA_OEM_GPU_CONTROL_SETUP,
+					 (unsigned long)laguna->fw_carveout_phys);
+	if (err)
+		return err;
+
+	err = pvr_laguna_trusty_send_fw(pvr_dev);
+	if (err)
+		return err;
+
+	err = pvr_laguna_smc_gpu_control(pvr_dev,
+					 PVR_LAGUNA_OEM_GPU_CONTROL_START, 0);
+	if (err)
+		return err;
+
+	laguna->fw_running = true;
+	return 0;
+}
+
+int pvr_laguna_fw_stop(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	int err;
+
+	if (!laguna || !laguna->fw_running)
+		return 0;
+
+	err = pvr_laguna_smc_gpu_control(pvr_dev,
+					 PVR_LAGUNA_OEM_GPU_CONTROL_STOP, 0);
+	if (!err)
+		laguna->fw_running = false;
+
+	return err;
+}
+
+int pvr_laguna_fw_init(struct pvr_device *pvr_dev)
+{
+	struct pvr_fw_device *fw_dev = &pvr_dev->fw_dev;
+	int err;
+
+	fw_dev->defs = &pvr_fw_defs_riscv;
+
+	err = fw_dev->defs->init(pvr_dev);
+	if (err)
+		return err;
+
+	err = pvr_laguna_fw_start(pvr_dev);
+	if (err)
+		return err;
+
+	WRITE_ONCE(fw_dev->initialised, true);
+	return 0;
+}
+
+void pvr_laguna_fw_fini(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+
+	WRITE_ONCE(pvr_dev->fw_dev.initialised, false);
+
+	if (!laguna)
+		return;
+
+	pvr_laguna_fw_stop(pvr_dev);
+	pvr_laguna_tz_close(&laguna->tz);
+}
+
+static void __iomem *
+pvr_laguna_ioremap_optional(struct platform_device *pdev, const char *name)
+{
+	struct resource *res;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+	if (!res)
+		return NULL;
+
+	return devm_ioremap_resource(&pdev->dev, res);
+}
+
+static int pvr_laguna_parse_fw_carveout(struct device *dev,
+					struct pvr_laguna_data *laguna)
+{
+	struct device_node *rmem_np;
+	struct resource rmem_res;
+	int err;
+
+	rmem_np = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (!rmem_np)
+		return dev_err_probe(dev, -ENODEV,
+				     "missing gpu_fw memory-region phandle\n");
+
+	err = of_address_to_resource(rmem_np, 0, &rmem_res);
+	of_node_put(rmem_np);
+	if (err)
+		return dev_err_probe(dev, err,
+				     "failed to resolve gpu_fw reserved memory\n");
+
+	if (resource_size(&rmem_res) < PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE)
+		return dev_err_probe(dev, -EINVAL,
+				     "gpu_fw carveout too small (%pap < %llu)\n",
+				     &rmem_res.end,
+				     PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE);
+
+	laguna->fw_carveout_phys = rmem_res.start;
+	laguna->fw_carveout_size = resource_size(&rmem_res);
+	return 0;
+}
+
+static int pvr_laguna_power_init(struct pvr_device *pvr_dev)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct device *dev = drm_dev->dev;
+	struct platform_device *pdev = to_platform_device(dev);
+	struct pvr_laguna_data *laguna;
+	static const char *const ra_lut_names[PVR_LAGUNA_RA_LUT_BANKS] = {
+		"ra_lut_0", "ra_lut_1", "ra_lut_2",
+	};
+	int err;
+
+	laguna = devm_kzalloc(dev, sizeof(*laguna), GFP_KERNEL);
+	if (!laguna)
+		return -ENOMEM;
+
+	laguna->core_freq_hz = PVR_LAGUNA_GPU_INIT_FREQ_HZ;
+	laguna->pf_state_clk = pvr_dev->core_clk;
+
+	laguna->pfsm = devm_platform_ioremap_resource_byname(pdev, "pfsm");
+	if (IS_ERR(laguna->pfsm))
+		return dev_err_probe(dev, PTR_ERR(laguna->pfsm),
+				     "failed to map pfsm registers\n");
+
+	laguna->req_pbha_lut =
+		devm_platform_ioremap_resource_byname(pdev, "req_pbha_lut");
+	if (IS_ERR(laguna->req_pbha_lut))
+		return dev_err_probe(dev, PTR_ERR(laguna->req_pbha_lut),
+				     "failed to map req_pbha_lut registers\n");
+
+	for (u32 i = 0; i < PVR_LAGUNA_RA_LUT_BANKS; i++) {
+		laguna->ra_lut[i] =
+			devm_platform_ioremap_resource_byname(pdev, ra_lut_names[i]);
+		if (IS_ERR(laguna->ra_lut[i]))
+			return dev_err_probe(dev, PTR_ERR(laguna->ra_lut[i]),
+					     "failed to map %s registers\n",
+					     ra_lut_names[i]);
+	}
+
+	laguna->mba_glue =
+		devm_platform_ioremap_resource_byname(pdev, "mba_glue");
+	if (IS_ERR(laguna->mba_glue))
+		return dev_err_probe(dev, PTR_ERR(laguna->mba_glue),
+				     "failed to map mba_glue registers\n");
+
+	laguna->mba_client =
+		devm_platform_ioremap_resource_byname(pdev, "mba_client");
+	if (IS_ERR(laguna->mba_client))
+		return dev_err_probe(dev, PTR_ERR(laguna->mba_client),
+				     "failed to map mba_client registers\n");
+
+	laguna->gpu_control = pvr_laguna_ioremap_optional(pdev, "gpu_control");
+	if (IS_ERR(laguna->gpu_control))
+		return dev_err_probe(dev, PTR_ERR(laguna->gpu_control),
+				     "failed to map gpu_control registers\n");
+
+	laguna->pvtc = pvr_laguna_ioremap_optional(pdev, "pvtc");
+	if (IS_ERR(laguna->pvtc))
+		return dev_err_probe(dev, PTR_ERR(laguna->pvtc),
+				     "failed to map pvtc registers\n");
+
+	laguna->pvtc_pwroff = pvr_laguna_ioremap_optional(pdev, "pvtc_pwroff");
+	if (IS_ERR(laguna->pvtc_pwroff))
+		return dev_err_probe(dev, PTR_ERR(laguna->pvtc_pwroff),
+				     "failed to map pvtc_pwroff registers\n");
+
+	laguna->dts = pvr_laguna_ioremap_optional(pdev, "dts");
+	if (IS_ERR(laguna->dts))
+		return dev_err_probe(dev, PTR_ERR(laguna->dts),
+				     "failed to map dts registers\n");
+
+	err = pvr_laguna_parse_fw_carveout(dev, laguna);
+	if (err)
+		return err;
+
+	pvr_laguna_tz_init(&laguna->tz, dev);
+	pvr_dev->laguna = laguna;
+
+	return 0;
+}
+
+static int pvr_laguna_power_on(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	int err;
+
+	if (!laguna)
+		return -ENODEV;
+
+	err = clk_prepare_enable(laguna->pf_state_clk);
+	if (err)
+		return err;
+
+	err = pvr_laguna_core_logic_power_on(laguna);
+	if (err) {
+		clk_disable_unprepare(laguna->pf_state_clk);
+		return err;
+	}
+
+	/* Read PFSM status to fence power-on before programming SLC/MBA. */
+	(void)readl(laguna->pfsm + PVR_LAGUNA_PFSM_STATUS_OFF);
+
+	/* Re-program OSID 1 SLC PBHA & read-allocate LUTs on every power-on. */
+	pvr_laguna_slc_program_lut(pvr_dev);
+	pvr_laguna_mba_clear_irq(laguna);
+
+	return 0;
+}
+
+static int pvr_laguna_power_off(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+
+	if (!laguna)
+		return 0;
+
+	pvr_laguna_mba_clear_irq(laguna);
+	pvr_laguna_core_logic_power_off(laguna);
+	clk_disable_unprepare(laguna->pf_state_clk);
+
+	return 0;
+}
+
+const struct pvr_power_sequence_ops pvr_power_sequence_ops_laguna = {
+	.init = pvr_laguna_power_init,
+	.power_on = pvr_laguna_power_on,
+	.power_off = pvr_laguna_power_off,
+};

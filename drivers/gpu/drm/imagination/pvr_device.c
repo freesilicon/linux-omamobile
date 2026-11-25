@@ -5,11 +5,13 @@
 #include "pvr_device_info.h"
 
 #include "pvr_fw.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_queue.h"
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_stream.h"
 #include "pvr_vm.h"
+#include "pvr_volcanic_defs.h"
 
 #include <drm/drm_print.h>
 
@@ -62,7 +64,11 @@ pvr_device_reg_init(struct pvr_device *pvr_dev)
 	pvr_dev->regs_resource = NULL;
 	pvr_dev->regs = NULL;
 
-	regs = devm_platform_get_and_ioremap_resource(plat_dev, 0, &regs_resource);
+	regs_resource = platform_get_resource_byname(plat_dev, IORESOURCE_MEM, "rgx");
+	if (regs_resource)
+		regs = devm_ioremap_resource(drm_dev->dev, regs_resource);
+	else
+		regs = devm_platform_get_and_ioremap_resource(plat_dev, 0, &regs_resource);
 	if (IS_ERR(regs))
 		return dev_err_probe(drm_dev->dev, PTR_ERR(regs),
 				     "failed to ioremap gpu registers\n");
@@ -100,6 +106,15 @@ static int pvr_device_clk_init(struct pvr_device *pvr_dev)
 	struct clk *core_clk;
 	struct clk *sys_clk;
 	struct clk *mem_clk;
+
+	if (pvr_dev->device_data && pvr_dev->device_data->is_laguna) {
+		core_clk = devm_clk_get_optional(drm_dev->dev, "gpu_pf_state");
+		if (IS_ERR(core_clk))
+			return dev_err_probe(drm_dev->dev, PTR_ERR(core_clk),
+					     "failed to get gpu_pf_state clock\n");
+		pvr_dev->core_clk = core_clk;
+		return 0;
+	}
 
 	core_clk = devm_clk_get(drm_dev->dev, "core");
 	if (IS_ERR(core_clk))
@@ -213,7 +228,8 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
 	while (pvr_fw_irq_pending(pvr_dev)) {
 		pvr_fw_irq_clear(pvr_dev);
 
-		if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
+		if (READ_ONCE(pvr_dev->fw_dev.initialised) &&
+		    pvr_dev->fw_dev.fwif_osdata) {
 			pvr_fwccb_process(pvr_dev);
 			pvr_kccb_wake_up_waiters(pvr_dev);
 			pvr_device_process_active_queues(pvr_dev);
@@ -535,6 +551,9 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 	case PVR_PACKED_BVNC(36, 53, 104, 796):
 		return PVR_GPU_SUPPORTED;
 
+	case PVR_VOLCANIC_DXT_48_1536_BVNC:
+		return PVR_GPU_EXPERIMENTAL;
+
 	default:
 		return PVR_GPU_UNKNOWN;
 	}
@@ -674,6 +693,36 @@ pvr_device_gpu_init(struct pvr_device *pvr_dev)
 	if (err)
 		return err;
 
+	if (pvr_dev->laguna) {
+		err = pvr_device_info_init_volcanic(pvr_dev);
+		if (err)
+			return err;
+
+		err = pvr_laguna_request_signed_firmware(pvr_dev);
+		if (err)
+			return err;
+
+		pvr_dev->fw_version.major = 1;
+		pvr_dev->fw_version.minor = 1;
+		pvr_dev->fw_dev.processor_type = PVR_FW_PROCESSOR_TYPE_RISCV;
+
+		pvr_stream_create_musthave_masks(pvr_dev);
+
+		err = pvr_set_dma_info(pvr_dev);
+		if (err)
+			return err;
+
+		pvr_dev->kernel_vm_ctx = pvr_vm_create_context(pvr_dev, false);
+		if (IS_ERR(pvr_dev->kernel_vm_ctx))
+			return PTR_ERR(pvr_dev->kernel_vm_ctx);
+
+		err = pvr_laguna_fw_init(pvr_dev);
+		if (err)
+			goto err_vm_ctx_put;
+
+		return 0;
+	}
+
 	err = pvr_request_firmware(pvr_dev);
 	if (err)
 		return err;
@@ -725,7 +774,10 @@ err_vm_ctx_put:
 static void
 pvr_device_gpu_fini(struct pvr_device *pvr_dev)
 {
-	pvr_fw_fini(pvr_dev);
+	if (pvr_dev->laguna)
+		pvr_laguna_fw_fini(pvr_dev);
+	else
+		pvr_fw_fini(pvr_dev);
 
 	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
 		WARN_ON(!pvr_vm_context_put(pvr_dev->kernel_vm_ctx));
@@ -832,6 +884,14 @@ pvr_device_has_uapi_quirk(struct pvr_device *pvr_dev, u32 quirk)
 		return PVR_HAS_QUIRK(pvr_dev, 51764);
 	case 62269:
 		return PVR_HAS_QUIRK(pvr_dev, 62269);
+	case 65104:
+		return PVR_HAS_QUIRK(pvr_dev, 65104);
+	case 69700:
+		return PVR_HAS_QUIRK(pvr_dev, 69700);
+	case 74812:
+		return PVR_HAS_QUIRK(pvr_dev, 74812);
+	case 77899:
+		return PVR_HAS_QUIRK(pvr_dev, 77899);
 	default:
 		return false;
 	};

@@ -97,13 +97,15 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 	if (!hard_reset) {
 		cancel_delayed_work_sync(&pvr_dev->watchdog.work);
 
-		err = pvr_power_request_idle(pvr_dev);
-		if (err)
-			return err;
+		if (pvr_dev->fw_dev.power_sync) {
+			err = pvr_power_request_idle(pvr_dev);
+			if (err)
+				return err;
 
-		err = pvr_power_request_pwr_off(pvr_dev);
-		if (err)
-			return err;
+			err = pvr_power_request_pwr_off(pvr_dev);
+			if (err)
+				return err;
+		}
 	}
 
 	if (rpm_suspend) {
@@ -130,15 +132,19 @@ pvr_power_fw_enable(struct pvr_device *pvr_dev, bool rpm_resume)
 	if (err)
 		goto out;
 
-	err = pvr_wait_for_fw_boot(pvr_dev);
-	if (err) {
-		drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
-		pvr_fw_stop(pvr_dev);
-		goto out;
+	if (pvr_dev->fw_dev.fwif_sysinit) {
+		err = pvr_wait_for_fw_boot(pvr_dev);
+		if (err) {
+			drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
+			pvr_fw_stop(pvr_dev);
+			goto out;
+		}
 	}
 
-	queue_delayed_work(pvr_dev->sched_wq, &pvr_dev->watchdog.work,
-			   msecs_to_jiffies(WATCHDOG_TIME_MS));
+	if (pvr_dev->fw_dev.fwif_osdata) {
+		queue_delayed_work(pvr_dev->sched_wq, &pvr_dev->watchdog.work,
+				   msecs_to_jiffies(WATCHDOG_TIME_MS));
+	}
 
 	return 0;
 
@@ -152,6 +158,9 @@ out:
 bool
 pvr_power_is_idle(struct pvr_device *pvr_dev)
 {
+	if (!pvr_dev->fw_dev.fwif_sysdata)
+		return true;
+
 	/*
 	 * FW power state can be out of date if a KCCB command has been submitted but the FW hasn't
 	 * started processing it yet. So also check the KCCB status.
@@ -660,13 +669,17 @@ int pvr_power_domains_init(struct pvr_device *pvr_dev)
 		goto out;
 	}
 
-	const struct dev_pm_domain_attach_data pd_attach_data = {
-		.pd_names = ROGUE_PD_NAMES,
-		.num_pd_names = domain_count,
-		.pd_flags = 0,
-	};
+	if (of_device_is_compatible(dev->of_node, "google,lga-gpu")) {
+		err = dev_pm_domain_attach_list(dev, NULL, &domains);
+	} else {
+		const struct dev_pm_domain_attach_data pd_attach_data = {
+			.pd_names = ROGUE_PD_NAMES,
+			.num_pd_names = domain_count,
+			.pd_flags = 0,
+		};
 
-	err = dev_pm_domain_attach_list(dev, &pd_attach_data, &domains);
+		err = dev_pm_domain_attach_list(dev, &pd_attach_data, &domains);
+	}
 	if (err < 0)
 		goto err_free_links;
 

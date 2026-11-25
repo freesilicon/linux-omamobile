@@ -20,6 +20,7 @@ powervr-y := \
 	pvr_gem.o \
 	pvr_hwrt.o \
 	pvr_job.o \
+	pvr_laguna.o \
 	pvr_mmu.o \
 	pvr_power.o \
 	pvr_queue.o \

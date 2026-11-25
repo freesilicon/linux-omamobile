@@ -10,10 +10,12 @@
 #include "pvr_power.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_mmu_defs.h"
+#include "pvr_volcanic_defs.h"
 
 #include <drm/drm_drv.h>
 #include <drm/drm_print.h>
 #include <linux/atomic.h>
+#include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/kmemleak.h>
@@ -752,6 +754,7 @@ pvr_page_table_l0_entry_raw_clear(struct pvr_page_table_l0_entry_raw *entry)
 /**
  * pvr_page_flags_raw_create() - Initialize the flag bits of a raw level 0 page
  *                               table entry.
+ * @pvr_dev: Target PowerVR device.
  * @read_only: This page is read-only (see: Read Only).
  * @cache_coherent: This page does not require cache flushes (see: Cache
  *                  Coherency).
@@ -767,16 +770,31 @@ pvr_page_table_l0_entry_raw_clear(struct pvr_page_table_l0_entry_raw *entry)
  * pvr_page_table_l0_entry_raw_set() or pvr_page_table_l0_insert().
  */
 static struct pvr_page_flags_raw
-pvr_page_flags_raw_create(bool read_only, bool cache_coherent, bool slc_bypass,
+pvr_page_flags_raw_create(struct pvr_device *pvr_dev, bool read_only,
+			  bool cache_coherent, bool slc_bypass,
 			  bool pm_fw_protect)
 {
 	struct pvr_page_flags_raw flags;
+
+	static_assert((VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK &
+		       ROGUE_MMUCTRL_PT_DATA_PM_META_PROTECT_EN) == 0);
+	static_assert((VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK &
+		       ~ROGUE_MMUCTRL_PAGE_4KB_RANGE_CLRMSK) == 0);
 
 	flags.val.val =
 		PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
 		PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
 		PVR_PAGE_TABLE_FIELD_PREP(0, PT, SLC_BYPASS_CTRL, slc_bypass) |
 		PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect);
+
+	if (PVR_HAS_FEATURE(pvr_dev, mmu_version) &&
+	    pvr_dev->features.mmu_version >= 4) {
+		u64 axcache = slc_bypass ? VOLCANIC_MMUCTRL_AXCACHE_UNCACHED :
+					   VOLCANIC_MMUCTRL_AXCACHE_CACHED;
+
+		flags.val.val |= FIELD_PREP(VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK,
+					    axcache);
+	}
 
 	return flags;
 }
@@ -2599,7 +2617,8 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 
 	memcpy(&ptr_copy, &op_ctx->curr_page, sizeof(ptr_copy));
 
-	flags_raw = pvr_page_flags_raw_create(false, false,
+	flags_raw = pvr_page_flags_raw_create(op_ctx->mmu_ctx->pvr_dev,
+					      false, false,
 					      flags & DRM_PVR_BO_BYPASS_DEVICE_CACHE,
 					      flags & DRM_PVR_BO_PM_FW_PROTECT);
 

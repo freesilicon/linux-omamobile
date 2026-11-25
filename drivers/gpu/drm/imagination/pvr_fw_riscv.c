@@ -9,6 +9,7 @@
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_rogue_riscv.h"
 #include "pvr_vm.h"
+#include "pvr_volcanic_defs.h"
 
 #include <linux/compiler.h>
 #include <linux/delay.h>
@@ -30,6 +31,12 @@ pvr_riscv_wrapper_init(struct pvr_device *pvr_dev)
 
 	u64 code_addr = pvr_fw_obj_get_gpu_addr(pvr_dev->fw_dev.mem.code_obj);
 	u64 data_addr = pvr_fw_obj_get_gpu_addr(pvr_dev->fw_dev.mem.data_obj);
+	u32 code_remap_reg = pvr_dev->features.is_volcanic ?
+		VOLCANIC_RISCVFW_REGION_REMAP_CR(BOOTLDR_CODE) :
+		ROGUE_RISCVFW_REGION_REMAP_CR(BOOTLDR_CODE);
+	u32 data_remap_reg = pvr_dev->features.is_volcanic ?
+		VOLCANIC_RISCVFW_REGION_REMAP_CR(BOOTLDR_DATA) :
+		ROGUE_RISCVFW_REGION_REMAP_CR(BOOTLDR_DATA);
 
 	/* This condition allows us to OR the addresses into the register directly. */
 	static_assert(ROGUE_CR_FWCORE_ADDR_REMAP_CONFIG1_DEVVADDR_SHIFT ==
@@ -38,10 +45,10 @@ pvr_riscv_wrapper_init(struct pvr_device *pvr_dev)
 	WARN_ON(code_addr & ROGUE_CR_FWCORE_ADDR_REMAP_CONFIG1_DEVVADDR_CLRMSK);
 	WARN_ON(data_addr & ROGUE_CR_FWCORE_ADDR_REMAP_CONFIG1_DEVVADDR_CLRMSK);
 
-	pvr_cr_write64(pvr_dev, ROGUE_RISCVFW_REGION_REMAP_CR(BOOTLDR_CODE),
+	pvr_cr_write64(pvr_dev, code_remap_reg,
 		       code_addr | common_opts | ROGUE_CR_FWCORE_ADDR_REMAP_CONFIG0_FETCH_EN_EN);
 
-	pvr_cr_write64(pvr_dev, ROGUE_RISCVFW_REGION_REMAP_CR(BOOTLDR_DATA),
+	pvr_cr_write64(pvr_dev, data_remap_reg,
 		       data_addr | common_opts |
 			       ROGUE_CR_FWCORE_ADDR_REMAP_CONFIG0_LOAD_STORE_EN_EN);
 
@@ -141,6 +148,10 @@ pvr_riscv_vm_unmap(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj)
 static bool
 pvr_riscv_irq_pending(struct pvr_device *pvr_dev)
 {
+	if (pvr_dev->features.is_volcanic)
+		return pvr_cr_read32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_STATUS) &
+		       VOLCANIC_CR_IRQ_OS0_EVENT_STATUS_SOURCE_EN;
+
 	return pvr_cr_read32(pvr_dev, ROGUE_CR_IRQ_OS0_EVENT_STATUS) &
 	       ROGUE_CR_IRQ_OS0_EVENT_STATUS_SOURCE_EN;
 }
@@ -148,6 +159,12 @@ pvr_riscv_irq_pending(struct pvr_device *pvr_dev)
 static void
 pvr_riscv_irq_clear(struct pvr_device *pvr_dev)
 {
+	if (pvr_dev->features.is_volcanic) {
+		pvr_cr_write32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_CLEAR,
+			       VOLCANIC_CR_IRQ_OS0_EVENT_CLEAR_SOURCE_EN);
+		return;
+	}
+
 	pvr_cr_write32(pvr_dev, ROGUE_CR_IRQ_OS0_EVENT_CLEAR,
 		       ROGUE_CR_IRQ_OS0_EVENT_CLEAR_SOURCE_EN);
 }

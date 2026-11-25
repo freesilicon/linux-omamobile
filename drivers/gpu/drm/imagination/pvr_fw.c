@@ -9,6 +9,7 @@
 #include "pvr_fw_startstop.h"
 #include "pvr_fw_trace.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_rogue_fwif_dev_info.h"
 #include "pvr_rogue_heap_config.h"
@@ -365,7 +366,9 @@ fw_sysinit_init(void *cpu_ptr, void *priv)
 	struct pvr_fw_device *fw_dev = &pvr_dev->fw_dev;
 	struct pvr_fw_mem *fw_mem = &fw_dev->mem;
 	dma_addr_t fault_dma_addr = 0;
-	u32 clock_speed_hz = clk_get_rate(pvr_dev->core_clk);
+	u32 clock_speed_hz = pvr_dev->laguna ?
+		(u32)pvr_laguna_get_core_clk_rate(pvr_dev) :
+		clk_get_rate(pvr_dev->core_clk);
 
 	WARN_ON(!clock_speed_hz);
 
@@ -429,7 +432,9 @@ fw_runtime_cfg_init(void *cpu_ptr, void *priv)
 {
 	struct rogue_fwif_runtime_cfg *runtime_cfg = cpu_ptr;
 	struct pvr_device *pvr_dev = priv;
-	u32 clock_speed_hz = clk_get_rate(pvr_dev->core_clk);
+	u32 clock_speed_hz = pvr_dev->laguna ?
+		(u32)pvr_laguna_get_core_clk_rate(pvr_dev) :
+		clk_get_rate(pvr_dev->core_clk);
 
 	WARN_ON(!clock_speed_hz);
 

@@ -1,0 +1,74 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/*
+ * Clean-room PowerVR Volcanic (DXT-48-1536, BVNC 71.2.2448.1212) register,
+ * MMUv4, and identity definitions for Tensor G5 (Laguna).
+ */
+
+#ifndef PVR_VOLCANIC_DEFS_H
+#define PVR_VOLCANIC_DEFS_H
+
+#include <linux/bits.h>
+#include <linux/types.h>
+
+/*
+ * Tensor G5 PowerVR Volcanic DXT-48-1536 identity:
+ *   BVNC 71.2.2448.1212 -> RGX_CR_CORE_ID (0x0020) = 0x00470002099004bc
+ *   2 SPUs, 6 USC clusters (1536 FP32), 24 ISP/IPP pipes, 32x32 tiles,
+ *   FBCDC v5 (alg 5, arch 6), SLC 1536 KiB / 6 banks / 1024-bit lines,
+ *   MMUv4 (40-bit VA/PA + AXCACHE[61:58]), Ray Tracing Arch 3,
+ *   Volcanic errata BRN 65104 / 69700 / 74812 / 77899 (mask 0x283).
+ */
+#define PVR_VOLCANIC_DXT_48_1536_B			71U
+#define PVR_VOLCANIC_DXT_48_1536_V			2U
+#define PVR_VOLCANIC_DXT_48_1536_N			2448U
+#define PVR_VOLCANIC_DXT_48_1536_C			1212U
+#define PVR_VOLCANIC_DXT_48_1536_BVNC			0x00470002099004bcULL
+#define PVR_VOLCANIC_DXT_48_1536_BRN_MASK		0x283ULL
+
+/* Volcanic control register (CR) offsets relative to rgx base (0x34f00000). */
+#define VOLCANIC_CR_CLK_CTRL0				0x0000U
+#define VOLCANIC_CR_CORE_ID				0x0020U
+#define VOLCANIC_CR_SPU_ENABLE				0x0050U
+#define VOLCANIC_CR_SPU_ENABLE_MASK			GENMASK(1, 0)
+#define VOLCANIC_CR_SOFT_RESET				0x0100U
+#define VOLCANIC_CR_EVENT_STATUS			0x0130U
+#define VOLCANIC_CR_MTS_SCHEDULE			0x0B00U
+#define VOLCANIC_CR_MTS_GARTEN_WRAPPER_CONFIG		0x0B50U
+#define VOLCANIC_CR_MTS_INTCTX				0x0B98U
+
+/* Volcanic moved OS0 IRQ and RISC-V FW wrapper registers vs Rogue. */
+#define VOLCANIC_CR_IRQ_OS0_EVENT_STATUS		0x0BD0U
+#define VOLCANIC_CR_IRQ_OS0_EVENT_STATUS_SOURCE_EN	BIT(0)
+#define VOLCANIC_CR_IRQ_OS0_EVENT_CLEAR			0x0BD8U
+#define VOLCANIC_CR_IRQ_OS0_EVENT_CLEAR_SOURCE_EN	BIT(0)
+
+#define VOLCANIC_CR_FWCORE_ADDR_REMAP_CONFIG0		0x7020U
+#define VOLCANIC_CR_FWCORE_BOOT				0x70C0U
+#define VOLCANIC_CR_FWCORE_BOOT_ENABLE_EN		BIT(0)
+
+#define VOLCANIC_RISCVFW_REGION_REMAP_CR(r) \
+	(VOLCANIC_CR_FWCORE_ADDR_REMAP_CONFIG0 + \
+	 (u32)(ROGUE_RISCV_REGION_##r) * 8U)
+
+/* Volcanic S7_TOP idle & MMUv4 catalogue base registers (no Rogue BIF_CTRL). */
+#define VOLCANIC_CR_JONES_IDLE				0x8328U
+#define VOLCANIC_CR_JONES_IDLE_MASKFULL			GENMASK(14, 0)
+#define VOLCANIC_CR_MMU_CBASE_MAPPING_CONTEXT		0xE140U
+#define VOLCANIC_CR_MMU_CBASE_MAPPING			0xE148U
+#define VOLCANIC_CR_MMU_CBASE_MAPPING_ADDR_ALIGNSHIFT	12U
+#define VOLCANIC_CR_MMU_CBASE_MAPPING_ADDR_MASK		GENMASK(27, 0)
+
+/*
+ * Volcanic MMUv4 (MMU_VERSION = 4) L0 page table entry AXCACHE attribute bits.
+ * Retains 40-bit VA (PC[39:30], PD[29:21], PT[20:12]) and 40-bit PA, adding
+ * 4-bit AXI4 AxCACHE encoding in PT_DATA[61:58] (below PM_META_PROTECT bit 62).
+ */
+#define VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_SHIFT		58U
+#define VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK		GENMASK_ULL(61, 58)
+#define VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_CLRMSK		(~VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK)
+
+/* AXI4 AxCACHE[3:0] policies for MMUv4 PTEs. */
+#define VOLCANIC_MMUCTRL_AXCACHE_UNCACHED		0x3ULL /* Normal Non-Cacheable Bufferable */
+#define VOLCANIC_MMUCTRL_AXCACHE_CACHED			0xFULL /* Write-Back Read/Write-Allocate */
+
+#endif /* PVR_VOLCANIC_DEFS_H */

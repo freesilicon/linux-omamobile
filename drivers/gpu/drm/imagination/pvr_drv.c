@@ -9,6 +9,7 @@
 #include "pvr_gem.h"
 #include "pvr_hwrt.h"
 #include "pvr_job.h"
+#include "pvr_laguna.h"
 #include "pvr_mmu.h"
 #include "pvr_power.h"
 #include "pvr_rogue_defs.h"
@@ -466,6 +467,10 @@ pvr_dev_query_quirks_get(struct pvr_device *pvr_dev,
 	static const u32 umd_quirks[] = {
 		48545,
 		51764,
+		65104,
+		69700,
+		74812,
+		77899,
 	};
 	struct drm_pvr_dev_query_quirks query;
 	u32 out[ARRAY_SIZE(umd_quirks_musthave) + ARRAY_SIZE(umd_quirks)];
@@ -602,6 +607,30 @@ copy_out:
 	return 0;
 }
 
+static int
+pvr_dev_query_fw_info_get(struct pvr_device *pvr_dev,
+			  struct drm_pvr_ioctl_dev_query_args *args)
+{
+	struct drm_pvr_dev_query_fw_info fw_info = {0};
+	int err;
+
+	if (!args->pointer) {
+		args->size = sizeof(struct drm_pvr_dev_query_fw_info);
+		return 0;
+	}
+
+	fw_info.major_version = pvr_dev->fw_version.major;
+	fw_info.minor_version = pvr_dev->fw_version.minor;
+
+	err = PVR_UOBJ_SET(args->pointer, args->size, fw_info);
+	if (err < 0)
+		return err;
+
+	if (args->size > sizeof(fw_info))
+		args->size = sizeof(fw_info);
+	return 0;
+}
+
 /**
  * pvr_ioctl_dev_query() - IOCTL to copy information about a device
  * @drm_dev: [IN] DRM device.
@@ -657,6 +686,10 @@ pvr_ioctl_dev_query(struct drm_device *drm_dev, void *raw_args,
 
 	case DRM_PVR_DEV_QUERY_STATIC_DATA_AREAS_GET:
 		ret = pvr_static_data_areas_get(pvr_dev, args);
+		break;
+
+	case DRM_PVR_DEV_QUERY_FW_INFO_GET:
+		ret = pvr_dev_query_fw_info_get(pvr_dev, args);
 		break;
 	}
 
@@ -1492,7 +1525,16 @@ static const struct pvr_device_data pvr_device_data_pwrseq = {
 	.pwr_ops = &pvr_power_sequence_ops_pwrseq,
 };
 
+static const struct pvr_device_data pvr_device_data_laguna = {
+	.pwr_ops = &pvr_power_sequence_ops_laguna,
+	.is_laguna = true,
+};
+
 static const struct of_device_id dt_match[] = {
+	{
+		.compatible = "google,lga-gpu",
+		.data = &pvr_device_data_laguna,
+	},
 	{
 		.compatible = "thead,th1520-gpu",
 		.data = &pvr_device_data_pwrseq,

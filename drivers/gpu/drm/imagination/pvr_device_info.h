@@ -84,6 +84,15 @@ struct pvr_device_features {
 	bool has_xt_top_infrastructure;
 	bool has_zls_subtile;
 
+	/* Volcanic-specific feature flags and values (not in Rogue FW bitmask). */
+	bool is_volcanic;
+	bool has_host_security_version;
+	bool has_mmu_version;
+	bool has_num_spus;
+	bool has_ray_tracing_arch;
+	bool has_slc_vivt;
+	bool has_tdm_control_stream_format;
+
 	u64 cdm_control_stream_format;
 	u64 common_store_size_in_dwords;
 	u64 ecc_rams;
@@ -92,21 +101,26 @@ struct pvr_device_features {
 	u64 fbcdc;
 	u64 fbcdc_algorithm;
 	u64 fbcdc_architecture;
+	u64 host_security_version;
 	u64 isp_max_tiles_in_flight;
 	u64 isp_samples_per_pixel;
 	u64 layout_mars;
 	u64 max_partitions;
 	u64 meta;
 	u64 meta_coremem_size;
+	u64 mmu_version;
 	u64 num_clusters;
 	u64 num_isp_ipp_pipes;
 	u64 num_osids;
 	u64 num_raster_pipes;
+	u64 num_spus;
 	u64 phys_bus_width;
+	u64 ray_tracing_arch;
 	u64 simple_parameter_format_version;
 	u64 slc_banks;
 	u64 slc_cache_line_size_bits;
 	u64 slc_size_in_kilobytes;
+	u64 tdm_control_stream_format;
 	u64 tile_size_x;
 	u64 tile_size_y;
 	u64 usc_min_output_registers_per_pix;
@@ -131,8 +145,12 @@ struct pvr_device_quirks {
 	bool has_brn62269;
 	bool has_brn63142;
 	bool has_brn63553;
+	bool has_brn65104;
 	bool has_brn66011;
+	bool has_brn69700;
 	bool has_brn71242;
+	bool has_brn74812;
+	bool has_brn77899;
 };
 
 /*
@@ -155,6 +173,7 @@ void pvr_device_info_set_enhancements(struct pvr_device *pvr_dev, const u64 *bit
 				      u32 bitmask_len);
 int pvr_device_info_set_features(struct pvr_device *pvr_dev, const u64 *features, u32 features_size,
 				 u32 feature_param_size);
+int pvr_device_info_init_volcanic(struct pvr_device *pvr_dev);
 
 /*
  * Meta cores
