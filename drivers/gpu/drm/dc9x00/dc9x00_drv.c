@@ -25,6 +25,7 @@
 #include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
+#include <linux/atomic.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
@@ -35,6 +36,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
 
@@ -44,6 +46,14 @@
 static bool use_te_sync = true;
 module_param(use_te_sync, bool, 0644);
 MODULE_PARM_DESC(use_te_sync, "Synchronize DC9x00 Output0 command frames to panel TE (default: Y)");
+
+static int te_sel;
+module_param(te_sel, int, 0644);
+MODULE_PARM_DESC(te_sel, "DC9x00 OUTPUT0_TE_SEL value (default: 0 matching stock vs_drm)");
+
+static int cmd_opt;
+module_param(cmd_opt, int, 0644);
+MODULE_PARM_DESC(cmd_opt, "DC9x00 OUTPUT0_CMD_OPT value (default: 0 trigger mode)");
 
 struct dc9x00_drm {
 	struct drm_device drm;
@@ -61,6 +71,11 @@ struct dc9x00_drm {
 	spinlock_t event_lock;
 	struct drm_pending_vblank_event *pending_event;
 	struct timer_list commit_watchdog;
+	atomic64_t irq_frm_start;
+	atomic64_t irq_frm_done;
+	atomic64_t irq_underrun;
+	atomic64_t irq_te;
+	atomic64_t watchdog_fires;
 	bool active;
 };
 
@@ -89,8 +104,18 @@ static void dc9x00_commit_watchdog_fn(struct timer_list *t)
 {
 	struct dc9x00_drm *priv = timer_container_of(priv, t, commit_watchdog);
 
-	if (priv->pending_event)
-		dev_dbg_ratelimited(priv->dev, "DC9x00 frame commit watchdog completion\n");
+	if (priv->pending_event) {
+		atomic64_inc(&priv->watchdog_fires);
+		if (priv->active)
+			dev_warn_ratelimited(priv->dev,
+					     "DC9x00 frame watchdog (fe0=%#x be0=%#x be1=%#x coord=%#x req=%#x rev=%#x)\n",
+					     readl(priv->base + DC9X00_FE0_INTR_STATUS),
+					     readl(priv->base + DC9X00_BE_INTR_STATUS),
+					     readl(priv->base + DC9X00_BE_INTR_STATUS1),
+					     readl(priv->base + DC9X00_SH_OUTPUT0_CURRENT_COORD),
+					     readl(priv->base + DC9X00_BE_DEBUG_REQ_BURST_CNT),
+					     readl(priv->base + DC9X00_BE_DEBUG_REV_BURST_CNT));
+	}
 	dc9x00_complete_pending_event(priv);
 }
 
@@ -121,18 +146,44 @@ static irqreturn_t dc9x00_be_irq(int irq, void *data)
 	if (!st0 && !ov0 && !st1 && !ov1)
 		return IRQ_NONE;
 
-	if (st0 & DC9X00_BE_OUTPATH0_UNDERRUN)
+	if (st0 & DC9X00_BE_OUTPATH0_FRM_START)
+		atomic64_inc(&priv->irq_frm_start);
+
+	if (st0 & DC9X00_BE_OUTPATH0_FRM_DONE)
+		atomic64_inc(&priv->irq_frm_done);
+
+	if (st0 & DC9X00_BE_OUTPATH0_UNDERRUN) {
+		atomic64_inc(&priv->irq_underrun);
 		dev_warn_ratelimited(priv->dev, "DC9x00 Outpath0 underrun (st0=%#x)\n", st0);
+	}
 
-	if (st0 & DC9X00_BE_OUTPATH0_TE_RISING)
+	if (st0 & DC9X00_BE_OUTPATH0_TE_RISING) {
+		atomic64_inc(&priv->irq_te);
 		drm_crtc_handle_vblank(&priv->crtc);
+	}
 
-	if (st0 & (DC9X00_BE_OUTPATH0_FRM_DONE | DC9X00_BE_OUTPATH0_TE_RISING)) {
+	if ((st0 & DC9X00_BE_OUTPATH0_FRM_DONE) ||
+	    (use_te_sync && (st0 & DC9X00_BE_OUTPATH0_TE_RISING))) {
 		timer_delete(&priv->commit_watchdog);
 		dc9x00_complete_pending_event(priv);
 	}
 
 	return IRQ_HANDLED;
+}
+
+/**
+ * dc9x00_force_be_csr_read() - Flush BE CSR clock domain before clearing isolation.
+ * @priv: DC9x00 device context.
+ *
+ * Performing 30 dummy reads of POST_PROCESS_OUT prior to clearing
+ * CLOCK_DOMAIN_ISOLATION ensures the back-end CSR interface latches reliably.
+ */
+static void dc9x00_force_be_csr_read(struct dc9x00_drm *priv)
+{
+	unsigned int i;
+
+	for (i = 0; i < 30; i++)
+		readl(priv->base + DC9X00_POST_PROCESS_OUT);
 }
 
 static void dc9x00_sw_reset(struct dc9x00_drm *priv)
@@ -222,6 +273,7 @@ static void dc9x00_plane_atomic_update(struct drm_plane *plane,
 	writel((w & 0xffff) | ((h & 0xffff) << 16), priv->base + DC9X00_SH_LAYER0_OUT_ROI_SIZE);
 
 	cfg = DC9X00_LAYER_CFG_ENABLE |
+	      DC9X00_LAYER_CFG_BYPASS_HDR |
 	      FIELD_PREP(DC9X00_LAYER_CFG_SWIZZLE_MASK, DC9X00_LAYER_CFG_SWIZZLE_ARGB) |
 	      FIELD_PREP(DC9X00_LAYER_CFG_TILE_MASK, DC9X00_LAYER_CFG_TILE_LINEAR) |
 	      FIELD_PREP(DC9X00_LAYER_CFG_FORMAT_MASK, fmt);
@@ -294,7 +346,13 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 		 readl(priv->base + DC9X00_PRODUCT_ID), w, h);
 
 	dc9x00_sw_reset(priv);
+	dc9x00_force_be_csr_read(priv);
 	writel(0x0, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+	readl(priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
+
+	/* Output0 clock must be enabled before writing Output0 CSRs */
+	writel(1, priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
+	readl(priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
 
 	writel(readl(priv->base + DC9X00_BE_INTR_STATUS), priv->base + DC9X00_BE_INTR_STATUS);
 	writel(readl(priv->base + DC9X00_BE_INTR_STATUS1), priv->base + DC9X00_BE_INTR_STATUS1);
@@ -322,9 +380,9 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 	dc9x00_dsc_configure(priv->base, 0, &dsc_usage, dsc_cfg);
 
 	writel(DC9X00_OUTPUT0_WORK_MODE_CMD, priv->base + DC9X00_OUTPUT0_CTRL);
-	writel(0, priv->base + DC9X00_OUTPUT0_CMD_OPT);
+	writel(cmd_opt & 0x3, priv->base + DC9X00_OUTPUT0_CMD_OPT);
 	writel(0, priv->base + DC9X00_OUTPUT0_DE_SYNC_MODE);
-	writel(use_te_sync ? 1 : 0, priv->base + DC9X00_OUTPUT0_TE_SEL);
+	writel(te_sel & 0x1, priv->base + DC9X00_OUTPUT0_TE_SEL);
 	writel(0, priv->base + DC9X00_OUTPUT0_TE_POLARITY);
 
 	writel(0, priv->base + DC9X00_OUTPUT0_TIMING_HSYNC);
@@ -348,7 +406,6 @@ static void dc9x00_crtc_atomic_enable(struct drm_crtc *crtc,
 	       priv->base + DC9X00_SH_OUTPUT0_SCANOUT_COUNTER);
 	writel(0, priv->base + DC9X00_OUTPUT0_SCANOUT_DELAY_COUNTER);
 	writel(0, priv->base + DC9X00_SH_OUTPUT0_URGENT_VALUE);
-	writel(1, priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
 
 	priv->active = true;
 	drm_crtc_vblank_on(crtc);
@@ -447,6 +504,32 @@ static int dc9x00_dumb_create(struct drm_file *file_priv, struct drm_device *dev
 	return drm_gem_dma_dumb_create_internal(file_priv, dev, args);
 }
 
+static void dc9x00_atomic_commit_tail(struct drm_atomic_commit *state)
+{
+	struct drm_device *dev = state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(dev, state);
+
+	/*
+	 * Enable the DSI2H/CDPHY/panel chain before resetting BE and bringing
+	 * up DC9x00 Output0, then commit planes after priv->active is true.
+	 */
+	drm_atomic_helper_commit_encoder_bridge_pre_enable(dev, state);
+	drm_atomic_helper_commit_encoder_bridge_enable(dev, state);
+	drm_atomic_helper_commit_crtc_enable(dev, state);
+
+	drm_atomic_helper_commit_planes(dev, state, DRM_PLANE_COMMIT_ACTIVE_ONLY);
+
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_wait_for_vblanks(dev, state);
+	drm_atomic_helper_cleanup_planes(dev, state);
+}
+
+static const struct drm_mode_config_helper_funcs dc9x00_mode_config_helper_funcs = {
+	.atomic_commit_tail = dc9x00_atomic_commit_tail,
+};
+
 static const struct drm_mode_config_funcs dc9x00_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create,
 	.atomic_check = drm_atomic_helper_check,
@@ -490,6 +573,126 @@ static int dc9x00_setup_irqs(struct platform_device *pdev, struct dc9x00_drm *pr
 
 	return 0;
 }
+
+#define DC9X00_DPU_SMMU_BASE	0x0ed80000
+#define DC9X00_DSI2H0_BASE	0x0efd8000
+
+struct dc9x00_reg_dump_entry {
+	const char *name;
+	u32 off;
+};
+
+static void dc9x00_dump_reg_table(struct seq_file *m, void __iomem *base,
+				  const struct dc9x00_reg_dump_entry *regs,
+				  size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		seq_printf(m, "%-19s = %#010x\n", regs[i].name,
+			   readl(base + regs[i].off));
+}
+
+static int dc9x00_display_regs_show(struct seq_file *m, void *data)
+{
+	static const struct dc9x00_reg_dump_entry dc_regs[] = {
+		{ "FE0_INTR_STATUS", DC9X00_FE0_INTR_STATUS },
+		{ "SH_LAYER0_ADDR", DC9X00_SH_LAYER0_ADDR },
+		{ "SH_LAYER0_HIGH", DC9X00_SH_LAYER0_HIGH_ADDR },
+		{ "SH_LAYER0_STRIDE", DC9X00_SH_LAYER0_STRIDE },
+		{ "SH_LAYER0_SIZE", DC9X00_SH_LAYER0_SIZE },
+		{ "SH_LAYER0_CONFIG", DC9X00_SH_LAYER0_CONFIG },
+		{ "SH_LAYER0_DMA_MODE", DC9X00_SH_LAYER0_DMA_MODE },
+		{ "BE_REG_READ_SRC", DC9X00_BE_REG_READ_SRC },
+		{ "BE_INTR_ENABLE", DC9X00_BE_INTR_ENABLE },
+		{ "BE_INTR_STATUS", DC9X00_BE_INTR_STATUS },
+		{ "BE_INTR_OVERFLOW", DC9X00_BE_INTR_OVERFLOW },
+		{ "BE_INTR_STATUS1", DC9X00_BE_INTR_STATUS1 },
+		{ "BE_REQ_BURST_CNT", DC9X00_BE_DEBUG_REQ_BURST_CNT },
+		{ "BE_REV_BURST_CNT", DC9X00_BE_DEBUG_REV_BURST_CNT },
+		{ "CLK_DOMAIN_ISO", DC9X00_CLOCK_DOMAIN_ISOLATION },
+		{ "SH_PANEL0_CONFIG", DC9X00_SH_PANEL0_CONFIG },
+		{ "SH_PANEL0_SPLIT", DC9X00_SH_PANEL0_SPLIT_CONFIG },
+		{ "SH_PANEL0_WIDTH", DC9X00_SH_PANEL0_WIDTH },
+		{ "SH_PANEL0_HEIGHT", DC9X00_SH_PANEL0_HEIGHT },
+		{ "DSC_ENC_MAIN_CONF", DC9X00_PANEL0_DSC_BASE },
+		{ "DSC_HS0_DF_CTRL", DC9X00_PANEL0_DSC_BASE + 0x100 },
+		{ "DSC_HS0_GEN_STATUS", DC9X00_PANEL0_DSC_BASE + 0x104 },
+		{ "OUTPUT0_START", DC9X00_OUTPUT0_START },
+		{ "OUTPUT0_SW_CONFIG", DC9X00_OUTPUT0_SW_CONFIG },
+		{ "OUTPUT0_CTRL", DC9X00_OUTPUT0_CTRL },
+		{ "OUTPUT0_CMD_OPT", DC9X00_OUTPUT0_CMD_OPT },
+		{ "OUTPUT0_DE_SYNC", DC9X00_OUTPUT0_DE_SYNC_MODE },
+		{ "OUTPUT0_TE_SEL", DC9X00_OUTPUT0_TE_SEL },
+		{ "SH_OUTPUT0_IPI_FMT", DC9X00_SH_OUTPUT0_IPI_FORMAT },
+		{ "SH_OUTPUT0_IPI_DEP", DC9X00_SH_OUTPUT0_IPI_DEPTH },
+		{ "SH_OUTPUT0_COORD", DC9X00_SH_OUTPUT0_CURRENT_COORD },
+		{ "OUTPUT0_CONFIG", DC9X00_OUTPUT0_CONFIG },
+		{ "SH_OUTPUT0_SYS_CNT", DC9X00_SH_OUTPUT0_SYSTEM_COUNTER },
+		{ "SH_OUTPUT0_SCN_CNT", DC9X00_SH_OUTPUT0_SCANOUT_COUNTER },
+		{ "SH_OUTPUT0_CLK_EN", DC9X00_SH_OUTPUT0_CLK_EN },
+		{ "POST_PROCESS_OUT", DC9X00_POST_PROCESS_OUT },
+	};
+	static const struct dc9x00_reg_dump_entry smmu_table[] = {
+		{ "DPU_SMMU_IDR0", 0x00 },
+		{ "DPU_SMMU_IDR1", 0x04 },
+		{ "DPU_SMMU_CR0", 0x20 },
+		{ "DPU_SMMU_CR0ACK", 0x24 },
+		{ "DPU_SMMU_GBPA", 0x44 },
+		{ "DPU_SMMU_GERROR", 0x60 },
+	};
+	static const struct dc9x00_reg_dump_entry dsi2h_table[] = {
+		{ "DSI2H_PWR_UP", DSI2H_PWR_UP },
+		{ "DSI2H_MODE_CTRL", DSI2H_MODE_CTRL },
+		{ "DSI2H_MODE_STATUS", DSI2H_MODE_STATUS },
+		{ "DSI2H_CORE_STATUS", DSI2H_CORE_STATUS },
+		{ "DSI2H_PHY_STATUS", 0x108 },
+		{ "DSI2H_IPI_COLOR", 0x300 },
+		{ "DSI2H_IPI_PIX_PKT", 0x344 },
+		{ "DSI2H_INT_ST_PHY", 0x400 },
+		{ "DSI2H_INT_ST_TO", 0x410 },
+		{ "DSI2H_INT_ST_IPI", 0x430 },
+	};
+	struct dc9x00_drm *priv = m->private;
+	void __iomem *smmu_regs;
+	void __iomem *dsi2h_regs;
+	int ret;
+
+	seq_printf(m, "active=%d use_te_sync=%d te_sel=%d cmd_opt=%d\n",
+		   priv->active, use_te_sync, te_sel, cmd_opt);
+	seq_printf(m, "irqs: frm_start=%lld frm_done=%lld underrun=%lld te=%lld watchdog=%lld\n",
+		   atomic64_read(&priv->irq_frm_start),
+		   atomic64_read(&priv->irq_frm_done),
+		   atomic64_read(&priv->irq_underrun),
+		   atomic64_read(&priv->irq_te),
+		   atomic64_read(&priv->watchdog_fires));
+
+	ret = pm_runtime_get_if_active(priv->dev);
+	if (ret <= 0) {
+		seq_puts(m, "power=suspended\n");
+		return 0;
+	}
+
+	dc9x00_dump_reg_table(m, priv->base, dc_regs, ARRAY_SIZE(dc_regs));
+
+	smmu_regs = ioremap(DC9X00_DPU_SMMU_BASE, 0x100);
+	if (smmu_regs) {
+		dc9x00_dump_reg_table(m, smmu_regs, smmu_table,
+				      ARRAY_SIZE(smmu_table));
+		iounmap(smmu_regs);
+	}
+
+	dsi2h_regs = ioremap(DC9X00_DSI2H0_BASE, 0x500);
+	if (dsi2h_regs) {
+		dc9x00_dump_reg_table(m, dsi2h_regs, dsi2h_table,
+				      ARRAY_SIZE(dsi2h_table));
+		iounmap(dsi2h_regs);
+	}
+
+	pm_runtime_put(priv->dev);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(dc9x00_display_regs);
 
 static int dc9x00_probe(struct platform_device *pdev)
 {
@@ -551,6 +754,7 @@ static int dc9x00_probe(struct platform_device *pdev)
 	drm->mode_config.min_height = 16;
 	drm->mode_config.max_height = 4096;
 	drm->mode_config.funcs = &dc9x00_mode_config_funcs;
+	drm->mode_config.helper_private = &dc9x00_mode_config_helper_funcs;
 
 	ret = drm_universal_plane_init(drm, &priv->primary, 1, &dc9x00_plane_funcs,
 				       formats, ARRAY_SIZE(formats), NULL,
@@ -603,6 +807,8 @@ static int dc9x00_probe(struct platform_device *pdev)
 	drm_client_setup(drm, NULL);
 
 	priv->debug_dir = debugfs_create_dir("dc9x00", NULL);
+	debugfs_create_file("display_regs", 0444, priv->debug_dir, priv,
+			    &dc9x00_display_regs_fops);
 	dc9x00_gpu_probe_debugfs_init(priv->debug_dir);
 
 	return 0;
