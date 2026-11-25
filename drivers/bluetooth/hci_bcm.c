@@ -1656,6 +1656,7 @@ static struct bcm_device_data bcm4383_device_data = {
 };
 
 static struct bcm_device_data bcm4390_device_data = {
+	.no_early_set_baudrate = true,
 	.power_on_delay_ms = 30,
 };
 
