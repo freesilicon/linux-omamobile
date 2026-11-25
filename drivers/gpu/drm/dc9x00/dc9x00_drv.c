@@ -6,6 +6,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_crtc.h>
@@ -370,9 +371,6 @@ static void dc9x00_crtc_atomic_disable(struct drm_crtc *crtc,
 	writel(0, priv->base + DC9X00_OUTPUT0_SW_CONFIG);
 	writel(0, priv->base + DC9X00_OUTPUT0_START);
 	writel(0, priv->base + DC9X00_SH_OUTPUT0_CLK_EN);
-	writel(0, priv->base + DC9X00_SH_LINK_NODE0_RESOURCE);
-	writel(1, priv->base + DC9X00_LINK_NODE0_SW_DONE);
-	writel(1, priv->base + DC9X00_LINK_NODE0_START);
 	writel(0xf, priv->base + DC9X00_CLOCK_DOMAIN_ISOLATION);
 
 	pm_runtime_put_sync(priv->dev);
@@ -383,7 +381,7 @@ static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
 {
 	struct dc9x00_drm *priv = to_dc9x00(crtc->dev);
 	struct drm_crtc_state *cstate = drm_atomic_get_new_crtc_state(state, crtc);
-	u32 link_res, mux;
+	u32 mux;
 	unsigned long flags;
 
 	if (!priv->active) {
@@ -399,15 +397,6 @@ static void dc9x00_crtc_atomic_flush(struct drm_crtc *crtc,
 	writel(DC9X00_LAYER0_REG_SWITCH, priv->base + DC9X00_LAYER0_CONFIG);
 	writel(DC9X00_PANEL0_REG_SWITCH, priv->base + DC9X00_PANEL0_CONFIG);
 	writel(DC9X00_OUTPUT0_REG_SWITCH, priv->base + DC9X00_OUTPUT0_CONFIG);
-
-	writel(DC9X00_XBAR_PATH_VALID, priv->base + DC9X00_OUTPUT0_CROSSBAR4_TO4);
-
-	link_res = DC9X00_LINK_LAYER0 | DC9X00_LINK_FE0 | DC9X00_LINK_POST0 |
-		   DC9X00_LINK_DSC0 | DC9X00_LINK_DBUFFER0 | DC9X00_LINK_TM0;
-	writel(link_res, priv->base + DC9X00_SH_LINK_NODE0_RESOURCE);
-	writel(0x7, priv->base + DC9X00_LINK_NODE0_CONFIG);
-	writel(0x1, priv->base + DC9X00_LINK_NODE0_SW_DONE);
-	writel(0x1, priv->base + DC9X00_LINK_NODE0_START);
 
 	mux = readl(priv->base + DC9X00_POST_PROCESS_OUT);
 	mux &= ~DC9X00_POST_MUX_OUT0_MASK;
@@ -569,6 +558,11 @@ static int dc9x00_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_pm;
 	drm_plane_helper_add(&priv->primary, &dc9x00_plane_helper_funcs);
+
+	ret = drm_plane_create_blend_mode_property(&priv->primary,
+						   BIT(DRM_MODE_BLEND_PIXEL_NONE));
+	if (ret)
+		goto err_pm;
 
 	ret = drm_crtc_init_with_planes(drm, &priv->crtc, &priv->primary, NULL,
 					&dc9x00_crtc_funcs, "dc9x00-crtc0");

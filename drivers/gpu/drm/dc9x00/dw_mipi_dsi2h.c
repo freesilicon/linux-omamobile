@@ -62,6 +62,20 @@ static inline struct dw_dsi2h *bridge_to_dsi2h(struct drm_bridge *bridge)
 	return container_of(bridge, struct dw_dsi2h, bridge);
 }
 
+static void dw_dsi2h_dump_diag(struct dw_dsi2h *ctx, const char *ctx_str)
+{
+	dev_err(ctx->dev,
+		"DSI2H %s: core=%#x mode=%#x phy=%#x int_main=%#x int_phy=%#x int_to=%#x int_cri=%#x\n",
+		ctx_str,
+		readl(ctx->regs + DSI2H_CORE_STATUS),
+		readl(ctx->regs + DSI2H_MODE_STATUS),
+		readl(ctx->regs + DSI2H_PHY_STATUS),
+		readl(ctx->regs + DSI2H_INT_ST_MAIN),
+		readl(ctx->regs + DSI2H_INT_ST_PHY),
+		readl(ctx->regs + DSI2H_INT_ST_TO),
+		readl(ctx->regs + DSI2H_INT_ST_CRI));
+}
+
 static int dw_dsi2h_set_op_mode(struct dw_dsi2h *ctx, u32 mode)
 {
 	u32 sts;
@@ -71,18 +85,24 @@ static int dw_dsi2h_set_op_mode(struct dw_dsi2h *ctx, u32 mode)
 	ret = readl_poll_timeout(ctx->regs + DSI2H_MODE_STATUS, sts,
 				 (sts & 0x7) == mode, DSI2H_POLL_INTERVAL_US,
 				 DSI2H_POLL_TIMEOUT_US);
-	if (ret)
+	if (ret) {
 		dev_err(ctx->dev, "DSI2H mode %u timeout (status=%#x)\n", mode, sts);
+		dw_dsi2h_dump_diag(ctx, "mode_timeout");
+	}
 	return ret;
 }
 
 static int dw_dsi2h_wait_cri_idle(struct dw_dsi2h *ctx)
 {
 	u32 sts;
+	int ret;
 
-	return readl_poll_timeout(ctx->regs + DSI2H_CORE_STATUS, sts,
-				  !(sts & DSI2H_CORE_CRI_BUSY),
-				  DSI2H_POLL_INTERVAL_US, DSI2H_POLL_TIMEOUT_US);
+	ret = readl_poll_timeout(ctx->regs + DSI2H_CORE_STATUS, sts,
+				 !(sts & DSI2H_CORE_CRI_BUSY),
+				 DSI2H_POLL_INTERVAL_US, DSI2H_POLL_TIMEOUT_US);
+	if (ret)
+		dw_dsi2h_dump_diag(ctx, "cri_idle_timeout");
+	return ret;
 }
 
 static ssize_t dw_dsi2h_cri_read(struct dw_dsi2h *ctx, const struct mipi_dsi_msg *msg)
@@ -100,8 +120,10 @@ static ssize_t dw_dsi2h_cri_read(struct dw_dsi2h *ctx, const struct mipi_dsi_msg
 	ret = readl_poll_timeout(ctx->regs + DSI2H_CORE_STATUS, sts,
 				 sts & DSI2H_CORE_CRI_RD_DATA_AVAIL,
 				 DSI2H_POLL_INTERVAL_US, DSI2H_POLL_TIMEOUT_US);
-	if (ret)
+	if (ret) {
+		dw_dsi2h_dump_diag(ctx, "cri_rx_timeout");
 		return ret;
+	}
 
 	while (readl(ctx->regs + DSI2H_CORE_STATUS) & DSI2H_CORE_CRI_RD_DATA_AVAIL) {
 		hdr = readl(ctx->regs + DSI2H_CRI_RX_HDR);
@@ -271,6 +293,8 @@ static void dw_dsi2h_program_regs(struct dw_dsi2h *ctx)
 	u32 color_cfg;
 
 	writel(0, ctx->regs + DSI2H_PWR_UP);
+	writel(DSI2H_MODE_IDLE, ctx->regs + DSI2H_MODE_CTRL);
+	writel(0, ctx->regs + DSI2H_CRI_TX_CTRL);
 
 	writel(0x0, ctx->regs + DSI2H_TO_HSTX_CFG);
 	writel(0xffff, ctx->regs + DSI2H_TO_HSTXRDY_CFG);
@@ -301,7 +325,8 @@ static void dw_dsi2h_program_regs(struct dw_dsi2h *ctx)
 	       ctx->regs + DSI2H_DSI_GENERAL_CFG);
 	writel(0, ctx->regs + DSI2H_DSI_VCID_CFG);
 	writel(0, ctx->regs + DSI2H_DSI_SCRAMBLING_CFG);
-	writel(0, ctx->regs + DSI2H_DSI_VID_TX_CFG);
+	writel(0x2 | BIT(4) | BIT(5) | BIT(12) | BIT(13) | BIT(14),
+	       ctx->regs + DSI2H_DSI_VID_TX_CFG);
 	writel(1000, ctx->regs + DSI2H_DSI_MAX_RPS_CFG);
 	writel(1, ctx->regs + DSI2H_DSI_TEAR_EFFECT_CFG);
 
@@ -354,6 +379,7 @@ static void dw_dsi2h_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 {
 	struct dw_dsi2h *ctx = bridge_to_dsi2h(bridge);
 	union phy_configure_opts opts = {};
+	u32 phy_sts = 0;
 	int ret;
 
 	mutex_lock(&ctx->lock);
@@ -363,6 +389,10 @@ static void dw_dsi2h_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 		mutex_unlock(&ctx->lock);
 		return;
 	}
+
+	dev_info(ctx->dev, "DSI2H CORE_ID=%#x VERSION=%#x\n",
+		 readl(ctx->regs + DSI2H_CORE_ID),
+		 readl(ctx->regs + DSI2H_VERSION));
 
 	dw_dsi2h_program_regs(ctx);
 
@@ -388,7 +418,12 @@ static void dw_dsi2h_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 		goto err_phy_exit;
 	}
 
-	dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_CMD);
+	if (readl_poll_timeout(ctx->regs + DSI2H_PHY_STATUS, phy_sts,
+			       (phy_sts & DSI2H_PHY_STOPSTATE_ALL) == DSI2H_PHY_STOPSTATE_ALL,
+			       DSI2H_POLL_INTERVAL_US, 10000))
+		dev_warn(ctx->dev, "DSI2H PHY stopstate incomplete (phy=%#x)\n", phy_sts);
+
+	dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_DATA_STREAM);
 	ctx->host_ready = true;
 	mutex_unlock(&ctx->lock);
 	return;
@@ -406,19 +441,9 @@ static void dw_dsi2h_bridge_atomic_enable(struct drm_bridge *bridge,
 	struct dw_dsi2h *ctx = bridge_to_dsi2h(bridge);
 
 	mutex_lock(&ctx->lock);
-	if (ctx->host_ready)
+	if (ctx->host_ready &&
+	    (readl(ctx->regs + DSI2H_MODE_STATUS) & 0x7) != DSI2H_MODE_DATA_STREAM)
 		dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_DATA_STREAM);
-	mutex_unlock(&ctx->lock);
-}
-
-static void dw_dsi2h_bridge_atomic_disable(struct drm_bridge *bridge,
-					   struct drm_atomic_commit *state)
-{
-	struct dw_dsi2h *ctx = bridge_to_dsi2h(bridge);
-
-	mutex_lock(&ctx->lock);
-	if (ctx->host_ready)
-		dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_CMD);
 	mutex_unlock(&ctx->lock);
 }
 
@@ -443,7 +468,6 @@ static const struct drm_bridge_funcs dw_dsi2h_bridge_funcs = {
 	.mode_set = dw_dsi2h_bridge_mode_set,
 	.atomic_pre_enable = dw_dsi2h_bridge_atomic_pre_enable,
 	.atomic_enable = dw_dsi2h_bridge_atomic_enable,
-	.atomic_disable = dw_dsi2h_bridge_atomic_disable,
 	.atomic_post_disable = dw_dsi2h_bridge_atomic_post_disable,
 	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,

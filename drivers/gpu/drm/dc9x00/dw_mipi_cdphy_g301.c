@@ -333,13 +333,13 @@ static void cdphy_program_pll(struct dw_cdphy_g301 *ctx)
 		  FIELD_PREP(GENMASK(11, 0), p->mint) |
 		  FIELD_PREP(GENMASK(23, 12), p->m) |
 		  FIELD_PREP(GENMASK(29, 24), p->n) |
-		  BIT(30) |
 		  (p->fracn_en ? BIT(31) : 0));
 
 	cdphy_rmw(a + CDPHY_PLL_CFG4, GENMASK(15, 0), 1);
 	cdphy_rmw(a + CDPHY_PLL_CFG5, GENMASK(20, 0), 0);
 	cdphy_rmw(a + CDPHY_PLL_CFG6, GENMASK(22, 0), 0);
 	cdphy_rmw(a + CDPHY_PLL_CFG7, GENMASK(31, 0), p->frac_quot & 0xffff);
+	cdphy_rmw(a + CDPHY_PLL_CFG3, BIT(30), BIT(30));
 
 	cdphy_rmw(a + CDPHY_PLL_CP, GENMASK(26, 0),
 		  FIELD_PREP(GENMASK(2, 0), p->cp->vco_0_2) |
