@@ -824,6 +824,7 @@ static u32 brcmf_chip_sysmem_ramsize(struct brcmf_core_priv *sysmem)
 
 	switch (sysmem->chip->pub.chip) {
 	case BRCM_CC_4389_CHIP_ID:
+	case BRCM_CC_4390_CHIP_ID:
 	case BRCM_CC_4398_CHIP_ID:
 		/* Count the RAM banks only, and skip the ROM banks in
 		 * front of them.
@@ -930,6 +931,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 		return 0x6e0000;
 	case BRCM_CC_4387_CHIP_ID:
 		return 0x740000;
+	case BRCM_CC_4390_CHIP_ID:
 	case BRCM_CC_4398_CHIP_ID:
 		return 0x2a0000;
 	default:
@@ -961,6 +963,8 @@ int brcmf_chip_get_raminfo(struct brcmf_chip *pub)
 			mem_core = container_of(mem, struct brcmf_core_priv,
 						pub);
 			ci->pub.ramsize = brcmf_chip_sysmem_ramsize(mem_core);
+			if (ci->pub.chip == BRCM_CC_4390_CHIP_ID)
+				ci->pub.ramsize = 3276800;
 			ci->pub.rambase = brcmf_chip_tcm_rambase(ci);
 			if (ci->pub.rambase == INVALID_RAMBASE) {
 				brcmf_err("RAM base not provided with ARM CA7 core\n");
