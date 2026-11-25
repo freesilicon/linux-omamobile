@@ -564,7 +564,7 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 	}
 
 	/* Disable IRQs for the duration of the reset. */
-	if (hard_reset) {
+	if (hard_reset || pvr_dev->laguna) {
 		disable_irq(pvr_dev->irq);
 	} else {
 		/*
@@ -591,12 +591,22 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 				if (err)
 					goto err_device_lost;
 
+				if (pvr_dev->laguna)
+					pvr_laguna_clear_hwr_flags(pvr_dev);
+
 				err = pvr_power_device_resume(from_pvr_device(pvr_dev)->dev);
 				WRITE_ONCE(pvr_dev->fw_dev.initialised, true);
 				if (err)
 					goto err_device_lost;
 			} else if (pvr_dev->laguna) {
+				err = pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
 				pvr_laguna_clear_hwr_flags(pvr_dev);
+				if (err)
+					goto err_device_lost;
+
+				err = pvr_dev->device_data->pwr_ops->power_on(pvr_dev);
+				if (err)
+					goto err_device_lost;
 			} else {
 				/* Clear the FW faulted flags. */
 				pvr_dev->fw_dev.fwif_sysdata->hwr_state_flags &=
@@ -604,9 +614,10 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 					  ROGUE_FWIF_HWR_RESTART_REQUESTED);
 			}
 
-			pvr_fw_irq_clear(pvr_dev);
-
-			err = pvr_power_fw_enable(pvr_dev, false);
+			if (!err) {
+				pvr_fw_irq_clear(pvr_dev);
+				err = pvr_power_fw_enable(pvr_dev, false);
+			}
 		}
 
 		if (err && hard_reset)

@@ -50,6 +50,9 @@ struct pvr_cccb {
 
 	/** @wrap_mask: CCCB wrap mask. */
 	u32 wrap_mask;
+
+	/** @laguna: True when targeting Laguna DDK 25.3 cCCB command encoding. */
+	bool laguna;
 };
 
 int pvr_cccb_init(struct pvr_device *pvr_dev, struct pvr_cccb *cccb,

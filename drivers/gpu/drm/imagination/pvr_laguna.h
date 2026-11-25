@@ -19,7 +19,9 @@
 
 #include <linux/completion.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 struct clk;
 struct firmware;
@@ -125,6 +127,7 @@ struct pvr_laguna_tz {
  * struct pvr_laguna_data - Tensor G5 Laguna platform state for PowerVR Volcanic
  */
 struct pvr_laguna_data {
+	struct pvr_device *pvr_dev;
 	void __iomem *pfsm;
 	void __iomem *req_pbha_lut;
 	void __iomem *ra_lut[PVR_LAGUNA_RA_LUT_BANKS];
@@ -209,6 +212,11 @@ struct pvr_laguna_data {
 	struct pvr_laguna_fwif_fwccb_cmd *fwccb;
 	u32 *power_sync;
 
+	struct work_struct restart_work;
+	spinlock_t restart_lock; /* protects restart burst tracking */
+	unsigned long restart_window_jiffies;
+	u32 restart_burst_count;
+
 	struct pvr_laguna_tz tz;
 };
 
@@ -231,8 +239,11 @@ phys_addr_t pvr_laguna_fw_shared_paddr(struct pvr_device *pvr_dev, u32 fw_offset
 bool pvr_laguna_fw_ready(const struct pvr_device *pvr_dev);
 bool pvr_laguna_kccb_ready(const struct pvr_device *pvr_dev);
 bool pvr_laguna_power_is_idle(struct pvr_device *pvr_dev);
+bool pvr_laguna_needs_reset(const struct pvr_device *pvr_dev);
 void pvr_laguna_clear_hwr_flags(struct pvr_device *pvr_dev);
+void pvr_laguna_schedule_restart(struct pvr_device *pvr_dev);
 void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason);
+u32 pvr_laguna_translate_cccb_cmd_type(u32 rogue_cmd_type);
 u32 pvr_laguna_kccb_used_slot_count_locked(struct pvr_device *pvr_dev);
 void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 					       struct rogue_fwif_kccb_cmd *cmd,

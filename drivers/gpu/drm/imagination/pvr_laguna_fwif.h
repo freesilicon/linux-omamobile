@@ -55,16 +55,37 @@
 #define PVR_LAGUNA_FWCCB_CMD_REQUEST_GPU_RESTART	(109U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 #define PVR_LAGUNA_FWCCB_CMD_FW_PAGEFAULT		(112U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
 
+/* DDK 25.3 Client CCB (cCCB) command types (DumpCCB / RGXCmdHelperAcquireCmdCCB). */
+#define PVR_LAGUNA_CCB_CMD_DM_BIT		BIT(15)
+#define PVR_LAGUNA_CCB_CMD_TYPE_TA		(201U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_TQ_3D		(202U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_3D		(203U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_3D_PR		(204U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_CDM		(205U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_TQ_TDM		(206U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_NULL		(210U | PVR_LAGUNA_CMD_MAGIC_SHIFTED | \
+						 PVR_LAGUNA_CCB_CMD_DM_BIT)
+#define PVR_LAGUNA_CCB_CMD_TYPE_FENCE		(212U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_CCB_CMD_TYPE_UPDATE		(213U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_CCB_CMD_TYPE_RMW_UPDATE	(214U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_CCB_CMD_TYPE_FENCE_PR	(215U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+#define PVR_LAGUNA_CCB_CMD_TYPE_PADDING		(221U | PVR_LAGUNA_CMD_MAGIC_SHIFTED)
+
 /* DDK 25.3 OS-FW connection states in RGXFWIF_CONNECTION_CTL. */
 #define PVR_LAGUNA_FW_CONN_OS_OFFLINE		0U
 #define PVR_LAGUNA_FW_CONN_OS_READY		1U
 #define PVR_LAGUNA_FW_CONN_OS_ACTIVE		2U
 
-/* DDK 25.3 Volcanic MMU cache invalidation flags (no Rogue TLB bit). */
+/* DDK 25.3 Volcanic MMU cache invalidation flags (_PrepareAndSubmitCacheCommand). */
 #define PVR_LAGUNA_MMUCACHE_FLAGS_PT		0x1U
 #define PVR_LAGUNA_MMUCACHE_FLAGS_PD		0x2U
 #define PVR_LAGUNA_MMUCACHE_FLAGS_PC		0x4U
-#define PVR_LAGUNA_MMUCACHE_FLAGS_CTX_ALL	0x800U
 #define PVR_LAGUNA_MMUCACHE_FLAGS_INTERRUPT	0x4000000U
 
 /* DDK 25.3 Volcanic Data Master IDs (matches RGXFWIF_DM). */
@@ -160,6 +181,14 @@ static_assert(offsetof(struct pvr_laguna_fwif_osinit, comp_checks) == 0x28);
 static_assert(offsetof(struct pvr_laguna_fwif_osinit, hwperf_data) == 0x70);
 static_assert(offsetof(struct pvr_laguna_fwif_osinit, hwperf_ctl) == 0x7c);
 
+struct pvr_laguna_fwif_dma_addr {
+	u64 dev_addr;
+	u32 fw_addr;
+	u32 pad_0c;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_dma_addr) == 16);
+static_assert(offsetof(struct pvr_laguna_fwif_dma_addr, fw_addr) == 8);
+
 struct pvr_laguna_fwif_sysinit {
 	u64 fault_phys_addr;
 	u64 pds_exec_base;
@@ -193,7 +222,7 @@ struct pvr_laguna_fwif_sysinit {
 	u8 remap_tables[132];
 	u32 marker_val;
 	u32 firmware_started_timestamp;
-	u8 coremem_data_store[16];
+	struct pvr_laguna_fwif_dma_addr coremem_data_store;
 	u32 firmware_perf;
 	u32 pad_164;
 	u8 opp_info[384];
@@ -210,6 +239,7 @@ static_assert(offsetof(struct pvr_laguna_fwif_sysinit, fw_sys_data) == 0xa0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, align_checks) == 0xb0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, firmware_started) == 0xc0);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, marker_val) == 0x148);
+static_assert(offsetof(struct pvr_laguna_fwif_sysinit, coremem_data_store) == 0x150);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, firmware_perf) == 0x160);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, opp_info) == 0x168);
 static_assert(offsetof(struct pvr_laguna_fwif_sysinit, gpio_validation_mode) == 0x2ec);
@@ -228,19 +258,41 @@ static_assert(offsetof(struct pvr_laguna_fwif_osdata, interrupt_count) == 0x230)
 static_assert(offsetof(struct pvr_laguna_fwif_osdata, kccb_cmds_executed) == 0x234);
 static_assert(offsetof(struct pvr_laguna_fwif_osdata, power_sync) == 0x238);
 
+#define PVR_LAGUNA_FWFAULTINFO_MAX		8U
+
+struct pvr_laguna_fwif_fault_info {
+	u64 cr_timer;
+	u64 os_timer;
+	u64 data;
+	char assert_info[200];
+	char assert_path[200];
+	u32 line_num;
+	u32 pad_1ac;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_fault_info) == 0x1b0);
+static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_info) == 0x18);
+static_assert(offsetof(struct pvr_laguna_fwif_fault_info, assert_path) == 0xe0);
+static_assert(offsetof(struct pvr_laguna_fwif_fault_info, line_num) == 0x1a8);
+
 struct pvr_laguna_fwif_sysdata {
 	u32 config_flags;
 	u32 config_flags_ext;
 	u32 pow_state;
-	u8 reserved_0c[0xda4];
+	u8 reserved_0c[0x24];
+	struct pvr_laguna_fwif_fault_info fault_info[PVR_LAGUNA_FWFAULTINFO_MAX];
 	u32 fw_faults;
-	u8 reserved_db4[0x34];
+	u32 cr_poll_addr;
+	u32 cr_poll_mask;
+	u8 reserved_dbc[0x2c];
 	u32 hwr_state_flags;
 	u8 reserved_dec[0x144];
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_sysdata) == 3888);
 static_assert(offsetof(struct pvr_laguna_fwif_sysdata, pow_state) == 0x08);
+static_assert(offsetof(struct pvr_laguna_fwif_sysdata, fault_info) == 0x30);
 static_assert(offsetof(struct pvr_laguna_fwif_sysdata, fw_faults) == 0xdb0);
+static_assert(offsetof(struct pvr_laguna_fwif_sysdata, cr_poll_addr) == 0xdb4);
+static_assert(offsetof(struct pvr_laguna_fwif_sysdata, cr_poll_mask) == 0xdb8);
 static_assert(offsetof(struct pvr_laguna_fwif_sysdata, hwr_state_flags) == 0xde8);
 
 struct pvr_laguna_fwif_runtime_cfg {
@@ -279,8 +331,7 @@ struct pvr_laguna_fwif_hwrinfobuf {
 	u32 dm_lockup_cnt[PVR_LAGUNA_DM_MAX];
 	u32 dm_overrun_cnt[PVR_LAGUNA_DM_MAX];
 	u32 dm_rejected_cnt[PVR_LAGUNA_DM_MAX];
-	u32 write_index;
-	u8 reserved_980[0x20];
+	u32 write_index[PVR_LAGUNA_DM_MAX];
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_hwrinfobuf) == PVR_LAGUNA_FWIF_HWRINFOBUF_SIZE);
 static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_lockup_cnt) ==
@@ -478,8 +529,7 @@ static_assert(sizeof(struct pvr_laguna_fwif_cdm_regs_cswitch) == 96);
 struct pvr_laguna_fwif_fwcommoncontext {
 	u32 cccb_ctl_fw_addr;
 	u32 cccb_fw_addr;
-	u64 ccb_meta_dma_addr;
-	u64 reserved_10;
+	struct pvr_laguna_fwif_dma_addr ccb_meta_dma_addr;
 	u32 context_state_fw_addr;
 	u32 fw_com_ctx_flags;
 	s32 priority;

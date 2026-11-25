@@ -6,6 +6,7 @@
 #include "pvr_device.h"
 #include "pvr_gem.h"
 #include "pvr_hwrt.h"
+#include "pvr_laguna.h"
 
 #include <linux/compiler.h>
 #include <linux/delay.h>
@@ -52,6 +53,7 @@ pvr_cccb_init(struct pvr_device *pvr_dev, struct pvr_cccb *pvr_cccb,
 	pvr_cccb->size = size;
 	pvr_cccb->write_offset = 0;
 	pvr_cccb->wrap_mask = size - 1;
+	pvr_cccb->laguna = !!pvr_dev->laguna;
 
 	/*
 	 * Map CCCB and control structure as uncached, so we don't have to flush
@@ -151,7 +153,9 @@ pvr_cccb_write_command_with_header(struct pvr_cccb *pvr_cccb, u32 cmd_type, u32 
 {
 	u32 sz_with_hdr = pvr_cccb_get_size_of_cmd_with_hdr(cmd_size);
 	struct rogue_fwif_ccb_cmd_header cmd_header = {
-		.cmd_type = cmd_type,
+		.cmd_type = pvr_cccb->laguna ?
+			    pvr_laguna_translate_cccb_cmd_type(cmd_type) :
+			    cmd_type,
 		.cmd_size = ALIGN(cmd_size, 8),
 		.ext_job_ref = ext_job_ref,
 		.int_job_ref = int_job_ref,
@@ -182,7 +186,9 @@ pvr_cccb_write_command_with_header(struct pvr_cccb *pvr_cccb, u32 cmd_type, u32 
 	if (required_size != sz_with_hdr) {
 		/* Add padding command */
 		struct rogue_fwif_ccb_cmd_header pad_cmd = {
-			.cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_PADDING,
+			.cmd_type = pvr_cccb->laguna ?
+				    PVR_LAGUNA_CCB_CMD_TYPE_PADDING :
+				    ROGUE_FWIF_CCB_CMD_TYPE_PADDING,
 			.cmd_size = remaining - sizeof(pad_cmd),
 		};
 

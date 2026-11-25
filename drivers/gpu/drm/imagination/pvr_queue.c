@@ -933,6 +933,8 @@ pvr_queue_timedout_job(struct drm_sched_job *s_job)
 		mutex_unlock(&pvr_dev->queues.lock);
 
 		drm_sched_start(sched, 0);
+		if (pvr_laguna_needs_reset(pvr_dev))
+			pvr_laguna_schedule_restart(pvr_dev);
 		return DRM_GPU_SCHED_STAT_RESET;
 	}
 
