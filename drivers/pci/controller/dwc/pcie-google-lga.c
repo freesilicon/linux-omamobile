@@ -299,10 +299,16 @@ static void google_lga_pcie_host_post_init(struct dw_pcie_rp *pp)
 	google_lga_pcie_set_auto_gate(lga, true);
 
 	if (!lga->irqs_enabled) {
-		if (lga->cpl_timeout_irq > 0)
+		if (lga->cpl_timeout_irq > 0) {
+			irq_set_irqchip_state(lga->cpl_timeout_irq,
+					      IRQCHIP_STATE_PENDING, false);
 			enable_irq(lga->cpl_timeout_irq);
-		if (lga->link_down_irq > 0)
+		}
+		if (lga->link_down_irq > 0) {
+			irq_set_irqchip_state(lga->link_down_irq,
+					      IRQCHIP_STATE_PENDING, false);
 			enable_irq(lga->link_down_irq);
+		}
 		lga->irqs_enabled = true;
 	}
 }
