@@ -1129,6 +1129,14 @@ u32 pvr_laguna_kccb_used_slot_count_locked(struct pvr_device *pvr_dev)
 	wr_offset = READ_ONCE(laguna->kccb_ctl->write_offset);
 	rd_offset = READ_ONCE(laguna->kccb_ctl->read_offset);
 
+	if (wr_offset >= PVR_LAGUNA_KCCB_NUMCMDS ||
+	    rd_offset >= PVR_LAGUNA_KCCB_NUMCMDS) {
+		drm_err_once(from_pvr_device(pvr_dev),
+			     "Corrupt Laguna KCCB indices (rd=%u, wr=%u)\n",
+			     rd_offset, wr_offset);
+		return pvr_dev->kccb.slot_count - 1U;
+	}
+
 	if (wr_offset >= rd_offset)
 		return wr_offset - rd_offset;
 
@@ -1213,8 +1221,22 @@ static int pvr_laguna_translate_kccb_cmd(const struct rogue_fwif_kccb_cmd *in,
 	case ROGUE_FWIF_KCCB_CMD_POW:
 		out->cmd_type = PVR_LAGUNA_KCCB_CMD_POW;
 		out->data.pow.pow_type = in->cmd_data.pow_data.pow_type;
-		out->data.pow.arg0 = in->cmd_data.pow_data.power_req_data.pow_request_type;
-		return 0;
+		switch (in->cmd_data.pow_data.pow_type) {
+		case ROGUE_FWIF_POW_OFF_REQ:
+			out->data.pow.arg0 =
+				in->cmd_data.pow_data.power_req_data.forced ? 1U : 0U;
+			return 0;
+		case ROGUE_FWIF_POW_FORCED_IDLE_REQ:
+			out->data.pow.arg0 =
+				in->cmd_data.pow_data.power_req_data.pow_request_type;
+			return 0;
+		case ROGUE_FWIF_POW_NUM_UNITS_CHANGE:
+			out->data.pow.arg0 =
+				in->cmd_data.pow_data.power_req_data.num_of_dusts;
+			return 0;
+		default:
+			return -EINVAL;
+		}
 
 	default:
 		return -EOPNOTSUPP;
@@ -1228,7 +1250,7 @@ void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
 	struct pvr_laguna_fwif_ccb_ctl *ctrl;
 	struct pvr_laguna_fwif_kccb_cmd fw_cmd;
-	u32 old_woff, new_woff;
+	u32 old_woff, new_woff, rd_offset;
 	int err;
 
 	WARN_ON(pvr_dev->lost);
@@ -1245,10 +1267,24 @@ void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 
 	ctrl = laguna->kccb_ctl;
 	old_woff = READ_ONCE(ctrl->write_offset);
-	new_woff = (old_woff + 1U) & READ_ONCE(ctrl->wrap_mask);
-
-	if (WARN_ON(READ_ONCE(ctrl->read_offset) == new_woff))
+	rd_offset = READ_ONCE(ctrl->read_offset);
+	if (old_woff >= PVR_LAGUNA_KCCB_NUMCMDS ||
+	    rd_offset >= PVR_LAGUNA_KCCB_NUMCMDS) {
+		drm_err_once(from_pvr_device(pvr_dev),
+			     "Corrupt Laguna KCCB indices on send (rd=%u, wr=%u)\n",
+			     rd_offset, old_woff);
+		if (kccb_slot)
+			*kccb_slot = 0;
+		pvr_dev->kccb.reserved_count--;
 		goto out_unlock;
+	}
+
+	new_woff = (old_woff + 1U) & (PVR_LAGUNA_KCCB_NUMCMDS - 1U);
+
+	if (WARN_ON(rd_offset == new_woff)) {
+		pvr_dev->kccb.reserved_count--;
+		goto out_unlock;
+	}
 
 	err = pvr_laguna_translate_kccb_cmd(cmd, &fw_cmd);
 	if (err) {
@@ -1286,7 +1322,6 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 {
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
 	struct pvr_laguna_fwif_ccb_ctl *ctrl;
-	u32 rd_offset;
 
 	if (!laguna || !laguna->fwccb_ctl || !laguna->fwccb)
 		return;
@@ -1294,12 +1329,26 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 	ctrl = laguna->fwccb_ctl;
 	mutex_lock(&pvr_dev->fwccb.lock);
 
-	while ((rd_offset = READ_ONCE(ctrl->read_offset)) !=
-	       READ_ONCE(ctrl->write_offset)) {
-		struct pvr_laguna_fwif_fwccb_cmd cmd = laguna->fwccb[rd_offset];
+	for (u32 processed = 0; processed < PVR_LAGUNA_FWCCB_NUMCMDS; processed++) {
+		u32 rd_offset = READ_ONCE(ctrl->read_offset);
+		u32 wr_offset = READ_ONCE(ctrl->write_offset);
+		struct pvr_laguna_fwif_fwccb_cmd cmd;
+
+		if (rd_offset == wr_offset)
+			break;
+
+		if (rd_offset >= PVR_LAGUNA_FWCCB_NUMCMDS ||
+		    wr_offset >= PVR_LAGUNA_FWCCB_NUMCMDS) {
+			drm_err_once(from_pvr_device(pvr_dev),
+				     "Corrupt Laguna FWCCB indices (rd=%u, wr=%u)\n",
+				     rd_offset, wr_offset);
+			break;
+		}
+
+		cmd = laguna->fwccb[rd_offset];
 
 		WRITE_ONCE(ctrl->read_offset,
-			   (rd_offset + 1U) & READ_ONCE(ctrl->wrap_mask));
+			   (rd_offset + 1U) & (PVR_LAGUNA_FWCCB_NUMCMDS - 1U));
 		wmb(); /* Publish updated FWCCB read offset to FW. */
 
 		mutex_unlock(&pvr_dev->fwccb.lock);

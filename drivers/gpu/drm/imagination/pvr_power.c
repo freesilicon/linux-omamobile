@@ -67,7 +67,7 @@ pvr_power_send_command(struct pvr_device *pvr_dev, struct rogue_fwif_kccb_cmd *p
 static int
 pvr_power_request_idle(struct pvr_device *pvr_dev)
 {
-	struct rogue_fwif_kccb_cmd pow_cmd;
+	struct rogue_fwif_kccb_cmd pow_cmd = { 0 };
 
 	/* Send FORCED_IDLE request to FW. */
 	pow_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_POW;
@@ -80,7 +80,7 @@ pvr_power_request_idle(struct pvr_device *pvr_dev)
 static int
 pvr_power_request_pwr_off(struct pvr_device *pvr_dev)
 {
-	struct rogue_fwif_kccb_cmd pow_cmd;
+	struct rogue_fwif_kccb_cmd pow_cmd = { 0 };
 
 	/* Send POW_OFF request to firmware. */
 	pow_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_POW;
@@ -205,7 +205,7 @@ pvr_watchdog_kccb_stalled(struct pvr_device *pvr_dev)
 
 		if (has_active_contexts) {
 			/* Send a HEALTH_CHECK command so we can verify FW is still alive. */
-			struct rogue_fwif_kccb_cmd health_check_cmd;
+			struct rogue_fwif_kccb_cmd health_check_cmd = { 0 };
 
 			health_check_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_HEALTH_CHECK;
 
