@@ -51,6 +51,7 @@
 #define DW_UART_QUIRK_APMC0D08		BIT(4)
 #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
 #define DW_UART_QUIRK_IER_KICK		BIT(6)
+#define DW_UART_QUIRK_NO_EMPTY_RX_READ	BIT(7)
 
 /*
  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
@@ -434,12 +435,18 @@ static int dw8250_handle_irq(struct uart_port *p)
 	 * fire forever.
 	 *
 	 * This problem has only been observed so far when not in DMA mode
-	 * so we limit the workaround only to non-DMA mode.
+	 * so we limit the workaround only to non-DMA mode.  On platforms
+	 * with ECC-protected FIFO SRAM (DW_UART_QUIRK_NO_EMPTY_RX_READ),
+	 * reading UART_RX while FIFOs are enabled and empty triggers a
+	 * fatal synchronous external abort (ECC RAS error), so skip the
+	 * dummy read there.
 	 */
 	if (!up->dma && rx_timeout) {
 		status = serial_lsr_in(up);
 
-		if (!(status & (UART_LSR_DR | UART_LSR_BI)))
+		if (!(status & (UART_LSR_DR | UART_LSR_BI)) &&
+		    !((quirks & DW_UART_QUIRK_NO_EMPTY_RX_READ) &&
+		      (up->fcr & UART_FCR_ENABLE_FIFO)))
 			serial_port_in(p, UART_RX);
 	}
 
@@ -888,9 +895,15 @@ static const struct dw8250_platform_data dw8250_ultrarisc_dp1000_data = {
 	.quirks = DW_UART_QUIRK_CPR_VALUE,
 };
 
+static const struct dw8250_platform_data dw8250_lga_data = {
+	.usr_reg = DW_UART_USR,
+	.quirks = DW_UART_QUIRK_SKIP_SET_RATE | DW_UART_QUIRK_NO_EMPTY_RX_READ,
+};
+
 static const struct of_device_id dw8250_of_match[] = {
 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
-	{ .compatible = "goog,goog-dw-apb-uart", .data = &dw8250_dw_apb },
+	{ .compatible = "google,lga-uart", .data = &dw8250_lga_data },
+	{ .compatible = "goog,goog-dw-apb-uart", .data = &dw8250_lga_data },
 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
 	{ .compatible = "marvell,armada-38x-uart", .data = &dw8250_armada_38x_data },
 	{ .compatible = "renesas,rzn1-uart", .data = &dw8250_renesas_rzn1_data },
