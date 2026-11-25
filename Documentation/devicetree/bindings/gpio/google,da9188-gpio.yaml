@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/google,da9188-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Dialog DA9188 PMIC physical and virtual GPIO controllers
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description: |
+  The Dialog DA9188 PMIC on Google Tensor G5 (Laguna) exposes both a physical
+  GPIO controller and a firmware-managed virtual GPIO controller over the CPM
+  mailbox interface.  The virtual GPIO lines control PMIC-sequenced outputs
+  such as Bluetooth power enable (BT_REG_ON) and BLE DBO latch clock.
+
+properties:
+  compatible:
+    enum:
+      - google,da9188-gpio
+      - google,da9188-vgpio
+
+  gpio-controller: true
+
+  "#gpio-cells":
+    const: 2
+
+  gpio-ranges:
+    maxItems: 1
+
+  ngpios:
+    minimum: 1
+    maximum: 32
+
+required:
+  - compatible
+  - gpio-controller
+  - "#gpio-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    da9188-vgpio {
+        compatible = "google,da9188-vgpio";
+        gpio-controller;
+        #gpio-cells = <2>;
+    };

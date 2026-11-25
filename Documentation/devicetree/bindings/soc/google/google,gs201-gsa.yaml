@@ -20,6 +20,7 @@ properties:
     enum:
       - google,gs201-gsa
       - google,zumapro-gsa
+      - google,gs101-gsa-v1
 
   reg:
     minItems: 1
@@ -39,12 +40,45 @@ properties:
   interrupts:
     maxItems: 1
 
+  mboxes:
+    maxItems: 1
+    description: google,mba-ctrl v2.0 mailbox channel used on Laguna
+
+  iommus:
+    maxItems: 1
+    description: AMB SMMUv3 stream ID used by GSA DMA header reads on Laguna
+
+  log-region:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Reserved memory region for GSA telemetry logs
+
+  mbox-channels:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+
+  channel-max-pending-msgs:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+
 required:
   - compatible
-  - reg
-  - interrupts
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          const: google,gs101-gsa-v1
+    then:
+      description:
+        On Laguna (Tensor G5), the GSA communicates through a google,mba-ctrl
+        v2.0 mailbox channel and AMB SMMUv3 rather than raw MMIO mailbox
+        registers.
+      required:
+        - mboxes
+    else:
+      required:
+        - reg
+        - interrupts
   - if:
       properties:
         compatible:
