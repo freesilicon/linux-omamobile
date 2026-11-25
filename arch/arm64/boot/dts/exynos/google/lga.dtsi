@@ -760,6 +760,7 @@
 						regulator-name = "ldo_4m";
 						regulator-min-microvolt = <1200000>;
 						regulator-max-microvolt = <1200000>;
+						google,monitor-only;
 					};
 
 					ldo_10m_reg: ldo_10m {
@@ -1164,7 +1165,6 @@
 				device-wakeup-gpios = <&pinctrl_aoc 0xd GPIO_ACTIVE_HIGH>;
 				interrupts-extended = <&pinctrl_aoc 0x16 IRQ_TYPE_EDGE_RISING>;
 				interrupt-names = "host-wakeup";
-				vddio-supply = <&ldo_4m_reg>;
 				max-speed = <3000000>;
 				status = "disabled";
 			};
