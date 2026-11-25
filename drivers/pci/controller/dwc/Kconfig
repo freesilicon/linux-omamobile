@@ -440,6 +440,19 @@ config PCIE_GS201_SYSMMU
 	  System MMU that sits in front of the controller. The region is
 	  mapped 1:1, so the device driver keeps using physical addresses.
 
+config PCIE_GOOGLE_LGA
+	tristate "Google Laguna (Tensor G5) PCIe host controller"
+	depends on OF && (ARCH_EXYNOS || ARM64 || COMPILE_TEST)
+	depends on PCI_MSI
+	depends on GOOGLE_CPM_CLK || COMPILE_TEST
+	select PCIE_DW_HOST
+	select PCI_PWRCTRL_GENERIC
+	help
+	  Say Y here to enable host controller support for the DesignWare
+	  PCIe Root Complex integrated on Google Laguna (Tensor G5) SoCs.
+	  This driver manages controller clocks, resets, PHY SRAM handshake,
+	  root-port power control, and link training.
+
 config PCIE_FU740
 	bool "SiFive FU740 PCIe controller"
 	depends on PCI_MSI
