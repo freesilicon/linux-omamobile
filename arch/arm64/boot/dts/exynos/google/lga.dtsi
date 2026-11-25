@@ -704,6 +704,7 @@
 			reset-names = "non_sticky", "sticky", "drd_bus", "top";
 			power-domains = <&hsio_n_usb_psw_pd>, <&hsio_n_usb_pd>;
 			power-domain-names = "psw", "top";
+			iommus = <&amb_smmu 0x8100>;
 			/* Omit usb3-phy so dwc3-google enters USB2ONLY_MODE without usb_phy_fw */
 			phys = <&usb_phy 0>;
 			phy-names = "usb2-phy";
