@@ -57,11 +57,6 @@ static const struct pinctrl_pin_desc da9188_pins[] = {
 
 #define DA9188_VGPIO_NGPIOS	32
 
-static unsigned int vgpio_target = DA9188_MB_TARGET_VGPIO;
-module_param(vgpio_target, uint, 0444);
-MODULE_PARM_DESC(vgpio_target,
-		 "CPM MBA target ID for DA9188 virtual GPIOs (default 4)");
-
 struct da9188_gpio_priv {
 	struct device *dev;
 	struct pinctrl_desc pdesc;
@@ -69,7 +64,7 @@ struct da9188_gpio_priv {
 	struct gpio_chip gc;
 	struct da9188_mbox mbox;
 	u32 dst_channel;
-	u8 mb_target;
+	u16 pin_offset;
 	bool is_vgpio;
 };
 
@@ -81,7 +76,8 @@ static int da9188_gpio_mb_cmd(struct da9188_gpio_priv *priv, u8 cmd,
 	int ret;
 
 	ret = da9188_mbox_xfer(priv->dev, &priv->mbox, priv->dst_channel,
-			       priv->mb_target, cmd, pin,
+			       DA9188_MB_TARGET_GPIO, cmd,
+			       priv->pin_offset + pin,
 			       &req, out ? &resp : NULL);
 	if (!ret && out)
 		*out = resp.data[0];
@@ -356,29 +352,6 @@ static int da9188_gpio_get_direction(struct gpio_chip *chip, unsigned int offset
 					      GPIO_LINE_DIRECTION_IN;
 }
 
-static int da9188_vgpio_direction_input(struct gpio_chip *chip,
-					unsigned int offset)
-{
-	struct da9188_gpio_priv *priv = gpiochip_get_data(chip);
-
-	return da9188_gpio_mb_cmd(priv, DA9188_GPIO_CMD_SET_DIRECTION,
-				  offset, DA9188_GPIO_DIR_IN, NULL);
-}
-
-static int da9188_vgpio_direction_output(struct gpio_chip *chip,
-					 unsigned int offset, int value)
-{
-	struct da9188_gpio_priv *priv = gpiochip_get_data(chip);
-	int ret;
-
-	ret = da9188_gpio_mb_cmd(priv, DA9188_GPIO_CMD_SET_DIRECTION,
-				 offset, DA9188_GPIO_DIR_OUT, NULL);
-	if (ret)
-		return ret;
-
-	return da9188_gpio_set(chip, offset, value);
-}
-
 static int da9188_gpio_direction_output(struct gpio_chip *chip,
 					unsigned int offset, int value)
 {
@@ -408,8 +381,7 @@ static int da9188_gpio_probe(struct platform_device *pdev)
 
 	priv->dev = dev;
 	priv->is_vgpio = id && id->driver_data;
-	priv->mb_target = priv->is_vgpio ? (u8)vgpio_target :
-					   DA9188_MB_TARGET_GPIO;
+	priv->pin_offset = priv->is_vgpio ? ARRAY_SIZE(da9188_pins) : 0;
 	priv->dst_channel = CPM_COMMON_PMIC_SERVICE;
 	of_property_read_u32(dev->of_node, "mba-dest-channel", &priv->dst_channel);
 	platform_set_drvdata(pdev, priv);
@@ -421,7 +393,6 @@ static int da9188_gpio_probe(struct platform_device *pdev)
 	priv->gc.label = pdev->name;
 	priv->gc.parent = dev;
 	priv->gc.owner = THIS_MODULE;
-	priv->gc.get_direction = da9188_gpio_get_direction;
 	priv->gc.get = da9188_gpio_get;
 	priv->gc.set = da9188_gpio_set;
 	priv->gc.base = -1;
@@ -434,8 +405,11 @@ static int da9188_gpio_probe(struct platform_device *pdev)
 		if (!ngpios || ngpios > DA9188_VGPIO_NGPIOS)
 			ngpios = DA9188_VGPIO_NGPIOS;
 
-		priv->gc.direction_input = da9188_vgpio_direction_input;
-		priv->gc.direction_output = da9188_vgpio_direction_output;
+		/*
+		 * Virtual GPIOs are output-only lines numbered directly after
+		 * the 19 physical PMIC GPIOs on DA9188_MB_TARGET_GPIO; leaving
+		 * direction callbacks NULL lets gpiolib call .set() directly.
+		 */
 		priv->gc.ngpio = ngpios;
 		return devm_gpiochip_add_data(dev, &priv->gc, priv);
 	}
@@ -458,6 +432,7 @@ static int da9188_gpio_probe(struct platform_device *pdev)
 
 	priv->gc.request = gpiochip_generic_request;
 	priv->gc.free = gpiochip_generic_free;
+	priv->gc.get_direction = da9188_gpio_get_direction;
 	priv->gc.direction_input = pinctrl_gpio_direction_input;
 	priv->gc.direction_output = da9188_gpio_direction_output;
 	priv->gc.set_config = gpiochip_generic_config;

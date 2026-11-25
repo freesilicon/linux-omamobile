@@ -17,7 +17,6 @@ enum da9188_mb_target {
 	DA9188_MB_TARGET_REGULATOR	= 1,
 	DA9188_MB_TARGET_RTC		= 2,
 	DA9188_MB_TARGET_GPIO		= 3,
-	DA9188_MB_TARGET_VGPIO		= 4,
 };
 
 enum da9188_mb_regl_cmd {
