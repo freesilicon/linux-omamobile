@@ -5,15 +5,18 @@
  */
 
 #include "pvr_ccb.h"
+#include "pvr_context.h"
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_gem.h"
 #include "pvr_laguna.h"
 #include "pvr_power.h"
+#include "pvr_queue.h"
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_fwif_common.h"
 #include "pvr_rogue_heap_config.h"
+#include "pvr_vm.h"
 #include "pvr_volcanic_defs.h"
 
 #include <drm/drm_managed.h>
@@ -24,6 +27,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
+#include <linux/cred.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/errno.h>
@@ -36,8 +40,10 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/sched.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 
@@ -66,14 +72,9 @@
 #define PVR_LAGUNA_GPU_PVTC_PWROFF_REQ		0x00U
 #define PVR_LAGUNA_GPU_PVTC_PWROFF_ACK		0x04U
 
-/* SLC PBHA LUT per-OSID register geometry (OSID 1 only; 32-bit writes only). */
-#define PVR_LAGUNA_REQ_PBHA_OSID_STRIDE		0x200U
-#define PVR_LAGUNA_REQ_PBHA_OSID_ENTRIES	16U
-#define PVR_LAGUNA_REQ_PBHA_OSID1_DEFAULT	0x00000001U
-
-#define PVR_LAGUNA_RA_LUT_OSID_STRIDE		0x40U
-#define PVR_LAGUNA_RA_LUT_OSID_ENTRIES		4U
-#define PVR_LAGUNA_RA_LUT_OSID1_DEFAULT		0x00000001U
+/* SLC PBHA LUT CSR geometry: 128 entries at 32-byte stride (0 = SLC bypass). */
+#define PVR_LAGUNA_REQ_PBHA_LUT_STRIDE		0x20U
+#define PVR_LAGUNA_REQ_PBHA_LUT_SIZE		0x1000U
 
 /* PFSM CSR offsets (0x34813000, size 0xc). */
 #define PVR_LAGUNA_PFSM_CTRL_OFF		0x00U
@@ -258,44 +259,23 @@ static void pvr_laguna_core_logic_power_off(struct pvr_laguna_data *laguna)
 }
 
 /**
- * pvr_laguna_slc_program_lut() - Program Laguna SLC PBHA & read-allocate LUTs
+ * pvr_laguna_slc_program_lut() - Reset Laguna SLC PBHA LUT to clean bypass
  * @pvr_dev: Target PowerVR device.
  *
- * Programs req_pbha_lut (0x34e08000, strictly 32-bit writes) and ra_lut_{0..2}
- * (0x3490{0,1,2}200) ONLY for OSID 1 (Non-Secure Linux). OSID 0 (FW) and
- * OSID 7 (TrustZone) are explicitly untouched so Trusty PTEs are never
- * polluted. Must be called after GPU power-on.
+ * Clears all 128 entries of req_pbha_lut (0x34e08000, 32-byte CSR stride,
+ * 32-bit writes only) to 0 (clean SLC bypass without unallocated PTID tags)
+ * and leaves ra_lut_{0..2} untouched. Must be called after GPU power-on.
  */
 void pvr_laguna_slc_program_lut(struct pvr_device *pvr_dev)
 {
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
-	u32 osid1_req_base = PVR_LAGUNA_OSID_LINUX *
-			     PVR_LAGUNA_REQ_PBHA_OSID_STRIDE;
-	u32 osid1_ra_base = PVR_LAGUNA_OSID_LINUX *
-			    PVR_LAGUNA_RA_LUT_OSID_STRIDE;
 
-	if (!laguna)
+	if (!laguna || !laguna->req_pbha_lut)
 		return;
 
-	BUILD_BUG_ON(PVR_LAGUNA_OSID_LINUX == PVR_LAGUNA_OSID_FW);
-	BUILD_BUG_ON(PVR_LAGUNA_OSID_LINUX == PVR_LAGUNA_OSID_TZ);
-
-	if (laguna->req_pbha_lut) {
-		for (u32 i = 0; i < PVR_LAGUNA_REQ_PBHA_OSID_ENTRIES; i++) {
-			writel(PVR_LAGUNA_REQ_PBHA_OSID1_DEFAULT,
-			       laguna->req_pbha_lut + osid1_req_base + i * 4U);
-		}
-	}
-
-	for (u32 bank = 0; bank < PVR_LAGUNA_RA_LUT_BANKS; bank++) {
-		if (!laguna->ra_lut[bank])
-			continue;
-
-		for (u32 i = 0; i < PVR_LAGUNA_RA_LUT_OSID_ENTRIES; i++) {
-			writel(PVR_LAGUNA_RA_LUT_OSID1_DEFAULT,
-			       laguna->ra_lut[bank] + osid1_ra_base + i * 4U);
-		}
-	}
+	for (u32 off = 0; off < PVR_LAGUNA_REQ_PBHA_LUT_SIZE;
+	     off += PVR_LAGUNA_REQ_PBHA_LUT_STRIDE)
+		writel(0, laguna->req_pbha_lut + off);
 }
 
 static void pvr_laguna_mba_clear_irq(struct pvr_laguna_data *laguna)
@@ -1018,6 +998,26 @@ static int pvr_laguna_trusty_send_fw(struct pvr_device *pvr_dev)
 	return 0;
 }
 
+static int pvr_laguna_fw_auth(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	int err;
+
+	if (laguna->fw_authenticated)
+		return 0;
+
+	/*
+	 * Stage and authenticate once per boot: Trusty locks the 2 MiB secure
+	 * carveout, populates the FW page tables in FW_PT_HEAP, and invokes
+	 * TF-A OEM_GPU_CONTROL_SETUP during SEND_FIRMWARE_IMAGE.
+	 */
+	err = pvr_laguna_stage_signed_fw(pvr_dev);
+	if (err)
+		return err;
+
+	return pvr_laguna_trusty_send_fw(pvr_dev);
+}
+
 int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
 {
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
@@ -1026,19 +1026,14 @@ int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
 	if (!laguna)
 		return -ENODEV;
 
-	/*
-	 * Stage and authenticate once per boot: Trusty locks the 2 MiB secure
-	 * carveout and invokes TF-A OEM_GPU_CONTROL_SETUP during
-	 * SEND_FIRMWARE_IMAGE. Subsequent starts only invoke TF-A START.
-	 */
-	if (!laguna->fw_authenticated) {
-		err = pvr_laguna_stage_signed_fw(pvr_dev);
-		if (err)
-			return err;
+	err = pvr_laguna_fw_auth(pvr_dev);
+	if (err)
+		return err;
 
-		err = pvr_laguna_trusty_send_fw(pvr_dev);
-		if (err)
-			return err;
+	if (laguna->fwif_connection_ctl) {
+		WRITE_ONCE(laguna->fwif_connection_ctl->connection_os_state,
+			   PVR_LAGUNA_FW_CONN_OS_READY);
+		wmb(); /* Publish OS READY state before starting RISC-V FW. */
 	}
 
 	err = pvr_laguna_smc_gpu_control(pvr_dev,
@@ -1054,9 +1049,11 @@ int pvr_laguna_fw_start(struct pvr_device *pvr_dev)
 	return 0;
 }
 
-#define PVR_LAGUNA_FW_BOOT_TIMEOUT_US		500000U
+#define PVR_LAGUNA_FW_BOOT_TIMEOUT_US		1000000U
 #define PVR_LAGUNA_FW_HEALTH_TIMEOUT_US		100000U
+#define PVR_LAGUNA_FW_POW_OFF_TIMEOUT_US	500000U
 #define PVR_LAGUNA_HCS_DEFAULT_DEADLINE_MS	5000U
+#define PVR_LAGUNA_CTX_MAX_DEADLINE_MS		30000U
 #define PVR_LAGUNA_FAULT_PAGE_SIZE		SZ_4K
 #define PVR_LAGUNA_FAULT_PAGE_POISON		0xdeadbee0U
 
@@ -1182,14 +1179,27 @@ static int pvr_laguna_translate_kccb_cmd(const struct rogue_fwif_kccb_cmd *in,
 		return 0;
 	}
 
-	case ROGUE_FWIF_KCCB_CMD_MMUCACHE:
+	case ROGUE_FWIF_KCCB_CMD_MMUCACHE: {
+		u32 in_flags = in->cmd_data.mmu_cache_data.cache_flags;
+		u32 out_flags = PVR_LAGUNA_MMUCACHE_FLAGS_CTX_ALL;
+
+		if (in_flags & ROGUE_FWIF_MMUCACHEDATA_FLAGS_PT)
+			out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_PT;
+		if (in_flags & ROGUE_FWIF_MMUCACHEDATA_FLAGS_PD)
+			out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_PD;
+		if (in_flags & ROGUE_FWIF_MMUCACHEDATA_FLAGS_PC)
+			out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_PC;
+		if (in_flags & ROGUE_FWIF_MMUCACHEDATA_FLAGS_INTERRUPT)
+			out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_INTERRUPT;
+
 		out->cmd_type = PVR_LAGUNA_KCCB_CMD_MMUCACHE;
-		out->data.mmucache.cache_flags = in->cmd_data.mmu_cache_data.cache_flags;
+		out->data.mmucache.cache_flags = out_flags;
 		out->data.mmucache.mmu_cache_sync_fw_addr =
 			in->cmd_data.mmu_cache_data.mmu_cache_sync_fw_addr;
 		out->data.mmucache.mmu_cache_sync_update_value =
 			in->cmd_data.mmu_cache_data.mmu_cache_sync_update_value;
 		return 0;
+	}
 
 	case ROGUE_FWIF_KCCB_CMD_CLEANUP:
 		out->cmd_type = PVR_LAGUNA_KCCB_CMD_CLEANUP;
@@ -1353,14 +1363,98 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 
 		mutex_unlock(&pvr_dev->fwccb.lock);
 
-		drm_dbg(from_pvr_device(pvr_dev),
-			"Laguna FWCCB command received (type=%#x, flags=%#x)\n",
-			cmd.cmd_type, cmd.fwccb_flags);
+		switch (cmd.cmd_type) {
+		case PVR_LAGUNA_FWCCB_CMD_CONTEXT_RESET:
+			drm_err(from_pvr_device(pvr_dev),
+				"Laguna FW context reset (ctx=%u, dm=%u, reason=%u, job_ref=%u, pc=%#llx, mmu=%#llx/%#llx)\n",
+				cmd.data.ctx_reset.server_common_context_id,
+				cmd.data.ctx_reset.dm,
+				cmd.data.ctx_reset.reset_reason,
+				cmd.data.ctx_reset.reset_job_ref,
+				cmd.data.ctx_reset.pc_address,
+				cmd.data.ctx_reset.mmu_status[0],
+				cmd.data.ctx_reset.mmu_status[1]);
+			break;
+		case PVR_LAGUNA_FWCCB_CMD_FW_PAGEFAULT:
+			drm_err(from_pvr_device(pvr_dev),
+				"Laguna FW pagefault at %#llx\n",
+				cmd.data.fw_pf.fw_fault_addr);
+			break;
+		case PVR_LAGUNA_FWCCB_CMD_REQUEST_GPU_RESTART:
+			drm_warn(from_pvr_device(pvr_dev),
+				 "Laguna FW requested GPU restart\n");
+			break;
+		case PVR_LAGUNA_FWCCB_CMD_UPDATE_STATS:
+			break;
+		default:
+			drm_dbg(from_pvr_device(pvr_dev),
+				"Laguna FWCCB command received (type=%#x, flags=%#x)\n",
+				cmd.cmd_type, cmd.fwccb_flags);
+			break;
+		}
 
 		mutex_lock(&pvr_dev->fwccb.lock);
 	}
 
 	mutex_unlock(&pvr_dev->fwccb.lock);
+}
+
+static u32 pvr_laguna_dm_from_job_type(enum drm_pvr_job_type type)
+{
+	switch (type) {
+	case DRM_PVR_JOB_TYPE_GEOMETRY:
+		return PVR_LAGUNA_DM_GEOM;
+	case DRM_PVR_JOB_TYPE_FRAGMENT:
+		return PVR_LAGUNA_DM_3D;
+	case DRM_PVR_JOB_TYPE_COMPUTE:
+		return PVR_LAGUNA_DM_CDM;
+	case DRM_PVR_JOB_TYPE_TRANSFER_FRAG:
+		return PVR_LAGUNA_DM_TDM;
+	}
+
+	return PVR_LAGUNA_DM_GP;
+}
+
+void pvr_laguna_init_fw_common_context(struct pvr_queue *queue, void *fw_ctx_map)
+{
+	struct pvr_context *ctx = queue->ctx;
+	struct pvr_fw_object *fw_mem_ctx_obj = pvr_vm_get_fw_mem_context(ctx->vm_ctx);
+	struct pvr_laguna_fwif_fwcommoncontext *cctx_fw;
+	struct pvr_cccb *cccb = &queue->cccb;
+
+	cctx_fw = fw_ctx_map + queue->ctx_offset;
+	cctx_fw->cccb_ctl_fw_addr = cccb->ctrl_fw_addr;
+	cctx_fw->cccb_fw_addr = cccb->cccb_fw_addr;
+	cctx_fw->priority = ctx->priority;
+	cctx_fw->priority_seq_num = 0;
+	cctx_fw->compat_flags = PVR_LAGUNA_CTX_COMPAT_HAS_DEFER_COUNT;
+	cctx_fw->max_deadline_ms = PVR_LAGUNA_CTX_MAX_DEADLINE_MS;
+	cctx_fw->server_common_context_id = ctx->ctx_id;
+	cctx_fw->pid = task_tgid_nr(current);
+	cctx_fw->uid = from_kuid_munged(current_user_ns(), current_uid());
+	strscpy(cctx_fw->proc_name, current->comm, sizeof(cctx_fw->proc_name));
+	cctx_fw->dm = pvr_laguna_dm_from_job_type(queue->type);
+
+	pvr_fw_object_get_fw_addr(fw_mem_ctx_obj,
+				  &cctx_fw->fw_mem_context_fw_addr);
+	pvr_fw_object_get_fw_addr(queue->reg_state_obj,
+				  &cctx_fw->context_state_fw_addr);
+}
+
+void pvr_laguna_copy_cdm_cswitch_regs(void *fw_ctx_map,
+				      const struct rogue_fwif_cdm_registers_cswitch *src)
+{
+	struct pvr_laguna_fwif_fwcomputecontext *fw_comp = fw_ctx_map;
+	struct pvr_laguna_fwif_cdm_regs_cswitch *dst =
+		&fw_comp->cdm_context.dm_specific.comp.ctxswitch_regs;
+
+	dst->cdm_context_pds0 = src->cdmreg_cdm_context_pds0;
+	dst->cdm_context_pds1 = src->cdmreg_cdm_context_pds1;
+	dst->cdm_terminate_pds = src->cdmreg_cdm_terminate_pds;
+	dst->cdm_terminate_pds1 = src->cdmreg_cdm_terminate_pds1;
+	dst->cdm_resume_pds0 = src->cdmreg_cdm_resume_pds0;
+	dst->cdm_context_pds0_b = src->cdmreg_cdm_context_pds0_b;
+	dst->cdm_resume_pds0_b = src->cdmreg_cdm_resume_pds0_b;
 }
 
 static int pvr_laguna_fw_defs_init(struct pvr_device *pvr_dev)
@@ -1523,6 +1617,21 @@ static void pvr_laguna_osinit_init(void *cpu_ptr, void *priv)
 				  &osinit->hwperf_ctl);
 }
 
+static void pvr_laguna_align_checks_init(void *cpu_ptr, void *priv)
+{
+	static const u32 km_align_checks[PVR_LAGUNA_ALIGN_CHECKS_KM_COUNT] = {
+		952, 0, 16, 80, 156, 160, 128, 0,
+		4, 12, 16, 36, 40, 976, 0, 488,
+		488, 0, 488, 0, 488, 112, 96, 4,
+		12, 0, 4, 8,
+	};
+	u32 *out = cpu_ptr;
+
+	out[0] = PVR_LAGUNA_ALIGN_CHECKS_KM_COUNT;
+	memcpy(&out[1], km_align_checks, sizeof(km_align_checks));
+	out[1 + PVR_LAGUNA_ALIGN_CHECKS_KM_COUNT] = 0;
+}
+
 static void pvr_laguna_sysinit_init(void *cpu_ptr, void *priv)
 {
 	struct pvr_laguna_fwif_sysinit *sysinit = cpu_ptr;
@@ -1546,8 +1655,9 @@ static void pvr_laguna_sysinit_init(void *cpu_ptr, void *priv)
 				  &sysinit->trace_buf_ctl);
 	pvr_fw_object_get_fw_addr(laguna->fwif_sysdata_obj,
 				  &sysinit->fw_sys_data);
+	pvr_fw_object_get_fw_addr(laguna->fwif_align_checks_obj,
+				  &sysinit->align_checks);
 
-	sysinit->align_checks = 0;
 	sysinit->initial_core_clock_speed =
 		(u32)pvr_laguna_get_core_clk_rate(pvr_dev);
 	sysinit->initial_soc_clock_speed = PVR_LAGUNA_GTC_FREQ_HZ;
@@ -1657,6 +1767,10 @@ static void pvr_laguna_fwif_destroy_structures(struct pvr_device *pvr_dev)
 		pvr_fw_object_destroy(laguna->fwif_fault_page_obj);
 		laguna->fwif_fault_page_obj = NULL;
 	}
+	if (laguna->fwif_align_checks_obj) {
+		pvr_fw_object_destroy(laguna->fwif_align_checks_obj);
+		laguna->fwif_align_checks_obj = NULL;
+	}
 	if (laguna->fwif_mmucache_sync_obj) {
 		pvr_fw_object_destroy(laguna->fwif_mmucache_sync_obj);
 		laguna->fwif_mmucache_sync_obj = NULL;
@@ -1693,6 +1807,13 @@ static int pvr_laguna_fwif_create_structures(struct pvr_device *pvr_dev)
 				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 				   pvr_laguna_fault_page_init, NULL,
 				   &laguna->fwif_fault_page_obj);
+	if (err)
+		goto err_destroy;
+
+	err = pvr_fw_object_create(pvr_dev, PVR_LAGUNA_ALIGN_CHECKS_TOTAL_SIZE,
+				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+				   pvr_laguna_align_checks_init, NULL,
+				   &laguna->fwif_align_checks_obj);
 	if (err)
 		goto err_destroy;
 
@@ -1932,13 +2053,67 @@ static void pvr_laguna_fw_health_check_poll(struct pvr_device *pvr_dev)
 	}
 }
 
+void pvr_laguna_fw_health_check_irq(struct pvr_device *pvr_dev)
+{
+	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	struct rogue_fwif_kccb_cmd cmd = {
+		.cmd_type = ROGUE_FWIF_KCCB_CMD_HEALTH_CHECK,
+	};
+	u32 slot = 0;
+	u32 rtn = 0;
+	int err;
+
+	if (!laguna || !READ_ONCE(laguna->fw_kccb_ready))
+		return;
+
+	err = pvr_kccb_send_cmd_powered(pvr_dev, &cmd, &slot);
+	if (err) {
+		drm_warn(drm_dev, "Volcanic FW IRQ health check send failed (%d)\n",
+			 err);
+		return;
+	}
+
+	err = pvr_kccb_wait_for_completion(pvr_dev, slot,
+					   msecs_to_jiffies(250), &rtn);
+	if (err) {
+		drm_warn(drm_dev,
+			 "Volcanic FW IRQ health check timed out (%d, slot=%u, rtn=%#x, irq=%#x)\n",
+			 err, slot, rtn,
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_STATUS));
+		return;
+	}
+
+	drm_info(drm_dev,
+		 "Volcanic FW IRQ KCCB HEALTH_CHECK passed (slot=%u, rtn=%#x, executed=%u)\n",
+		 slot, rtn, READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed));
+}
+
+int pvr_laguna_wait_pow_off(struct pvr_device *pvr_dev)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	ktime_t deadline;
+
+	if (!laguna || !laguna->fwif_sysdata)
+		return 0;
+
+	deadline = ktime_add_us(ktime_get(), PVR_LAGUNA_FW_POW_OFF_TIMEOUT_US);
+	while (ktime_before(ktime_get(), deadline)) {
+		if (READ_ONCE(laguna->fwif_sysdata->pow_state) == ROGUE_FWIF_POW_OFF)
+			return 0;
+		usleep_range(200, 500);
+	}
+
+	return -ETIMEDOUT;
+}
+
 int pvr_laguna_fw_wait_boot(struct pvr_device *pvr_dev)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
 	ktime_t deadline;
 	bool started = false;
-	u32 stage, fw_state, faults, irq_stat;
+	u32 stage, fw_state, os_state, faults, irq_stat, pfsm_sts;
 
 	if (!laguna || !laguna->fwif_sysinit)
 		return 0;
@@ -1955,22 +2130,45 @@ int pvr_laguna_fw_wait_boot(struct pvr_device *pvr_dev)
 	stage = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SCRATCH14);
 	fw_state = laguna->fwif_connection_ctl ?
 		   READ_ONCE(laguna->fwif_connection_ctl->connection_fw_state) : 0;
+	os_state = laguna->fwif_connection_ctl ?
+		   READ_ONCE(laguna->fwif_connection_ctl->connection_os_state) : 0;
 	faults = laguna->fwif_sysdata ?
 		 READ_ONCE(laguna->fwif_sysdata->fw_faults) : 0;
 	irq_stat = pvr_cr_read32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_STATUS);
+	pfsm_sts = laguna->pfsm ?
+		   readl(laguna->pfsm + PVR_LAGUNA_PFSM_STATUS_OFF) : 0;
 
 	WRITE_ONCE(laguna->fw_kccb_ready, started);
 
 	if (started) {
+		if (laguna->fwif_connection_ctl) {
+			WRITE_ONCE(laguna->fwif_connection_ctl->connection_os_state,
+				   PVR_LAGUNA_FW_CONN_OS_ACTIVE);
+			wmb(); /* Publish OS ACTIVE state after FW boot. */
+		}
 		drm_info(drm_dev,
-			 "Volcanic FW boot handshake succeeded (stage=%u, fw_state=%u, faults=%u, ts=%u)\n",
+			 "Volcanic FW boot handshake succeeded (stage=%u, fw_state=%u, faults=%u, ts=%u, pfsm=%#x)\n",
 			 stage, fw_state, faults,
-			 READ_ONCE(laguna->fwif_sysinit->firmware_started_timestamp));
+			 READ_ONCE(laguna->fwif_sysinit->firmware_started_timestamp),
+			 pfsm_sts);
 		pvr_laguna_fw_health_check_poll(pvr_dev);
 	} else {
 		drm_warn(drm_dev,
-			 "Volcanic FW boot handshake timed out (stage=%u, fw_state=%u, faults=%u, irq=%#x); keeping Stage G2 UAPI/carveout allocator active\n",
-			 stage, fw_state, faults, irq_stat);
+			 "Volcanic FW boot handshake timed out (stage=%u, fw_state=%u, os_state=%u, marker=%u, faults=%u, irq=%#x, ev=%#x, jones=%#x, slc=%#x, boot=%#x, rst=%#llx, mmu=%#llx/%#llx/%#llx, dm4=%#x, pfsm=%#x, s0=%#x)\n",
+			 stage, fw_state, os_state,
+			 READ_ONCE(laguna->fwif_sysinit->marker_val),
+			 faults, irq_stat,
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_EVENT_STATUS),
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_JONES_IDLE),
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_SLC_IDLE),
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_FWCORE_BOOT),
+			 pvr_cr_read64(pvr_dev, VOLCANIC_CR_SOFT_RESET),
+			 pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS1),
+			 pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS2),
+			 pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS_META),
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_MTS_DM4_INTERRUPT_ENABLE),
+			 pfsm_sts,
+			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_SCRATCH0));
 	}
 
 	return 0;
@@ -1986,24 +2184,35 @@ int pvr_laguna_fw_stop(struct pvr_device *pvr_dev)
 
 	WRITE_ONCE(laguna->fw_kccb_ready, false);
 
-	err = pvr_laguna_smc_gpu_control(pvr_dev,
-					 PVR_LAGUNA_OEM_GPU_CONTROL_STOP);
-	if (!err) {
-		laguna->fw_running = false;
-		if (laguna->fwif_sysinit)
-			WRITE_ONCE(laguna->fwif_sysinit->firmware_started, 0);
-		if (laguna->kccb_ctl) {
-			WRITE_ONCE(laguna->kccb_ctl->write_offset, 0);
-			WRITE_ONCE(laguna->kccb_ctl->read_offset, 0);
-		}
-		if (laguna->fwccb_ctl) {
-			WRITE_ONCE(laguna->fwccb_ctl->write_offset, 0);
-			WRITE_ONCE(laguna->fwccb_ctl->read_offset, 0);
-		}
-		wmb(); /* Ensure reset FWIF state reaches DRAM before restart. */
+	if (laguna->fwif_connection_ctl) {
+		WRITE_ONCE(laguna->fwif_connection_ctl->connection_os_state,
+			   PVR_LAGUNA_FW_CONN_OS_OFFLINE);
+		wmb(); /* Publish OS OFFLINE state before stopping RISC-V FW. */
 	}
 
-	return err;
+	err = pvr_laguna_smc_gpu_control(pvr_dev,
+					 PVR_LAGUNA_OEM_GPU_CONTROL_STOP);
+
+	laguna->fw_running = false;
+	if (laguna->fwif_sysinit)
+		WRITE_ONCE(laguna->fwif_sysinit->firmware_started, 0);
+	if (laguna->kccb_ctl) {
+		WRITE_ONCE(laguna->kccb_ctl->write_offset, 0);
+		WRITE_ONCE(laguna->kccb_ctl->read_offset, 0);
+	}
+	if (laguna->fwccb_ctl) {
+		WRITE_ONCE(laguna->fwccb_ctl->write_offset, 0);
+		WRITE_ONCE(laguna->fwccb_ctl->read_offset, 0);
+	}
+	wmb(); /* Ensure reset FWIF state reaches DRAM before restart. */
+
+	if (err) {
+		drm_warn(from_pvr_device(pvr_dev),
+			 "TF-A STOP returned %d during power-down; continuing suspend to avoid pm_runtime error latch\n",
+			 err);
+	}
+
+	return 0;
 }
 
 int pvr_laguna_fw_init(struct pvr_device *pvr_dev)
@@ -2019,6 +2228,15 @@ int pvr_laguna_fw_init(struct pvr_device *pvr_dev)
 	fw_dev->defs = &pvr_fw_defs_laguna;
 
 	err = fw_dev->defs->init(pvr_dev);
+	if (err)
+		return err;
+
+	/*
+	 * Authenticate the signed firmware image first so Trusty locks the
+	 * 2 MiB secure carveout, sets up FW_PT_HEAP, and completes TF-A
+	 * OEM_GPU_CONTROL_SETUP before we populate FW_SHARED_HEAP.
+	 */
+	err = pvr_laguna_fw_auth(pvr_dev);
 	if (err)
 		return err;
 

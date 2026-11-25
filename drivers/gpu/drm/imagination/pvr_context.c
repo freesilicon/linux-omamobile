@@ -7,6 +7,7 @@
 #include "pvr_drv.h"
 #include "pvr_gem.h"
 #include "pvr_job.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_fwif_common.h"
@@ -52,8 +53,20 @@ remap_priority(struct pvr_file *pvr_file, s32 uapi_priority,
 	return 0;
 }
 
-static int get_fw_obj_size(enum drm_pvr_ctx_type type)
+static int get_fw_obj_size(struct pvr_device *pvr_dev, enum drm_pvr_ctx_type type)
 {
+	if (pvr_dev->laguna) {
+		switch (type) {
+		case DRM_PVR_CTX_TYPE_RENDER:
+			return sizeof(struct pvr_laguna_fwif_fwrendercontext);
+		case DRM_PVR_CTX_TYPE_COMPUTE:
+			return sizeof(struct pvr_laguna_fwif_fwcomputecontext);
+		case DRM_PVR_CTX_TYPE_TRANSFER_FRAG:
+			return sizeof(struct pvr_laguna_fwif_fwtransfercontext);
+		}
+		return -EINVAL;
+	}
+
 	switch (type) {
 	case DRM_PVR_CTX_TYPE_RENDER:
 		return sizeof(struct rogue_fwif_fwrendercontext);
@@ -94,6 +107,16 @@ static int init_render_fw_objs(struct pvr_context *ctx,
 	if (!args->static_context_state_len)
 		return -EINVAL;
 
+	if (ctx->pvr_dev->laguna) {
+		struct rogue_fwif_geom_registers_caswitch regs = { 0 };
+
+		return process_static_context_state(ctx->pvr_dev,
+						    &pvr_static_render_context_state_stream,
+						    args->static_context_state,
+						    args->static_context_state_len,
+						    &regs);
+	}
+
 	static_rendercontext_state = &fw_render_context->static_render_context_state;
 
 	/* Copy static render context state from userspace. */
@@ -113,6 +136,22 @@ static int init_compute_fw_objs(struct pvr_context *ctx,
 
 	if (!args->static_context_state_len)
 		return -EINVAL;
+
+	if (ctx->pvr_dev->laguna) {
+		struct rogue_fwif_cdm_registers_cswitch regs = { 0 };
+		int err;
+
+		err = process_static_context_state(ctx->pvr_dev,
+						   &pvr_static_compute_context_state_stream,
+						   args->static_context_state,
+						   args->static_context_state_len,
+						   &regs);
+		if (err)
+			return err;
+
+		pvr_laguna_copy_cdm_cswitch_regs(fw_ctx_map, &regs);
+		return 0;
+	}
 
 	ctxswitch_regs = &fw_compute_context->static_compute_context_state.ctxswitch_regs;
 
@@ -290,7 +329,7 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	if (args->flags)
 		return -EINVAL;
 
-	ctx_size = get_fw_obj_size(args->type);
+	ctx_size = get_fw_obj_size(pvr_dev, args->type);
 	if (ctx_size < 0)
 		return ctx_size;
 

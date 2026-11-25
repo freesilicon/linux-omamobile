@@ -844,6 +844,9 @@ pvr_device_init(struct pvr_device *pvr_dev)
 	if (err)
 		goto err_device_gpu_fini;
 
+	if (pvr_dev->laguna && pvr_laguna_kccb_ready(pvr_dev))
+		pvr_laguna_fw_health_check_irq(pvr_dev);
+
 	pm_runtime_put(dev);
 
 	return 0;

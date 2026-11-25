@@ -787,19 +787,26 @@ pvr_page_flags_raw_create(struct pvr_device *pvr_dev, bool read_only,
 	static_assert((VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK &
 		       ~ROGUE_MMUCTRL_PAGE_4KB_RANGE_CLRMSK) == 0);
 
-	flags.val.val =
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, SLC_BYPASS_CTRL, slc_bypass) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect);
-
 	if (PVR_HAS_FEATURE(pvr_dev, mmu_version) &&
 	    pvr_dev->features.mmu_version >= 4) {
 		u64 axcache = slc_bypass ? VOLCANIC_MMUCTRL_AXCACHE_UNCACHED :
 					   VOLCANIC_MMUCTRL_AXCACHE_CACHED;
 
-		flags.val.val |= FIELD_PREP(VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK,
-					    axcache);
+		/*
+		 * MMUv4 replaces Rogue's bit 3 SLC_BYPASS_CTRL with the 4-bit
+		 * AXI4 AxCACHE attribute field in PT_DATA[61:58].
+		 */
+		flags.val.val =
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect) |
+			FIELD_PREP(VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK, axcache);
+	} else {
+		flags.val.val =
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, SLC_BYPASS_CTRL, slc_bypass) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect);
 	}
 
 	return flags;

@@ -10,6 +10,7 @@
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_job.h"
+#include "pvr_laguna.h"
 #include "pvr_queue.h"
 #include "pvr_trace.h"
 #include "pvr_vm.h"
@@ -79,6 +80,8 @@ static int get_ctx_state_size(struct pvr_device *pvr_dev, enum drm_pvr_job_type 
 	case DRM_PVR_JOB_TYPE_FRAGMENT:
 		return get_frag_ctx_state_size(pvr_dev);
 	case DRM_PVR_JOB_TYPE_COMPUTE:
+		if (pvr_dev->laguna)
+			return sizeof(struct pvr_laguna_fwif_computectx_state);
 		return sizeof(struct rogue_fwif_compute_ctx_state);
 	case DRM_PVR_JOB_TYPE_TRANSFER_FRAG:
 		return get_xfer_ctx_state_size(pvr_dev);
@@ -88,8 +91,26 @@ static int get_ctx_state_size(struct pvr_device *pvr_dev, enum drm_pvr_job_type 
 	return -EINVAL;
 }
 
-static u32 get_ctx_offset(enum drm_pvr_job_type type)
+static u32 get_ctx_offset(struct pvr_device *pvr_dev, enum drm_pvr_job_type type)
 {
+	if (pvr_dev->laguna) {
+		switch (type) {
+		case DRM_PVR_JOB_TYPE_GEOMETRY:
+			return offsetof(struct pvr_laguna_fwif_fwrendercontext,
+					geom_context);
+		case DRM_PVR_JOB_TYPE_FRAGMENT:
+			return offsetof(struct pvr_laguna_fwif_fwrendercontext,
+					frag_context);
+		case DRM_PVR_JOB_TYPE_COMPUTE:
+			return offsetof(struct pvr_laguna_fwif_fwcomputecontext,
+					cdm_context);
+		case DRM_PVR_JOB_TYPE_TRANSFER_FRAG:
+			return offsetof(struct pvr_laguna_fwif_fwtransfercontext,
+					tdm_context);
+		}
+		return 0;
+	}
+
 	switch (type) {
 	case DRM_PVR_JOB_TYPE_GEOMETRY:
 		return offsetof(struct rogue_fwif_fwrendercontext, geom_context);
@@ -1091,6 +1112,11 @@ static void init_fw_context(struct pvr_queue *queue, void *fw_ctx_map)
 	struct rogue_fwif_fwcommoncontext *cctx_fw;
 	struct pvr_cccb *cccb = &queue->cccb;
 
+	if (ctx->pvr_dev->laguna) {
+		pvr_laguna_init_fw_common_context(queue, fw_ctx_map);
+		return;
+	}
+
 	cctx_fw = fw_ctx_map + queue->ctx_offset;
 	cctx_fw->ccbctl_fw_addr = cccb->ctrl_fw_addr;
 	cctx_fw->ccb_fw_addr = cccb->cccb_fw_addr;
@@ -1328,7 +1354,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
 		return ERR_PTR(-ENOMEM);
 
 	queue->type = type;
-	queue->ctx_offset = get_ctx_offset(type);
+	queue->ctx_offset = get_ctx_offset(pvr_dev, type);
 	queue->ctx = ctx;
 	queue->callstack_addr = args->callstack_addr;
 	sched = &queue->scheduler;

@@ -6,6 +6,7 @@
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_mmu.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_heap_config.h"
@@ -519,11 +520,21 @@ static const struct drm_gpuvm_ops pvr_vm_gpuva_ops = {
 static void
 fw_mem_context_init(void *cpu_ptr, void *priv)
 {
-	struct rogue_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
 	struct pvr_vm_context *vm_ctx = priv;
+	dma_addr_t pc_dma_addr = pvr_vm_get_page_table_root_addr(vm_ctx);
 
-	fw_mem_ctx->pc_dev_paddr = pvr_vm_get_page_table_root_addr(vm_ctx);
-	fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+	if (vm_ctx->pvr_dev->laguna) {
+		struct pvr_laguna_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
+
+		fw_mem_ctx->pc_dev_paddr = pc_dma_addr;
+		fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+		fw_mem_ctx->pc_pm_dev_paddr = pc_dma_addr;
+	} else {
+		struct rogue_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
+
+		fw_mem_ctx->pc_dev_paddr = pc_dma_addr;
+		fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+	}
 }
 
 /**
@@ -577,7 +588,11 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		goto err_free;
 
 	if (is_userspace_context) {
-		err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_fwmemcontext),
+		size_t fw_mem_ctx_size = pvr_dev->laguna ?
+			sizeof(struct pvr_laguna_fwif_fwmemcontext) :
+			sizeof(struct rogue_fwif_fwmemcontext);
+
+		err = pvr_fw_object_create(pvr_dev, fw_mem_ctx_size,
 					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
 

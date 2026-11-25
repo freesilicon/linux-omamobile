@@ -26,6 +26,8 @@ struct firmware;
 struct pvr_device;
 struct pvr_fw_object;
 struct pvr_power_sequence_ops;
+struct pvr_queue;
+struct rogue_fwif_cdm_registers_cswitch;
 struct rogue_fwif_kccb_cmd;
 struct tipc_chan;
 
@@ -33,9 +35,9 @@ struct tipc_chan;
 #define PVR_LAGUNA_FW_CARVEOUT_MIN_SIZE		0x02100000ULL /* 33 MiB */
 #define PVR_LAGUNA_SECURE_FW_MEM_SIZE		0x00200000ULL /* 2 MiB (Trusty isolated) */
 #define PVR_LAGUNA_FW_CODE_HEAP_OFFSET		0x00000000ULL
-#define PVR_LAGUNA_FW_CODE_HEAP_SIZE		0x00130000ULL
-#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET	0x00130000ULL
-#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE	0x000B0000ULL
+#define PVR_LAGUNA_FW_CODE_HEAP_SIZE		0x00120000ULL
+#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_OFFSET	0x00120000ULL
+#define PVR_LAGUNA_FW_PRIV_DATA_HEAP_SIZE	0x000C0000ULL
 #define PVR_LAGUNA_FW_RODATA_HEAP_OFFSET	0x001E0000ULL
 #define PVR_LAGUNA_FW_RODATA_HEAP_SIZE		0x00020000ULL
 #define PVR_LAGUNA_FW_SHARED_HEAP_OFFSET	0x00200000ULL
@@ -182,6 +184,7 @@ struct pvr_laguna_data {
 	struct pvr_fw_object *fwif_hwperf_rtcfg_obj;
 	struct pvr_fw_object *fwif_hwperf_ctl_obj;
 	struct pvr_fw_object *fwif_fault_page_obj;
+	struct pvr_fw_object *fwif_align_checks_obj;
 	struct pvr_fw_object *fwif_power_sync_obj;
 	struct pvr_fw_object *fwif_mmucache_sync_obj;
 	struct pvr_fw_object *kccb_ctl_obj;
@@ -215,6 +218,8 @@ void pvr_laguna_fw_fini(struct pvr_device *pvr_dev);
 int pvr_laguna_fw_start(struct pvr_device *pvr_dev);
 int pvr_laguna_fw_stop(struct pvr_device *pvr_dev);
 int pvr_laguna_fw_wait_boot(struct pvr_device *pvr_dev);
+void pvr_laguna_fw_health_check_irq(struct pvr_device *pvr_dev);
+int pvr_laguna_wait_pow_off(struct pvr_device *pvr_dev);
 void pvr_laguna_slc_program_lut(struct pvr_device *pvr_dev);
 int pvr_laguna_mba_send_msg(struct pvr_device *pvr_dev, u32 client_idx, u32 msg);
 unsigned long pvr_laguna_get_core_clk_rate(const struct pvr_device *pvr_dev);
@@ -230,5 +235,8 @@ void pvr_laguna_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 					       u32 *kccb_slot);
 bool pvr_laguna_kccb_is_idle(struct pvr_device *pvr_dev);
 void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev);
+void pvr_laguna_init_fw_common_context(struct pvr_queue *queue, void *fw_ctx_map);
+void pvr_laguna_copy_cdm_cswitch_regs(void *fw_ctx_map,
+				      const struct rogue_fwif_cdm_registers_cswitch *src);
 
 #endif /* PVR_LAGUNA_H */
