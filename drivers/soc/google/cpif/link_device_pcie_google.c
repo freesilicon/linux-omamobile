@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include "modem_v1.h"
+#define __CPIF_PCIE_GOOGLE_IMPL
 #include "cpif_pcie_shim.h"
 
 static void cpif_pcie_callback(enum google_pcie_callback_type type, void *priv)

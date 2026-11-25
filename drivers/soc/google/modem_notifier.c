@@ -5,6 +5,7 @@
 
 #include <linux/module.h>
 #include <linux/notifier.h>
+#define __MODEM_NOTIFIER_IMPL
 #include <soc/google/modem_notifier.h>
 
 static ATOMIC_NOTIFIER_HEAD(modem_event_notifier);

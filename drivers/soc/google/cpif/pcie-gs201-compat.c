@@ -9,6 +9,7 @@
 #include <linux/soc/google/gs201-pcie-cp.h>
 #include <linux/types.h>
 
+#define __CPIF_PCIE_GS201_IMPL
 #include "modem_prj.h"
 #include "s51xx_pcie.h"
 

@@ -51,7 +51,7 @@ typedef struct cpif_pcie_register_event {
 void cpif_pcie_set_google(bool google);
 bool cpif_pcie_is_google(void);
 
-#if IS_REACHABLE(CONFIG_PCIE_GS201_CP)
+#if IS_REACHABLE(CONFIG_PCIE_GS201_CP) || defined(__CPIF_PCIE_GS201_IMPL)
 int cpif_gs201_pcie_register_event(pcie_register_event_t *reg);
 int cpif_gs201_pcie_deregister_event(pcie_register_event_t *reg);
 void cpif_gs201_pcie_register_dump(int ch_num);
@@ -102,7 +102,7 @@ static inline int cpif_gs201_pcie_register_separated_msi_vector(int ch_num,
 static inline int cpif_gs201_pcie_set_msi_ctrl_addr(int num, u64 msi_ctrl_addr) { return -ENODEV; }
 #endif
 
-#if IS_REACHABLE(CONFIG_PCIE_GOOGLE_LGA)
+#if IS_REACHABLE(CONFIG_PCIE_GOOGLE_LGA) || defined(__CPIF_PCIE_GOOGLE_IMPL)
 int cpif_google_pcie_register_event(pcie_register_event_t *reg);
 int cpif_google_pcie_deregister_event(pcie_register_event_t *reg);
 int cpif_google_pcie_l1ss_ctrl(int aspm_state, int ch_num);

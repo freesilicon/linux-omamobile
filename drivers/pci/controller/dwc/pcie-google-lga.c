@@ -22,6 +22,7 @@
 #include <linux/pci.h>
 #include <linux/pci-pwrctrl.h>
 #include <linux/pci_regs.h>
+#define __PCIE_GOOGLE_LGA_IMPL
 #include <linux/pcie_google_if.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>

@@ -6,6 +6,8 @@
 
 #include "link_device_pcie_iommu.h"
 
+#if IS_ENABLED(CONFIG_LINK_DEVICE_PCIE_IOMMU)
+
 void cpif_pcie_iommu_enable_regions(struct mem_link_device *mld)
 {
 	/*
@@ -168,3 +170,5 @@ set_unmap:
 	ioc->unmap_src_pa = src_pa;
 	ioc->unmap_page_size = page_size(virt_to_head_page(addr));
 }
+
+#endif /* CONFIG_LINK_DEVICE_PCIE_IOMMU */

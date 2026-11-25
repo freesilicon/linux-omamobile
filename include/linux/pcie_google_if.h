@@ -44,7 +44,7 @@ struct google_pcie_link_stats {
 typedef void (*google_pcie_callback_func)(enum google_pcie_callback_type type,
 					  void *priv);
 
-#if IS_ENABLED(CONFIG_PCIE_GOOGLE_LGA)
+#if IS_ENABLED(CONFIG_PCIE_GOOGLE_LGA) || defined(__PCIE_GOOGLE_LGA_IMPL)
 
 int google_pcie_rc_poweron(int num);
 int google_pcie_rc_poweroff(int num);
