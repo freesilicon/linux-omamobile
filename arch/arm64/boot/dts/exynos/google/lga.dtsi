@@ -43,6 +43,7 @@
 
 	aliases {
 		serial0 = &uart16;
+		serial1 = &uart12;
 		serial2 = &uart9;
 		ufs0 = &ufs0;
 	};
@@ -463,6 +464,15 @@
 			on-at-init;
 		};
 
+		aoc_core_pd: aoc_core_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x0>;
+			power-domains = <&sswrp_aoc_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+			no-auto-resume;
+		};
+
 		sswrp_lsio_n_pd: sswrp_lsio_n_pd {
 			#power-domain-cells = <0>;
 			sswrp-id = <0x1d>;
@@ -570,6 +580,20 @@
 			#clock-cells = <0>;
 			lpcm-id = <0x4>;
 			clock-id = <0x0>;
+		};
+
+		lsioe_cli12_cfg_clk: lsioe_cli12_cfg_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x2>;
+			clock-id = <0x6>;
+			rates = <0x0 0x11e1a300>; /* 300 MHz */
+		};
+
+		lsioe_cli12_uart_clk: lsioe_cli12_uart_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x2>;
+			clock-id = <0x1e>;
+			rates = <0x0 0x0bebc200>; /* 200 MHz */
 		};
 
 		lsioe_cli14_cfg_clk: lsioe_cli14_cfg_clk {
@@ -732,6 +756,13 @@
 
 			regulators {
 				da9188 {
+					ldo_4m_reg: ldo_4m {
+						regulator-name = "ldo_4m";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+						google,monitor-only;
+					};
+
 					ldo_10m_reg: ldo_10m {
 						regulator-name = "ldo_10m";
 						regulator-min-microvolt = <1200000>;
@@ -766,6 +797,24 @@
 				};
 
 				da9189 {
+					ldo_5s_reg: ldo_5s {
+						regulator-name = "ldo_5s";
+						regulator-min-microvolt = <3300000>;
+						regulator-max-microvolt = <3300000>;
+					};
+
+					ldo_7s_reg: ldo_7s {
+						regulator-name = "ldo_7s";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <1800000>;
+					};
+
+					ldo_10s_reg: ldo_10s {
+						regulator-name = "ldo_10s";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+					};
+
 					ldo_18s_reg: ldo_18s {
 						regulator-name = "ldo_18s";
 						regulator-min-microvolt = <3100000>;
@@ -795,6 +844,16 @@
 			#gpio-cells = <2>;
 			ngpios = <19>;
 			gpio-ranges = <&da9188_gpio 0 0 19>;
+		};
+
+		da9188_vgpio: da9188-vgpio {
+			compatible = "google,da9188-vgpio";
+			mba-dest-channel = <0xa>;
+			mboxes = <&goog_mba_cpm_iface>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <32>;
+			status = "disabled";
 		};
 	};
 
@@ -1075,6 +1134,42 @@
 			status = "disabled";
 		};
 
+		/* === Stage 1 Bluetooth HCI UART (LSIOE CLI12, 4-wire, disabled by default) === */
+		uart12: serial@3a352000 {
+			compatible = "google,lga-uart", "snps,dw-apb-uart";
+			reg = <0x0 0x3a352000 0x0 0x100>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			interrupts-extended = <&lsioe_level_gia_4 5>;
+			clocks = <&lsioe_cli12_uart_clk>, <&lsioe_cli12_cfg_clk>;
+			clock-names = "baudclk", "apb_pclk";
+			resets = <&lsioe_resets 0x16>;
+			reset-names = "s_rst_n";
+			power-domains = <&lsio_e_cli_gpio_pd>;
+			pinctrl-0 = <&xlsioe_cli12_pin0 &xlsioe_cli12_pin1
+				     &xlsioe_cli12_pin2 &xlsioe_cli12_pin3
+				     &cli12_uart_conf>;
+			pinctrl-1 = <&xlsioe_cli12_pin0_sleep &xlsioe_cli12_pin1_sleep
+				     &xlsioe_cli12_pin2_sleep &xlsioe_cli12_pin3_sleep>;
+			pinctrl-2 = <&cli12_uart_conf>;
+			pinctrl-names = "default", "sleep", "cli";
+			status = "disabled";
+
+			bt_bcm4390: bluetooth {
+				compatible = "brcm,bcm4390-bt";
+				pinctrl-names = "default";
+				pinctrl-0 = <&bt_dev_wake &bt_host_wake>;
+				shutdown-gpios = <&da9188_vgpio 0x13 GPIO_ACTIVE_HIGH>;
+				brcm,ble-dbo-gpios = <&da9188_vgpio 0x14 GPIO_ACTIVE_HIGH>;
+				device-wakeup-gpios = <&pinctrl_aoc 0xd GPIO_ACTIVE_HIGH>;
+				interrupts-extended = <&pinctrl_aoc 0x16 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "host-wakeup";
+				vddio-supply = <&ldo_4m_reg>;
+				max-speed = <3000000>;
+				status = "disabled";
+			};
+		};
+
 		pinctrl_cpm: pinctrl@5280000 {
 			compatible = "google,lga-cpm-pinctrl";
 			reg = <0x0 0x05280000 0x0 0x39000>;
@@ -1199,6 +1294,16 @@
 					   0x37 0x38 0x39 0x3a 0x41 0x42>;
 			status = "disabled";
 
+			bt_dev_wake: bt-dev-wake {
+				pins = "XAOC_GPIO1";
+				function = "aoc_cpm_eint";
+			};
+
+			bt_host_wake: bt-host-wake {
+				pins = "XAOC_GPIO2";
+				function = "aoc_cpm_eint";
+			};
+
 			ts0_2_aoc_int_l_1v2: ts0_2_aoc_int_l_1v2 {
 				pins = "XAOC_GPIO12";
 				bias-pull-up;
@@ -1283,6 +1388,70 @@
 					   0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17
 					   0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f>;
 			status = "disabled";
+
+			xlsioe_cli12_pin0: xlsioe_cli12_pin0 {
+				pins = "XLSIOE_CLI12_PIN0";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "lsioe_cli12";
+			};
+
+			xlsioe_cli12_pin1: xlsioe_cli12_pin1 {
+				pins = "XLSIOE_CLI12_PIN1";
+				bias-disable;
+				drive-strength = <0x2>;
+				input-enable;
+				output-enable;
+				function = "lsioe_cli12";
+			};
+
+			xlsioe_cli12_pin2: xlsioe_cli12_pin2 {
+				pins = "XLSIOE_CLI12_PIN2";
+				bias-disable;
+				drive-strength = <0x2>;
+				input-enable;
+				output-enable;
+				function = "lsioe_cli12";
+			};
+
+			xlsioe_cli12_pin3: xlsioe_cli12_pin3 {
+				pins = "XLSIOE_CLI12_PIN3";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "lsioe_cli12";
+			};
+
+			xlsioe_cli12_pin0_sleep: xlsioe_cli12_pin0_sleep {
+				pins = "XLSIOE_CLI12_PIN0";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "lsioe_gpio";
+			};
+
+			xlsioe_cli12_pin1_sleep: xlsioe_cli12_pin1_sleep {
+				pins = "XLSIOE_CLI12_PIN1";
+				input-enable;
+				output-high;
+				function = "lsioe_gpio";
+			};
+
+			xlsioe_cli12_pin2_sleep: xlsioe_cli12_pin2_sleep {
+				pins = "XLSIOE_CLI12_PIN2";
+				input-enable;
+				output-high;
+				function = "lsioe_gpio";
+			};
+
+			xlsioe_cli12_pin3_sleep: xlsioe_cli12_pin3_sleep {
+				pins = "XLSIOE_CLI12_PIN3";
+				bias-pull-up;
+				input-enable;
+				output-disable;
+				function = "lsioe_gpio";
+			};
 
 			cli14_2_wire_func: cli14_2_wire_func {
 				pins = "XLSIOE_CLI14_PIN0", "XLSIOE_CLI14_PIN1";
@@ -1430,6 +1599,18 @@
 			status = "disabled";
 		};
 
+		lsioe_cli12: pinctrl@3a350000 {
+			compatible = "pinctrl-single";
+			reg = <0x0 0x3a350000 0x0 0x10>;
+			pinctrl-single,register-width = <0x20>;
+			pinctrl-single,function-mask = <0xffffffff>;
+			#pinctrl-cells = <1>;
+
+			cli12_uart_conf: cli12_uart {
+				pinctrl-single,pins = <0x0 0x2 0x4 0x0 0x8 0x0>;
+			};
+		};
+
 		lsioe_cli14: pinctrl@3a370000 {
 			compatible = "pinctrl-single";
 			reg = <0x0 0x3a370000 0x0 0x10>;
@@ -1571,6 +1752,261 @@
 			#iommu-cells = <1>;
 			arm,instdata-override;
 			arm,max-sid-bits = <16>;
+			status = "disabled";
+		};
+
+		/* === Stage 1 AoC MBA v2.0 Mailboxes & DSP Complex (disabled by default) === */
+		aoc_mba_syscon: syscon@b490000 {
+			compatible = "google,aoc-mba-global", "syscon";
+			reg = <0x0 0x0b490000 0x0 0x80>;
+			status = "disabled";
+		};
+
+		aoc_ap_0_mba: mailbox@b4a0000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a0000 0x0 0x1000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 0>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_1_mba: mailbox@b4a1000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a1000 0x0 0x1000>;
+			interrupts = <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 1>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_2_mba: mailbox@b4a2000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a2000 0x0 0x1000>;
+			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 2>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_3_mba: mailbox@b4a3000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a3000 0x0 0x1000>;
+			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 3>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_4_mba: mailbox@b4a4000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a4000 0x0 0x1000>;
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 4>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_5_mba: mailbox@b4a5000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a5000 0x0 0x1000>;
+			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 5>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_6_mba: mailbox@b4a6000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a6000 0x0 0x1000>;
+			interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 6>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_7_mba: mailbox@b4a7000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a7000 0x0 0x1000>;
+			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 7>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_8_mba: mailbox@b4a8000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a8000 0x0 0x1000>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 8>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_9_mba: mailbox@b4a9000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4a9000 0x0 0x1000>;
+			interrupts = <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 9>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_10_mba: mailbox@b4aa000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4aa000 0x0 0x1000>;
+			interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 10>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_11_mba: mailbox@b4ab000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4ab000 0x0 0x1000>;
+			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 11>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_12_mba: mailbox@b4ac000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4ac000 0x0 0x1000>;
+			interrupts = <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 12>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_13_mba: mailbox@b4ad000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4ad000 0x0 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 13>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_14_mba: mailbox@b4ae000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4ae000 0x0 0x1000>;
+			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 14>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_15_mba: mailbox@b4af000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4af000 0x0 0x1000>;
+			interrupts = <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 15>;
+			mba-ip-version = <2 0>;
+			payload-size = <1>;
+			status = "disabled";
+		};
+
+		aoc_ap_16_mba: mailbox@b4b0000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4b0000 0x0 0x1000>;
+			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 16>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_17_mba: mailbox@b4b1000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4b1000 0x0 0x1000>;
+			interrupts = <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 17>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_18_mba: mailbox@b4b2000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4b2000 0x0 0x1000>;
+			interrupts = <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 18>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc_ap_19_mba: mailbox@b4b3000 {
+			compatible = "google,mba-ctrl";
+			reg = <0x0 0x0b4b3000 0x0 0x1000>;
+			interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <1>;
+			google,syscon-phandle = <&aoc_mba_syscon 19>;
+			mba-ip-version = <2 0>;
+			payload-size = <0>;
+			status = "disabled";
+		};
+
+		aoc: aoc@9000000 {
+			compatible = "google,lga-aoc";
+			reg = <0x0 0x09000000 0x0 0x02000000>,
+			      <0x0 0x0b4c0000 0x0 0x0000be28>;
+			reg-names = "blk_aoc", "lcpm";
+			wakeup-source;
+			iommus = <&amb_smmu 0x8300>, <&amb_smmu 0x8309>;
+			memory-region = <&aoc_rmem>;
+			mboxes = <&aoc_ap_0_mba 0>, <&aoc_ap_1_mba 0>,
+				 <&aoc_ap_2_mba 0>, <&aoc_ap_3_mba 0>,
+				 <&aoc_ap_4_mba 0>, <&aoc_ap_5_mba 0>,
+				 <&aoc_ap_6_mba 0>, <&aoc_ap_7_mba 0>,
+				 <&aoc_ap_8_mba 0>, <&aoc_ap_9_mba 0>,
+				 <&aoc_ap_10_mba 0>, <&aoc_ap_11_mba 0>,
+				 <&aoc_ap_12_mba 0>, <&aoc_ap_13_mba 0>,
+				 <&aoc_ap_14_mba 0>, <&aoc_ap_15_mba 0>,
+				 <&aoc_ap_16_mba 0>, <&aoc_ap_17_mba 0>,
+				 <&aoc_ap_18_mba 0>, <&aoc_ap_19_mba 0>;
+			power-domains = <&sswrp_aoc_pd>, <&aoc_core_pd>;
+			power-domain-names = "sswrp_aoc_pd", "aoc_core_pd";
+			gsa-device = <&gsa>;
+			sensor-1v8-supply = <&ldo_7s_reg>;
+			sensor-3v3-supply = <&ldo_5s_reg>;
+			google,gnss-type = <2>;
+			google,coredump-mbox = <19>;
 			status = "disabled";
 		};
 

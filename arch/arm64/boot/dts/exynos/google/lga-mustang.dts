@@ -200,3 +200,7 @@
 &gpu_stage0_probe {
 	status = "okay";
 };
+
+&ldo_10s_reg {
+	google,monitor-only;
+};

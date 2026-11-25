@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Opt-in Bluetooth HCI UART overlay for Google Pixel 10 Pro Fold (rango).
+ *
+ * Enables DA9188 virtual GPIOs (BT_REG_ON / BLE DBO latch), LSIOE CLI12
+ * 4-wire UART (uart12 @ 0x3a352000), and the BCM4390 serdev child node.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&da9188_vgpio {
+	status = "okay";
+};
+
+&uart12 {
+	status = "okay";
+};
+
+&bt_bcm4390 {
+	status = "okay";
+};

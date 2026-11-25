@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Opt-in Stage 1 AoC bring-up overlay for Google Pixel 10 Pro XL (mustang).
+ *
+ * Enables the 20 AoC google,mba-ctrl v2.0 doorbell mailboxes and google,lga-aoc
+ * with mustang's verified stock AoC board metadata (MT5, 0x70503, 0x10000).
+ * Firmware loading remains manual via /sys/kernel/debug/lga-aoc/load.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&aoc_mba_syscon {
+	status = "okay";
+};
+
+&aoc_ap_0_mba {
+	status = "okay";
+};
+
+&aoc_ap_1_mba {
+	status = "okay";
+};
+
+&aoc_ap_2_mba {
+	status = "okay";
+};
+
+&aoc_ap_3_mba {
+	status = "okay";
+};
+
+&aoc_ap_4_mba {
+	status = "okay";
+};
+
+&aoc_ap_5_mba {
+	status = "okay";
+};
+
+&aoc_ap_6_mba {
+	status = "okay";
+};
+
+&aoc_ap_7_mba {
+	status = "okay";
+};
+
+&aoc_ap_8_mba {
+	status = "okay";
+};
+
+&aoc_ap_9_mba {
+	status = "okay";
+};
+
+&aoc_ap_10_mba {
+	status = "okay";
+};
+
+&aoc_ap_11_mba {
+	status = "okay";
+};
+
+&aoc_ap_12_mba {
+	status = "okay";
+};
+
+&aoc_ap_13_mba {
+	status = "okay";
+};
+
+&aoc_ap_14_mba {
+	status = "okay";
+};
+
+&aoc_ap_15_mba {
+	status = "okay";
+};
+
+&aoc_ap_16_mba {
+	status = "okay";
+};
+
+&aoc_ap_17_mba {
+	status = "okay";
+};
+
+&aoc_ap_18_mba {
+	status = "okay";
+};
+
+&aoc_ap_19_mba {
+	status = "okay";
+};
+
+&aoc {
+	firmware-name = "google/aoc-mustang.bin";
+	google,board-cfg = "MT5";
+	google,board-id = <0x70503>;
+	google,board-rev = <0x10000>;
+	status = "okay";
+};
