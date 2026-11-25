@@ -251,8 +251,12 @@
 	remote-endpoint = <&panel0_in>;
 };
 
+&dw_mipi_g301_cdphy1 {
+	status = "okay";
+};
+
 &dsi2h1 {
-	status = "disabled";
+	status = "okay";
 	datarate = <1468>;
 	#address-cells = <1>;
 	#size-cells = <0>;
@@ -262,6 +266,7 @@
 		reg = <0>;
 		vci-supply = <&ldo_14m_reg>;
 		vddd-supply = <&s2dos07x02_inner>;
+		reset-gpios = <&da9188_gpio 0xc GPIO_ACTIVE_HIGH>;
 
 		port {
 			panel1_in: endpoint {
@@ -276,6 +281,20 @@
 };
 
 &dpu {
+	interrupts = <0x24>, <0x25>, <0x26>, <0x29>,
+		     <0x30>, <0x31>, <0x32>, <0x47>;
+	interrupt-names = "outpath0_frm_start",
+			  "outpath0_frm_done",
+			  "outpath0_underrun",
+			  "output0_te_rising_edge",
+			  "outpath1_frm_start",
+			  "outpath1_frm_done",
+			  "outpath1_underrun",
+			  "output1_te_rising_edge";
+	power-domains = <&dpu_dsi0_pd>, <&dpu_dsi1_pd>,
+			<&dpu_fe0_pd>, <&dpu_fe1_pd>;
+	power-domain-names = "dpu_dsi0_pd", "dpu_dsi1_pd",
+			     "dpu_fe0_pd", "dpu_fe1_pd";
 	status = "okay";
 };
 
