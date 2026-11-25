@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/google/samsung,exynos-cp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos/Google CPIF Cellular Modem Interface
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description:
+  Platform binding for the Samsung/Google CPIF cellular modem control, PCIe
+  link transport, shared-memory doorbell/status configuration, and IO device
+  channel table (S5300 / S5400).
+
+properties:
+  compatible:
+    const: samsung,exynos-cp
+
+  pci_ch_num:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: PCIe domain/channel index connected to the modem endpoint.
+
+  pci_db_addr:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Optional modem doorbell BAR base override (0 uses endpoint BAR0).
+
+  pci_aoc_addr:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Base address of the AoC audio window mapped for modem DMA.
+
+  cpboot_spi_bus_num:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: SPI bus index when SPI boot fallback is configured.
+
+  mif,name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Modem variant name string (e.g. s5300, s5400).
+
+  mif,cp_num:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Modem instance index matching cp-shmem cp_num.
+
+  mif,modem_type:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,protocol:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,ipc_version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,link_type:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,link_name:
+    $ref: /schemas/types.yaml#/definitions/string
+
+  mif,link_attrs:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,interrupt_types:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,capability_check:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif,cp2ap_active_not_alive:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  mif_off_during_volte:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  google,clk-buffer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the Google S5910 SPMI clock buffer companion device.
+
+  google,cp-pmic-spmi:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the Google companion modem PMIC SPMI slave device.
+
+  use-dynamic-link-spd:
+    type: boolean
+    description: Enable dynamic PCIe Gen1/Gen3 speed scaling in CPIF.
+
+  tp-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Throughput upshift threshold in Mbps for dynamic PCIe link speed.
+
+  tp-hysteresis:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Throughput hysteresis in Mbps for dynamic PCIe link speed.
+
+  ap2cp-cp-pwr-on-gpios:
+    maxItems: 1
+  ap2cp-nreset-gpios:
+    maxItems: 1
+  ap2cp-wakeup-gpios:
+    maxItems: 1
+  ap2cp-dump-noti-gpios:
+    maxItems: 1
+  ap2cp-pda-active-gpios:
+    maxItems: 1
+  ap2cp-cp-wrst-gpios:
+    maxItems: 1
+  ap2cp-pm-wrst-gpios:
+    maxItems: 1
+  ap2cp-partial-rst-n-gpios:
+    maxItems: 1
+  cp2ap-wakeup-gpios:
+    maxItems: 1
+  cp2ap-phone-active-gpios:
+    maxItems: 1
+  cp2ap-cp-wrst-gpios:
+    maxItems: 1
+  cp2ap-ps-hold-gpios:
+    maxItems: 1
+
+  iodevs:
+    type: object
+    description: Logical character and network IO device descriptors.
+    additionalProperties:
+      type: object
+      properties:
+        iod,name:
+          $ref: /schemas/types.yaml#/definitions/string
+        iod,ch:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,format:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,io_type:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,link_type:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,attrs:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,ch_count:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,max_tx_size:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,ul_num_buffers:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,ul_buffer_size:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,dl_num_buffers:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,dl_buffer_size:
+          $ref: /schemas/types.yaml#/definitions/uint32
+        iod,option_region:
+          $ref: /schemas/types.yaml#/definitions/string
+      required:
+        - iod,name
+        - iod,ch
+        - iod,format
+        - iod,io_type
+        - iod,link_type
+        - iod,attrs
+      additionalProperties: false
+
+patternProperties:
+  "^(mif,int_ap2cp|mif,irq_cp2ap|legacy_|offset_|srinfo_|capability_|ap_capability_|ap2cp_|cp2ap_|sbi_|pktproc_)":
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+
+required:
+  - compatible
+  - mif,name
+  - mif,cp_num
+  - iodevs
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    cpif {
+        compatible = "samsung,exynos-cp";
+        pci_ch_num = <0>;
+        mif,name = "s5400";
+        mif,cp_num = <0>;
+        google,clk-buffer = <&s5910>;
+        google,cp-pmic-spmi = <&cp_pmic>;
+        use-dynamic-link-spd;
+
+        iodevs {
+            io_device_0 {
+                iod,name = "umts_boot0";
+                iod,ch = <0xf1>;
+                iod,format = <4>;
+                iod,io_type = <0>;
+                iod,link_type = <1>;
+                iod,attrs = <0x4200>;
+            };
+        };
+    };

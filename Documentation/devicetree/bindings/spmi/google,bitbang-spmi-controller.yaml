@@ -59,7 +59,7 @@ required:
   - clk-gpios
   - dat-gpios
 
-additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |
