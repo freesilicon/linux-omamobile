@@ -12,7 +12,14 @@ dtb-$(CONFIG_ARCH_EXYNOS) += \
 	zuma-husky.dtb \
 	zumapro-tegu.dtb \
 	lga-mustang.dtb \
-	lga-rango.dtb
+	lga-mustang-s5400-modem.dtbo \
+	lga-mustang-s5400-modem.dtb \
+	lga-rango.dtb \
+	lga-rango-s5400-modem.dtbo \
+	lga-rango-s5400-modem.dtb
+
+lga-mustang-s5400-modem-dtbs := lga-mustang.dtb lga-mustang-s5400-modem.dtbo
+lga-rango-s5400-modem-dtbs := lga-rango.dtb lga-rango-s5400-modem.dtbo
 
 # ABL applies board overlays, so keep symbols for labels
 DTC_FLAGS_gs101-bluejay += -@

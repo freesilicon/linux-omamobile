@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Opt-in overlay enabling the Samsung S5400i cellular modem stack on
+ * Google Pixel 10 Pro Fold (rango):
+ * - pinctrl_hsion and pinctrl_gdmc pin/GPIO controllers
+ * - HSIO_N GIA aggregators and pcie0 (c500000) Root Complex
+ * - Bit-banged SPMI bus (s5910_bb) with S5910 clock buffer and CP PMIC
+ * - CPIF shared-memory map (cp_shmem) and modem interface (cpif)
+ */
+/dts-v1/;
+/plugin/;
+
+&pinctrl_hsion {
+	status = "okay";
+};
+
+&pinctrl_gdmc {
+	status = "okay";
+};
+
+&hsion_pulse_gia_3 {
+	status = "okay";
+};
+
+&hsion_pulse_gia_4 {
+	status = "okay";
+};
+
+&pcie0 {
+	status = "okay";
+};
+
+&s5910_bb {
+	status = "okay";
+};
+
+&cp_shmem {
+	status = "okay";
+};
+
+&cpif {
+	status = "okay";
+};
