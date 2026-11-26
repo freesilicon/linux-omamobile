@@ -91,6 +91,12 @@ static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
 #define PVR_LAGUNA_CDM_FLAG_WGP_CHECKSUM	BIT(0)
 #define PVR_LAGUNA_CDM_FLAG_PREVENT_ALL_OVERLAP	BIT(1)
 #define PVR_LAGUNA_CDM_FLAG_USRM_RECONFIG	BIT(3)
+/*
+ * BIT(4) -> CR 0x05b8 (written by Volcanic FW CDM kick; also set to 1 by FW
+ * register clear and direct-stream compute kicks so top-level CDM streams do
+ * not fetch a return address from CDM Stack State CR 0x0598 + 0x180).
+ */
+#define PVR_LAGUNA_CDM_FLAG_DIRECT_STREAM	BIT(4)
 
 /*
  * DDK 25.3 Volcanic RGXFWIF_CDM_REGISTERS (56 bytes, loaded at CMDCDM + 0x08).

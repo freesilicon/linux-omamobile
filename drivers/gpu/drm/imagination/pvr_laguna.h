@@ -217,6 +217,8 @@ struct pvr_laguna_data {
 	u32 mmucache_sync_seq;
 	u64 last_cdm_cs_base;
 	u64 last_cdm_ctx_state_base;
+	u64 last_cdm_stack_base;
+	u32 last_cdm_flags;
 
 	struct work_struct restart_work;
 	spinlock_t restart_lock; /* protects restart burst tracking */

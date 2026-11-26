@@ -1278,12 +1278,14 @@ static void pvr_laguna_log_mmu_fault(struct pvr_device *pvr_dev,
 	fbm = !!(status2 & VOLCANIC_CR_MMU_FAULT_STATUS2_FBM_FAULT_EN);
 
 	drm_err(from_pvr_device(pvr_dev),
-		"Laguna MMU fault [%s]: valid=%u %s va=%#llx level=%s(%u) pc=%u bank=%u req=%s(%#x) type=%u last_cdm(cs=%#llx ctx=%#llx)\n",
+		"Laguna MMU fault [%s]: valid=%u %s va=%#llx level=%s(%u) pc=%u bank=%u req=%s(%#x) type=%u last_cdm(cs=%#llx ctx=%#llx stk=%#llx flg=%#x)\n",
 		tag, valid ? 1U : 0U, rnw ? "read" : "write", va,
 		pvr_laguna_mmu_level_name(level), level, pc_ctx, bank,
 		pvr_laguna_mmu_req_name(bank, req_id, fbm, wb), req_id, ftype,
 		laguna ? READ_ONCE(laguna->last_cdm_cs_base) : 0ULL,
-		laguna ? READ_ONCE(laguna->last_cdm_ctx_state_base) : 0ULL);
+		laguna ? READ_ONCE(laguna->last_cdm_ctx_state_base) : 0ULL,
+		laguna ? READ_ONCE(laguna->last_cdm_stack_base) : 0ULL,
+		laguna ? READ_ONCE(laguna->last_cdm_flags) : 0U);
 }
 
 void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
@@ -1966,11 +1968,20 @@ int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
 	if (src->flags & ROGUE_COMPUTE_FLAG_PREVENT_ALL_OVERLAP)
 		dst->flags |= PVR_LAGUNA_CDM_FLAG_PREVENT_ALL_OVERLAP;
 
+	/*
+	 * Set CMDCDM flags BIT(4) -> CR 0x05b8 = 1 (matching FW boot-time
+	 * register clear and direct-stream compute kicks) so top-level CDM
+	 * streams do not fetch a return address from CR 0x0598 + 0x180.
+	 */
+	dst->flags |= PVR_LAGUNA_CDM_FLAG_DIRECT_STREAM;
+
 	dst->max_num_temp_regions = src->num_temp_regions;
 
 	WRITE_ONCE(laguna->last_cdm_cs_base, dst->regs.cdm_ctrl_stream_base);
 	WRITE_ONCE(laguna->last_cdm_ctx_state_base,
 		   dst->regs.cdm_context_state_base_addr);
+	WRITE_ONCE(laguna->last_cdm_stack_base, dst->regs.cdm_cb_queue);
+	WRITE_ONCE(laguna->last_cdm_flags, dst->flags);
 
 	kfree(job->cmd);
 	job->cmd = dst;
