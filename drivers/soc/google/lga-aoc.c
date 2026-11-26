@@ -58,13 +58,9 @@
 #define LGA_AOC_PQ_SUBHDR_OFF		0x4630U
 #define LGA_AOC_IMG_CFG_SIZE		256U
 
-/* LCPM core control, boot sync, and bootloader PLL registers */
-#define LGA_AOC_LCPM_A32_CTRL_OFF	0x400U
-#define LGA_AOC_LCPM_F1_CTRL_OFF	0x420U
-#define LGA_AOC_LCPM_HF0_CTRL_OFF	0x440U
-#define LGA_AOC_LCPM_HF1_CTRL_OFF	0x460U
+/* LCPM scratch/status registers */
+#define LGA_AOC_LCPM_RESET_OFF		0x400U
 #define LGA_AOC_LCPM_INIT_OFF		0x480U
-#define LGA_AOC_LCPM_BOOT_PLL_OFF	0xb000U
 #define LGA_AOC_LOG_SNAPSHOT_MAX	SZ_512K
 
 /* Four heaps reserved at the top of the AoC carve-out (total 0x434000) */
@@ -926,43 +922,6 @@ static int lga_aoc_discover_services(struct lga_aoc *aoc)
 	return 0;
 }
 
-struct lga_aoc_lcpm_snapshot {
-	bool has_core;
-	bool has_pll;
-	u32 a32;
-	u32 f1;
-	u32 hf0;
-	u32 hf1;
-	u32 init;
-	u32 pll_cfg;
-	u32 pll_req;
-	u32 pll_stat;
-};
-
-static void lga_aoc_read_lcpm(struct lga_aoc *aoc,
-			      struct lga_aoc_lcpm_snapshot *snap)
-{
-	memset(snap, 0, sizeof(*snap));
-	if (!aoc->lcpm || !aoc->sswrp_pd_on)
-		return;
-
-	if (aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32)) {
-		snap->has_core = true;
-		snap->a32 = readl(aoc->lcpm + LGA_AOC_LCPM_A32_CTRL_OFF);
-		snap->f1 = readl(aoc->lcpm + LGA_AOC_LCPM_F1_CTRL_OFF);
-		snap->hf0 = readl(aoc->lcpm + LGA_AOC_LCPM_HF0_CTRL_OFF);
-		snap->hf1 = readl(aoc->lcpm + LGA_AOC_LCPM_HF1_CTRL_OFF);
-		snap->init = readl(aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
-	}
-
-	if (aoc->lcpm_size >= LGA_AOC_LCPM_BOOT_PLL_OFF + 3U * sizeof(u32)) {
-		snap->has_pll = true;
-		snap->pll_cfg = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF);
-		snap->pll_req = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF + 4U);
-		snap->pll_stat = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF + 8U);
-	}
-}
-
 static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 			       bool allow_fallback)
 {
@@ -1007,14 +966,6 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	ret = lga_aoc_core_pd_set(aoc, true);
 	if (ret)
 		goto out_rel;
-
-	/*
-	 * Clear LCPM boot-sync scratch only while both sswrp_aoc_pd and
-	 * aoc_core_pd are powered on so warm reloads match cold-boot state.
-	 */
-	if (aoc->lcpm && aoc->sswrp_pd_on &&
-	    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
-		writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
 
 	ret = lga_aoc_alloc_mboxes(aoc);
 	if (ret)
@@ -1062,8 +1013,6 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	return 0;
 
 out_pd:
-	if (!persist_iommu)
-		lga_aoc_unmap_iommu(aoc);
 	lga_aoc_core_pd_set(aoc, false);
 out_rel:
 	release_firmware(fw);
@@ -1143,8 +1092,17 @@ static int lga_aoc_power_cycle_sswrp(struct lga_aoc *aoc)
 	if (!pinctrl_ret)
 		google_pinctrl_aoc_ssr_request(false);
 
-	if (aoc->sswrp_pd_on)
-		pm_runtime_resume(aoc->dev);
+	if (aoc->sswrp_pd_on) {
+		int dev_pm_ret;
+
+		if (aoc->lcpm &&
+		    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
+			writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+
+		dev_pm_ret = pm_runtime_resume_and_get(aoc->dev);
+		if (dev_pm_ret >= 0)
+			pm_runtime_put(aoc->dev);
+	}
 
 	return ret < 0 ? ret : 0;
 }
@@ -1190,15 +1148,18 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 		if (time_after(jiffies, deadline)) {
 			int gsa_state = gsa_send_aoc_cmd(aoc->gsa,
 							 GSA_AOC_GET_STATE);
-			struct lga_aoc_lcpm_snapshot lcpm;
+			u32 lcpm_rst = 0, lcpm_init = 0;
 
-			lga_aoc_read_lcpm(aoc, &lcpm);
+			if (aoc->lcpm && aoc->core_pd_on &&
+			    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32)) {
+				lcpm_rst = readl(aoc->lcpm + LGA_AOC_LCPM_RESET_OFF);
+				lcpm_init = readl(aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+			}
+
 			dev_err(aoc->dev,
-				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d lcpm a32=%#x f1=%#x hf0=%#x hf1=%#x init=%#x pll=%#x/%#x/%#x)\n",
+				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d lcpm %#x/%#x)\n",
 				magic, le32_to_cpu(READ_ONCE(cb->status)),
-				gsa_state, lcpm.a32, lcpm.f1, lcpm.hf0,
-				lcpm.hf1, lcpm.init, lcpm.pll_cfg,
-				lcpm.pll_req, lcpm.pll_stat);
+				gsa_state, lcpm_rst, lcpm_init);
 			lga_aoc_set_supplies(aoc, false);
 			lga_aoc_core_pd_set(aoc, false);
 			return -ETIMEDOUT;
@@ -1240,15 +1201,15 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
 	}
 
 	/*
-	 * Disable external sensor supplies and hold aoc_core_pd awake across
-	 * GSA SHUTDOWN + UNLOAD to match Laguna's offline hardware contract,
-	 * then unmap SMMU windows (when !persist_iommu), release mailboxes, and
-	 * drop aoc_core_pd before cycling sswrp_aoc_pd.
+	 * Hold aoc_core_pd awake across GSA SHUTDOWN + UNLOAD to match Laguna's
+	 * offline hardware contract, then unmap SMMU windows (when
+	 * !persist_iommu), release mailboxes, and drop aoc_core_pd (waiting
+	 * for GENPD_NOTIFY_OFF) before cycling sswrp_aoc_pd.
 	 */
-	lga_aoc_set_supplies(aoc, false);
 	lga_aoc_core_pd_set(aoc, true);
 
 	ret = gsa_aoc_stop(aoc->gsa);
+	lga_aoc_set_supplies(aoc, false);
 
 	kfree(aoc->services);
 	aoc->services = NULL;
@@ -1781,13 +1742,9 @@ EXPORT_SYMBOL_GPL(lga_aoc_ipc_read_timeout);
 static int lga_aoc_info_show(struct seq_file *s, void *unused)
 {
 	struct lga_aoc *aoc = s->private;
-	struct lga_aoc_lcpm_snapshot lcpm;
 	int gsa_state;
 
 	gsa_state = gsa_send_aoc_cmd(aoc->gsa, GSA_AOC_GET_STATE);
-	mutex_lock(&aoc->lock);
-	lga_aoc_read_lcpm(aoc, &lcpm);
-	mutex_unlock(&aoc->lock);
 
 	seq_printf(s, "board_cfg: %s\n", aoc->board_cfg ?: "unknown");
 	seq_printf(s, "board_id: %#x\n", aoc->board_id);
@@ -1805,14 +1762,6 @@ static int lga_aoc_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "sswrp_pd_on: %u core_pd_on: %u supplies_enabled: %u iommu_maps: %u\n",
 		   aoc->sswrp_pd_on, aoc->core_pd_on, aoc->supplies_enabled,
 		   aoc->num_iommu_maps);
-	if (lcpm.has_core) {
-		seq_printf(s, "lcpm: a32=%#x f1=%#x hf0=%#x hf1=%#x init=%#x",
-			   lcpm.a32, lcpm.f1, lcpm.hf0, lcpm.hf1, lcpm.init);
-		if (lcpm.has_pll)
-			seq_printf(s, " pll=%#x/%#x/%#x",
-				   lcpm.pll_cfg, lcpm.pll_req, lcpm.pll_stat);
-		seq_putc(s, '\n');
-	}
 	seq_printf(s, "loaded: %u online: %u services: %u\n",
 		   aoc->loaded, aoc->online, aoc->num_services);
 	if (aoc->loaded)
@@ -2418,7 +2367,6 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	lga_aoc_read_soc_info(aoc);
 
 	platform_set_drvdata(pdev, aoc);
-	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 
 	mutex_lock(&lga_aoc_dev_lock);
