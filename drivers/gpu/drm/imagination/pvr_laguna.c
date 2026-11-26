@@ -1945,10 +1945,22 @@ int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
 	dst->regs.tpu_border_colour_table = src->regs.tpu_border_colour_table;
 	dst->regs.tpu_tag_cdm_ctrl = src->regs.tpu_tag_cdm_ctrl;
 	dst->regs.cdm_ctrl_stream_base = src->regs.cdm_ctrl_stream_base;
-	dst->regs.cdm_cb_queue = src->regs.cdm_cb_queue;
 	dst->regs.cdm_resume_pds1 = src->regs.cdm_resume_pds1;
 	dst->regs.cdm_context_state_base_addr =
 		src->regs.cdm_context_state_base_addr;
+	/*
+	 * Volcanic DXT-48-1536 loads CMDCDM+0x20 (regs+0x18) into CR 0x0598
+	 * (CDM Stack State base, 2048 B / 256 B-aligned GPU R/W scratchpad),
+	 * not Rogue CDM_CB_QUEUE. When userspace leaves cdm_cb_queue zero on
+	 * a non-user-mode-queue core, place the stack state in the upper half
+	 * (+0x800) of the 4 KiB CDM context-state page.
+	 */
+	dst->regs.cdm_cb_queue = src->regs.cdm_cb_queue;
+	if (!dst->regs.cdm_cb_queue &&
+	    dst->regs.cdm_context_state_base_addr &&
+	    IS_ALIGNED(dst->regs.cdm_context_state_base_addr, SZ_4K))
+		dst->regs.cdm_cb_queue =
+			dst->regs.cdm_context_state_base_addr + 0x800ULL;
 	dst->regs.cdm_item = src->regs.cdm_item;
 
 	if (src->flags & ROGUE_COMPUTE_FLAG_PREVENT_ALL_OVERLAP)

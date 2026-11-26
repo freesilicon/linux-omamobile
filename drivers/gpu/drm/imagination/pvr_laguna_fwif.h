@@ -98,7 +98,9 @@ static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
  *   +0x00: CR 0x17a8 (TPU_BORDER_COLOUR_TABLE_CDM)
  *   +0x08: CR 0x1878 (TPU_TAG_CDM_CTRL)
  *   +0x10: CR 0x04e8 (CDM_CTRL_STREAM_BASE)
- *   +0x18: CR 0x0598 (CDM_CB_QUEUE)
+ *   +0x18: CR 0x0598 (CDM_STACK_STATE_BASE_ADDR on Volcanic DXT-48-1536:
+ *                     2048 B / 256 B-aligned GPU R/W scratchpad, raw 40-bit VA;
+ *                     same offset as Rogue CDM_CB_QUEUE)
  *   +0x20: CDM_CONTEXT_LOAD_PDS1 (written via CR 0x04e0 on context load)
  *   +0x28: CR 0x0498 (CDM_CONTEXT_STATE_BASE_ADDR)
  *   +0x30: CR 0x04d0 (CDM_ITEM)
@@ -107,7 +109,7 @@ struct pvr_laguna_fwif_cdm_regs {
 	u64 tpu_border_colour_table;
 	u64 tpu_tag_cdm_ctrl;
 	u64 cdm_ctrl_stream_base;
-	u64 cdm_cb_queue;
+	u64 cdm_cb_queue; /* CR 0x0598: Volcanic CDM Stack State base addr */
 	u32 cdm_resume_pds1;
 	u32 pad_24;
 	u64 cdm_context_state_base_addr;
@@ -116,6 +118,7 @@ struct pvr_laguna_fwif_cdm_regs {
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_cdm_regs) == 56);
 static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_ctrl_stream_base) == 0x10);
+static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_cb_queue) == 0x18);
 static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_resume_pds1) == 0x20);
 static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_context_state_base_addr) == 0x28);
 static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_item) == 0x30);
