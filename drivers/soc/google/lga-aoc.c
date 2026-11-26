@@ -235,6 +235,9 @@ struct lga_aoc {
 	struct notifier_block sswrp_pd_nb;
 	struct completion sswrp_off_done;
 	bool sswrp_pd_nb_added;
+	struct notifier_block core_pd_nb;
+	struct completion core_off_done;
+	bool core_pd_nb_added;
 	bool sswrp_pd_on;
 	bool core_pd_on;
 
@@ -426,11 +429,62 @@ static int lga_aoc_core_pd_set(struct lga_aoc *aoc, bool enable)
 	if (!aoc->core_pd_on)
 		return 0;
 
+	if (aoc->core_pd_nb_added)
+		reinit_completion(&aoc->core_off_done);
+
 	ret = pm_runtime_put_sync(aoc->pd_devs[1]);
 	if (ret < 0)
 		dev_warn(aoc->dev, "failed to release aoc_core_pd: %d\n", ret);
 	aoc->core_pd_on = false;
+
+	if (ret >= 0 && aoc->core_pd_nb_added)
+		wait_for_completion_timeout(&aoc->core_off_done,
+					    msecs_to_jiffies(LGA_AOC_PD_OFF_TIMEOUT_MS));
+
 	return 0;
+}
+
+static int lga_aoc_alloc_mboxes(struct lga_aoc *aoc)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < aoc->num_mboxes; i++) {
+		struct lga_aoc_mbox_slot *slot = &aoc->mboxes[i];
+
+		if (!IS_ERR_OR_NULL(slot->chan))
+			continue;
+
+		slot->aoc = aoc;
+		slot->index = i;
+		slot->client.dev = aoc->dev;
+		slot->client.tx_block = false;
+		slot->client.tx_tout = 100;
+		slot->client.rx_callback = lga_aoc_mbox_rx_cb;
+
+		slot->chan = mbox_request_channel(&slot->client, i);
+		if (IS_ERR(slot->chan)) {
+			ret = PTR_ERR(slot->chan);
+			slot->chan = NULL;
+			dev_err(aoc->dev, "failed to request AoC mbox %u: %d\n",
+				i, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static void lga_aoc_release_mboxes(struct lga_aoc *aoc)
+{
+	unsigned int i;
+
+	for (i = 0; i < aoc->num_mboxes; i++) {
+		if (!IS_ERR_OR_NULL(aoc->mboxes[i].chan)) {
+			mbox_free_channel(aoc->mboxes[i].chan);
+			aoc->mboxes[i].chan = NULL;
+		}
+	}
 }
 
 static int lga_aoc_set_supplies(struct lga_aoc *aoc, bool enable)
@@ -535,7 +589,13 @@ static int lga_aoc_configure_iommu(struct lga_aoc *aoc,
 	if (!domain || domain->type == IOMMU_DOMAIN_IDENTITY)
 		return 0;
 
-	lga_aoc_unmap_iommu(aoc);
+	/*
+	 * Match Laguna's persistent SMMU policy: keep the configured AoC
+	 * translation windows across warm stop/reload cycles rather than
+	 * tearing down and rebuilding them while amb_smmu stays active.
+	 */
+	if (aoc->num_iommu_maps)
+		return 0;
 
 	if (aoc->img_cfg_off &&
 	    aoc->img_cfg_off + LGA_AOC_IMG_CFG_SIZE <= aoc->hdr_size) {
@@ -720,13 +780,12 @@ static u32 lga_aoc_dram_to_iova(struct lga_aoc *aoc, phys_addr_t pa)
 	return LGA_AOC_DRAM_IOVA_BASE + (u32)(pa - aoc->dram_base);
 }
 
-static void lga_aoc_clear_heaps(struct lga_aoc *aoc)
+static void lga_aoc_clear_dram_tail(struct lga_aoc *aoc, size_t body_size)
 {
-	if (aoc->dram_size <= LGA_AOC_TOTAL_HEAPS_SIZE)
+	if (body_size >= aoc->dram_size)
 		return;
 
-	memset(aoc->dram + aoc->dram_size - LGA_AOC_TOTAL_HEAPS_SIZE, 0,
-	       LGA_AOC_TOTAL_HEAPS_SIZE);
+	memset(aoc->dram + body_size, 0, aoc->dram_size - body_size);
 	dma_wmb();
 }
 
@@ -893,6 +952,10 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	if (ret)
 		goto out_rel;
 
+	ret = lga_aoc_alloc_mboxes(aoc);
+	if (ret)
+		goto out_pd;
+
 	ret = lga_aoc_configure_iommu(aoc, fw);
 	if (ret)
 		goto out_pd;
@@ -907,14 +970,14 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 							 GFP_KERNEL);
 		if (!aoc->auth_hdr_virt) {
 			ret = -ENOMEM;
-			goto out_iommu;
+			goto out_pd;
 		}
 		aoc->auth_hdr_alloc_size = aoc->hdr_size;
 	}
 
-	lga_aoc_clear_heaps(aoc);
-
 	body_size = fw->size - aoc->hdr_size;
+	lga_aoc_clear_dram_tail(aoc, body_size);
+
 	memcpy(aoc->dram, fw->data + aoc->hdr_size, body_size);
 	dma_wmb();
 
@@ -924,7 +987,7 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	ret = gsa_load_aoc_fw_image(aoc->gsa, aoc->auth_hdr_dma, aoc->dram_base);
 	if (ret) {
 		dev_err(aoc->dev, "GSA AoC image authentication failed: %d\n", ret);
-		goto out_iommu;
+		goto out_pd;
 	}
 
 	lga_aoc_write_boot_params(aoc);
@@ -934,8 +997,6 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	release_firmware(fw);
 	return 0;
 
-out_iommu:
-	lga_aoc_unmap_iommu(aoc);
 out_pd:
 	lga_aoc_core_pd_set(aoc, false);
 out_rel:
@@ -956,6 +1017,17 @@ static int lga_aoc_sswrp_pd_notify(struct notifier_block *nb,
 
 	if (action == GENPD_NOTIFY_OFF)
 		complete(&aoc->sswrp_off_done);
+
+	return NOTIFY_OK;
+}
+
+static int lga_aoc_core_pd_notify(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	struct lga_aoc *aoc = container_of(nb, struct lga_aoc, core_pd_nb);
+
+	if (action == GENPD_NOTIFY_OFF)
+		complete(&aoc->core_off_done);
 
 	return NOTIFY_OK;
 }
@@ -1051,9 +1123,13 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 		if (magic == LGA_AOC_CONTROL_MAGIC)
 			break;
 		if (time_after(jiffies, deadline)) {
+			int gsa_state = gsa_send_aoc_cmd(aoc->gsa,
+							 GSA_AOC_GET_STATE);
+
 			dev_err(aoc->dev,
-				"timed out waiting for AoC control block (magic %#x)\n",
-				magic);
+				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d)\n",
+				magic, le32_to_cpu(READ_ONCE(cb->status)),
+				gsa_state);
 			lga_aoc_set_supplies(aoc, false);
 			lga_aoc_core_pd_set(aoc, false);
 			return -ETIMEDOUT;
@@ -1094,21 +1170,29 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
 		dma_wmb();
 	}
 
-	/* Hold aoc_core_pd awake while GSA performs AoC shutdown/unload */
-	lga_aoc_core_pd_set(aoc, true);
+	/*
+	 * Drop aoc_core_pd vote (waiting for GENPD_NOTIFY_OFF) before asking
+	 * GSA to shut down and unload AoC, matching the stock offline sequence.
+	 */
+	lga_aoc_core_pd_set(aoc, false);
 
 	ret = gsa_aoc_stop(aoc->gsa);
 	lga_aoc_set_supplies(aoc, false);
-	lga_aoc_core_pd_set(aoc, false);
-	lga_aoc_unmap_iommu(aoc);
 
 	kfree(aoc->services);
 	aoc->services = NULL;
 	aoc->num_services = 0;
 	if (!ret) {
 		aoc->loaded = false;
-		if (reset_sswrp)
+		if (reset_sswrp) {
+			/*
+			 * Free all AoC mailbox channels before cycling
+			 * sswrp_aoc_pd so goog-mba-ctrl re-programs IRQ masks
+			 * and auto-ack on the subsequent load.
+			 */
+			lga_aoc_release_mboxes(aoc);
 			pd_ret = lga_aoc_power_cycle_sswrp(aoc);
+		}
 	}
 
 	return ret ?: pd_ret;
@@ -1332,7 +1416,7 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 		memcpy(slot_ptr + sizeof(mhdr), buf, len);
 		dma_wmb();
 		WRITE_ONCE(reg->tx, cpu_to_le32(tx + 1U));
-		WRITE_ONCE(reg->wp, cpu_to_le32((wp + 1U) % size));
+		WRITE_ONCE(reg->wp, cpu_to_le32((wp + 1U) % slots));
 	} else if (type == LGA_AOC_SVC_RING) {
 		size_t avail = size - min_t(size_t, (u32)(tx - rx), size);
 		size_t first;
@@ -1476,7 +1560,7 @@ ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 		memcpy(buf, slot_ptr + sizeof(mhdr), msg_len);
 		dma_wmb();
 		WRITE_ONCE(reg->rx, cpu_to_le32(rx + 1U));
-		WRITE_ONCE(reg->rp, cpu_to_le32((rp + 1U) % size));
+		WRITE_ONCE(reg->rp, cpu_to_le32((rp + 1U) % slots));
 		ret = msg_len;
 	} else if (type == LGA_AOC_SVC_RING) {
 		u32 delta = tx - rx;
@@ -1828,6 +1912,11 @@ static void lga_aoc_detach_pds(void *data)
 		aoc->sswrp_pd_on = false;
 	}
 
+	if (aoc->core_pd_nb_added && !IS_ERR_OR_NULL(aoc->pd_devs[1])) {
+		dev_pm_genpd_remove_notifier(aoc->pd_devs[1]);
+		aoc->core_pd_nb_added = false;
+	}
+
 	if (aoc->sswrp_pd_nb_added && !IS_ERR_OR_NULL(aoc->pd_devs[0])) {
 		dev_pm_genpd_remove_notifier(aoc->pd_devs[0]);
 		aoc->sswrp_pd_nb_added = false;
@@ -1848,6 +1937,8 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 
 	init_completion(&aoc->sswrp_off_done);
 	aoc->sswrp_pd_nb.notifier_call = lga_aoc_sswrp_pd_notify;
+	init_completion(&aoc->core_off_done);
+	aoc->core_pd_nb.notifier_call = lga_aoc_core_pd_notify;
 
 	if (of_count_phandle_with_args(aoc->dev->of_node, "power-domains",
 				       "#power-domain-cells") < 2)
@@ -1884,20 +1975,23 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 		aoc->sswrp_pd_on = true;
 	}
 
+	if (aoc->pd_devs[1]) {
+		ret = dev_pm_genpd_add_notifier(aoc->pd_devs[1],
+						&aoc->core_pd_nb);
+		if (ret)
+			dev_warn(aoc->dev,
+				 "failed to register aoc_core_pd notifier: %d\n",
+				 ret);
+		else
+			aoc->core_pd_nb_added = true;
+	}
+
 	return devm_add_action_or_reset(aoc->dev, lga_aoc_detach_pds, aoc);
 }
 
 static void lga_aoc_free_mboxes(void *data)
 {
-	struct lga_aoc *aoc = data;
-	unsigned int i;
-
-	for (i = 0; i < aoc->num_mboxes; i++) {
-		if (!IS_ERR_OR_NULL(aoc->mboxes[i].chan)) {
-			mbox_free_channel(aoc->mboxes[i].chan);
-			aoc->mboxes[i].chan = NULL;
-		}
-	}
+	lga_aoc_release_mboxes(data);
 }
 
 static void lga_aoc_put_gsa(void *data)
@@ -1983,24 +2077,9 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	for (i = 0; i < aoc->num_mboxes; i++) {
-		struct lga_aoc_mbox_slot *slot = &aoc->mboxes[i];
-
-		slot->aoc = aoc;
-		slot->index = i;
-		slot->client.dev = dev;
-		slot->client.tx_block = false;
-		slot->client.tx_tout = 100;
-		slot->client.rx_callback = lga_aoc_mbox_rx_cb;
-
-		slot->chan = mbox_request_channel(&slot->client, i);
-		if (IS_ERR(slot->chan)) {
-			ret = PTR_ERR(slot->chan);
-			slot->chan = NULL;
-			return dev_err_probe(dev, ret,
-					     "failed to request AoC mbox %u\n", i);
-		}
-	}
+	ret = lga_aoc_alloc_mboxes(aoc);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request AoC mboxes\n");
 
 	aoc->coredump_mbox = LGA_AOC_DEFAULT_COREDUMP_MBOX;
 	aoc->board_id = LGA_AOC_DEFAULT_BOARD_ID;
@@ -2076,6 +2155,7 @@ static void lga_aoc_remove(struct platform_device *pdev)
 		lga_aoc_stop_locked(aoc, &was_online, false);
 	else
 		lga_aoc_set_supplies(aoc, false);
+	lga_aoc_unmap_iommu(aoc);
 	mutex_unlock(&aoc->lock);
 
 	if (was_online)
