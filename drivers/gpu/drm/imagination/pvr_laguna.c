@@ -1347,6 +1347,8 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 		u32 cdm_csw = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_CONTEXT_STORE_STATUS);
 		u32 cdm_dir = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_DIRECT_STREAM);
 		u64 tpu_tag = pvr_cr_read64(pvr_dev, VOLCANIC_CR_TPU_TAG_CDM_CTRL);
+		u32 cr4360 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_USC_TASKS_STRIDE);
+		u32 cr4378 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_MULTI_SPU);
 		u32 usrm0 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_0);
 		u32 usrm1 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_1);
 		u32 usrm2 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_2);
@@ -1357,14 +1359,45 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 		u64 usc_s0 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_0);
 		u64 usc_s1 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_1);
 		u64 usc_s2 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_2);
+		u64 pds_csum[VOLCANIC_DXT_48_1536_NUM_SPUS];
+		u64 usc_csum[VOLCANIC_DXT_48_1536_NUM_USCS];
+		u32 usc_st[VOLCANIC_DXT_48_1536_NUM_USCS];
+		u32 saved_spu_sel, saved_usc_sel;
+
+		saved_spu_sel = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_PDS_INDIRECT);
+		for (u32 i = 0; i < VOLCANIC_DXT_48_1536_NUM_SPUS; i++) {
+			pvr_cr_write32(pvr_dev, VOLCANIC_CR_SPU_PDS_INDIRECT, i);
+			(void)pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_PDS_INDIRECT);
+			pds_csum[i] = pvr_cr_read64(pvr_dev, VOLCANIC_CR_PDS_CDM_CHECKSUM);
+		}
+		pvr_cr_write32(pvr_dev, VOLCANIC_CR_SPU_PDS_INDIRECT, saved_spu_sel);
+
+		saved_usc_sel = pvr_cr_read32(pvr_dev, VOLCANIC_CR_USC_INDIRECT);
+		for (u32 i = 0; i < VOLCANIC_DXT_48_1536_NUM_USCS; i++) {
+			pvr_cr_write32(pvr_dev, VOLCANIC_CR_USC_INDIRECT, i);
+			(void)pvr_cr_read32(pvr_dev, VOLCANIC_CR_USC_INDIRECT);
+			usc_st[i] = pvr_cr_read32(pvr_dev, VOLCANIC_CR_USC_STATUS);
+			usc_csum[i] = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_CHECKSUM);
+		}
+		pvr_cr_write32(pvr_dev, VOLCANIC_CR_USC_INDIRECT, saved_usc_sel);
 
 		drm_warn(drm_dev,
-			 "Laguna CDM/SPU [%s]: cs=%#llx csw=%#x dir=%#x tpu_tag=%#llx usrm=%#x/%#x/%#x spu_p=%#x/%#x/%#x/%#x\n",
+			 "Laguna CDM/SPU [%s]: cs=%#llx csw=%#x dir=%#x tpu_tag=%#llx cr4360=%#x cr4378=%#x usrm=%#x/%#x/%#x spu_p=%#x/%#x/%#x/%#x\n",
 			 reason, cdm_cs_cr, cdm_csw, cdm_dir, tpu_tag,
-			 usrm0, usrm1, usrm2, spu_p0, spu_p1, spu_p2, spu_p3);
+			 cr4360, cr4378, usrm0, usrm1, usrm2,
+			 spu_p0, spu_p1, spu_p2, spu_p3);
 		drm_warn(drm_dev,
 			 "Laguna USC slots [%s]: 0=%#018llx 1=%#018llx 2=%#018llx\n",
 			 reason, usc_s0, usc_s1, usc_s2);
+		drm_warn(drm_dev,
+			 "Laguna PDS/USC hwr [%s]: pds_cdm=%#llx/%#llx usc_st=%#x/%#x/%#x/%#x/%#x/%#x\n",
+			 reason, pds_csum[0], pds_csum[1],
+			 usc_st[0], usc_st[1], usc_st[2],
+			 usc_st[3], usc_st[4], usc_st[5]);
+		drm_warn(drm_dev,
+			 "Laguna USC csum [%s]: %#llx %#llx %#llx %#llx %#llx %#llx\n",
+			 reason, usc_csum[0], usc_csum[1], usc_csum[2],
+			 usc_csum[3], usc_csum[4], usc_csum[5]);
 	}
 	if (mmu1 || mmu2)
 		pvr_laguna_log_mmu_fault(pvr_dev, reason, mmu1, mmu2);
