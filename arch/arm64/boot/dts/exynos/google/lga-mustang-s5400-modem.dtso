@@ -2,13 +2,21 @@
 /*
  * Opt-in overlay enabling the Samsung S5400i cellular modem stack on
  * Google Pixel 10 Pro XL (mustang):
- * - pinctrl_hsion and pinctrl_gdmc pin/GPIO controllers
+ * - lsios_level_gia_0 and pinctrl_lsios, pinctrl_hsion, pinctrl_gdmc controllers
  * - HSIO_N GIA aggregators and pcie0 (c500000) Root Complex
  * - Bit-banged SPMI bus (s5910_bb) with S5910 clock buffer and CP PMIC
  * - CPIF shared-memory map (cp_shmem) and modem interface (cpif)
  */
 /dts-v1/;
 /plugin/;
+
+&lsios_level_gia_0 {
+	status = "okay";
+};
+
+&pinctrl_lsios {
+	status = "okay";
+};
 
 &pinctrl_hsion {
 	status = "okay";
