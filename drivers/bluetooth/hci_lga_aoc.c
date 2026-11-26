@@ -54,7 +54,8 @@ struct lga_aocc_ctrl_msg {
 struct hci_lga_aoc {
 	struct device *aoc_dev;
 	struct hci_dev *hdev;
-	struct lga_aoc_service_info svc;
+	struct lga_aoc_service_info tx_svc;
+	struct lga_aoc_service_info rx_svc;
 
 	struct task_struct *rx_task;
 	struct mutex tx_lock; /* serializes TX frames on the AoC channel */
@@ -65,17 +66,25 @@ struct hci_lga_aoc {
 
 	struct gpio_desc *bt_shutdown_gpio;
 	struct gpio_desc *bt_ble_dbo_gpio;
+	struct gpio_desc *bt_dev_wake_gpio;
 
 	bool use_aocc_framing;
 	u32 channel_id;
-	size_t max_msg_len;
+	size_t tx_max_msg;
+	size_t rx_max_msg;
 	size_t max_payload;
 	u8 *tx_buf;
 };
 
 static char *service_name = "com.google.bt";
 module_param(service_name, charp, 0444);
-MODULE_PARM_DESC(service_name, "AoC IPC service name (default: com.google.bt)");
+MODULE_PARM_DESC(service_name,
+		 "AoC IPC TX/bidirectional service name (default: com.google.bt)");
+
+static char *rx_service_name = "";
+module_param(rx_service_name, charp, 0444);
+MODULE_PARM_DESC(rx_service_name,
+		 "Optional AoC IPC RX service name for split TX/RX rings (e.g. chre_bt_offload_data_rx)");
 
 static bool aocc_framing = true;
 module_param(aocc_framing, bool, 0444);
@@ -111,7 +120,7 @@ static int hci_lga_aoc_send_ctrl(struct hci_lga_aoc *bt,
 	ssize_t ret;
 
 	mutex_lock(&bt->tx_lock);
-	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->svc.index,
+	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->tx_svc.index,
 					&msg, sizeof(msg),
 					msecs_to_jiffies(LGA_AOCC_TX_TIMEOUT_MS));
 	mutex_unlock(&bt->tx_lock);
@@ -140,7 +149,7 @@ static int hci_lga_aoc_send_chunk(struct hci_lga_aoc *bt, const u8 *data,
 		frame_len = len;
 	}
 
-	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->svc.index,
+	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->tx_svc.index,
 					bt->tx_buf, frame_len,
 					msecs_to_jiffies(LGA_AOCC_TX_TIMEOUT_MS));
 	mutex_unlock(&bt->tx_lock);
@@ -286,7 +295,7 @@ static int hci_lga_aoc_rx_thread(void *arg)
 	struct hci_lga_aoc *bt = arg;
 	u8 *rx_buf;
 
-	rx_buf = kmalloc(bt->max_msg_len, GFP_KERNEL);
+	rx_buf = kmalloc(bt->rx_max_msg, GFP_KERNEL);
 	if (!rx_buf)
 		return -ENOMEM;
 
@@ -295,8 +304,8 @@ static int hci_lga_aoc_rx_thread(void *arg)
 		const u8 *payload;
 		size_t plen;
 
-		n = lga_aoc_ipc_read_timeout(bt->aoc_dev, bt->svc.index,
-					     rx_buf, bt->max_msg_len,
+		n = lga_aoc_ipc_read_timeout(bt->aoc_dev, bt->rx_svc.index,
+					     rx_buf, bt->rx_max_msg,
 					     msecs_to_jiffies(LGA_AOCC_RX_POLL_MS));
 		if (n == -ETIMEDOUT || n == -ERESTARTSYS || n == -EAGAIN)
 			continue;
@@ -394,18 +403,35 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 		bt->bt_shutdown_gpio = gp;
 	}
 
+	gp = gpiod_get_optional(bt->aoc_dev, "bt-device-wakeup", GPIOD_OUT_LOW);
+	if (IS_ERR(gp)) {
+		dev_info(bt->aoc_dev,
+			 "bt-device-wakeup GPIO unavailable (%ld), skipping\n",
+			 PTR_ERR(gp));
+	} else {
+		bt->bt_dev_wake_gpio = gp;
+	}
+
 	if (bt->bt_shutdown_gpio) {
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 0);
 		hci_lga_aoc_latch_ble_dbo(bt);
-		msleep(50);
+		msleep(30);
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 1);
 		hci_lga_aoc_latch_ble_dbo(bt);
-		msleep(100);
 	}
+	if (bt->bt_dev_wake_gpio)
+		gpiod_set_value_cansleep(bt->bt_dev_wake_gpio, 1);
+	if (bt->bt_shutdown_gpio || bt->bt_dev_wake_gpio)
+		msleep(100);
 }
 
 static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
 {
+	if (bt->bt_dev_wake_gpio) {
+		gpiod_set_value_cansleep(bt->bt_dev_wake_gpio, 0);
+		gpiod_put(bt->bt_dev_wake_gpio);
+		bt->bt_dev_wake_gpio = NULL;
+	}
 	if (bt->bt_shutdown_gpio) {
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 0);
 		hci_lga_aoc_latch_ble_dbo(bt);
@@ -459,9 +485,11 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 		}
 	}
 
-	bt_dev_info(hdev, "opened AoC service '%s' (idx=%u chan=%u framing=%u)",
-		    bt->svc.name, bt->svc.index, bt->channel_id,
-		    bt->use_aocc_framing);
+	bt_dev_info(hdev,
+		    "opened AoC TX '%s' (idx=%u) / RX '%s' (idx=%u) chan=%u framing=%u",
+		    bt->tx_svc.name, bt->tx_svc.index,
+		    bt->rx_svc.name, bt->rx_svc.index,
+		    bt->channel_id, bt->use_aocc_framing);
 	return 0;
 }
 
@@ -568,14 +596,41 @@ static int hci_lga_aoc_setup(struct hci_dev *hdev)
 	return 0;
 }
 
+static int hci_lga_aoc_calc_msg_len(const struct lga_aoc_service_info *svc,
+				    bool is_tx, size_t *out_len)
+{
+	u32 slots = is_tx ? svc->down_slots : svc->up_slots;
+	u32 size = is_tx ? svc->down_size : svc->up_size;
+	size_t max_msg = LGA_AOCC_MAX_MSG_SIZE;
+
+	if (svc->type == LGA_AOC_SVC_BUFFER)
+		return -EOPNOTSUPP;
+	if (!slots || !size)
+		return -EINVAL;
+
+	if (svc->type == LGA_AOC_SVC_QUEUE) {
+		if (size <= 8U)
+			return -EINVAL;
+		max_msg = min_t(size_t, max_msg, size - 8U);
+	} else if (svc->type == LGA_AOC_SVC_RING) {
+		max_msg = min_t(size_t, max_msg, size);
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	*out_len = max_msg;
+	return 0;
+}
+
 static int hci_lga_aoc_attach_locked(void)
 {
 	struct device *aoc_dev;
-	struct lga_aoc_service_info svc;
+	struct lga_aoc_service_info tx_svc, rx_svc;
+	const char *rx_name;
 	struct hci_lga_aoc *bt;
 	struct hci_dev *hdev;
 	bool use_framing = aocc_framing;
-	size_t max_msg, hdr_overhead;
+	size_t tx_max_msg, rx_max_msg, hdr_overhead;
 	int ret;
 
 	if (hci_lga_aoc_inst)
@@ -590,29 +645,56 @@ static int hci_lga_aoc_attach_locked(void)
 		return -EAGAIN;
 	}
 
-	ret = lga_aoc_find_service(aoc_dev, service_name, &svc);
+	ret = lga_aoc_find_service(aoc_dev, service_name, &tx_svc);
 	if (ret) {
 		dev_err(aoc_dev, "AoC service '%s' not found: %d\n",
 			service_name, ret);
+		if (!strcmp(service_name, "com.google.bt") &&
+		    !lga_aoc_find_service(aoc_dev, "chre_bt_offload_data_tx",
+					  &tx_svc) &&
+		    !lga_aoc_find_service(aoc_dev, "chre_bt_offload_data_rx",
+					  &rx_svc))
+			dev_info(aoc_dev,
+				 "Laguna AoC publishes split rings 'chre_bt_offload_data_tx'/'chre_bt_offload_data_rx' instead of 'com.google.bt'\n");
 		put_device(aoc_dev);
 		return ret;
 	}
 
-	max_msg = LGA_AOCC_MAX_MSG_SIZE;
-	if (svc.type == LGA_AOC_SVC_QUEUE) {
-		size_t down_msg = svc.down_size > 8U ? svc.down_size - 8U : 0;
-		size_t up_msg = svc.up_size > 8U ? svc.up_size - 8U : 0;
+	rx_name = (rx_service_name && *rx_service_name) ? rx_service_name :
+							  service_name;
+	if (!strcmp(rx_name, service_name)) {
+		rx_svc = tx_svc;
+	} else {
+		ret = lga_aoc_find_service(aoc_dev, rx_name, &rx_svc);
+		if (ret) {
+			dev_err(aoc_dev, "AoC RX service '%s' not found: %d\n",
+				rx_name, ret);
+			put_device(aoc_dev);
+			return ret;
+		}
+	}
 
-		if (down_msg)
-			max_msg = min(max_msg, down_msg);
-		if (up_msg)
-			max_msg = min(max_msg, up_msg);
+	ret = hci_lga_aoc_calc_msg_len(&tx_svc, true, &tx_max_msg);
+	if (ret) {
+		dev_err(aoc_dev, "AoC TX service '%s' unsupported/invalid: %d\n",
+			tx_svc.name, ret);
+		put_device(aoc_dev);
+		return ret;
+	}
+
+	ret = hci_lga_aoc_calc_msg_len(&rx_svc, false, &rx_max_msg);
+	if (ret) {
+		dev_err(aoc_dev, "AoC RX service '%s' unsupported/invalid: %d\n",
+			rx_svc.name, ret);
+		put_device(aoc_dev);
+		return ret;
 	}
 
 	hdr_overhead = use_framing ? LGA_AOCC_HDR_SIZE : 0;
-	if (max_msg <= hdr_overhead + 1U) {
-		dev_err(aoc_dev, "AoC service '%s' message size %zu too small\n",
-			svc.name, max_msg);
+	if (tx_max_msg <= hdr_overhead + 1U || rx_max_msg <= hdr_overhead + 1U) {
+		dev_err(aoc_dev,
+			"AoC service '%s'/'%s' message size (%zu/%zu) too small\n",
+			tx_svc.name, rx_svc.name, tx_max_msg, rx_max_msg);
 		put_device(aoc_dev);
 		return -EINVAL;
 	}
@@ -623,7 +705,7 @@ static int hci_lga_aoc_attach_locked(void)
 		return -ENOMEM;
 	}
 
-	bt->tx_buf = kmalloc(max_msg, GFP_KERNEL);
+	bt->tx_buf = kmalloc(tx_max_msg, GFP_KERNEL);
 	if (!bt->tx_buf) {
 		kfree(bt);
 		put_device(aoc_dev);
@@ -642,10 +724,12 @@ static int hci_lga_aoc_attach_locked(void)
 	mutex_init(&bt->rx_lock);
 	bt->aoc_dev = aoc_dev;
 	bt->hdev = hdev;
-	bt->svc = svc;
+	bt->tx_svc = tx_svc;
+	bt->rx_svc = rx_svc;
 	bt->use_aocc_framing = use_framing;
-	bt->max_msg_len = max_msg;
-	bt->max_payload = max_msg - hdr_overhead;
+	bt->tx_max_msg = tx_max_msg;
+	bt->rx_max_msg = rx_max_msg;
+	bt->max_payload = tx_max_msg - hdr_overhead;
 
 	hci_set_drvdata(hdev, bt);
 	SET_HCIDEV_DEV(hdev, aoc_dev);
@@ -671,9 +755,9 @@ static int hci_lga_aoc_attach_locked(void)
 
 	hci_lga_aoc_inst = bt;
 	dev_info(aoc_dev,
-		 "registered %s over AoC service '%s' (idx=%u mbox=%u max_payload=%zu)\n",
-		 hdev->name, svc.name, svc.index, svc.mbox_index,
-		 bt->max_payload);
+		 "registered %s over AoC TX '%s' (idx=%u mbox=%u) / RX '%s' (idx=%u) max_payload=%zu\n",
+		 hdev->name, tx_svc.name, tx_svc.index, tx_svc.mbox_index,
+		 rx_svc.name, rx_svc.index, bt->max_payload);
 	return 0;
 }
 
