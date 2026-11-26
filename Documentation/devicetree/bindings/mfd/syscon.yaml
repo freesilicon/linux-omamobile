@@ -66,6 +66,7 @@ properties:
               - fsl,ls1088a-reset
               - fsl,vf610-anatop
               - fsl,vf610-mscm-cpucfg
+              - google,aoc-mba-global
               - hisilicon,dsa-subctrl
               - hisilicon,hi6220-sramctrl
               - hisilicon,hip04-ppe

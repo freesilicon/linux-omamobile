@@ -23,6 +23,10 @@ static const struct mfd_cell da9188_mfd_cells[] = {
 		.name = "da9188-gpio",
 		.of_compatible = "google,da9188-gpio",
 	},
+	{
+		.name = "da9188-vgpio",
+		.of_compatible = "google,da9188-vgpio",
+	},
 };
 
 static void da9188_mbox_release(void *data)

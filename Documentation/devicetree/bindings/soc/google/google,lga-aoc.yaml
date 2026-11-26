@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/google/google,lga-aoc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor G5 (Laguna) AoC (Always-on Compute)
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description:
+  The Always-on Compute (AoC) subsystem on Google Tensor G5 (Laguna) is the
+  audio and sensor DSP complex. The application processor loads signed firmware
+  into a reserved DRAM carve-out, authenticates and starts it through the GSA
+  mailbox (google,mba-ctrl v2.0) and Trusty hwmgr.aoc service, and exchanges
+  IPC doorbells over 20 AoC-to-AP MBA v2.0 channels while the AoC accesses
+  memory behind the AMB SMMUv3.
+
+properties:
+  compatible:
+    const: google,lga-aoc
+
+  reg:
+    items:
+      - description: AoC subsystem register and SRAM window (blk_aoc)
+      - description: AoC local clock and power management registers (lcpm)
+
+  reg-names:
+    items:
+      - const: blk_aoc
+      - const: lcpm
+
+  iommus:
+    description: AMB SMMUv3 stream IDs assigned to the AoC complex
+    minItems: 1
+    maxItems: 2
+
+  memory-region:
+    maxItems: 1
+    description: Reserved no-map DRAM carve-out where AoC firmware executes
+
+  mboxes:
+    description: AoC-to-AP google,mba-ctrl v2.0 doorbell and message channels
+    minItems: 1
+    maxItems: 20
+
+  power-domains:
+    items:
+      - description: Top-level AoC SSWRP power domain (sswrp_aoc_pd)
+      - description: AoC core sub-domain (aoc_core_pd)
+
+  power-domain-names:
+    items:
+      - const: sswrp_aoc_pd
+      - const: aoc_core_pd
+
+  gsa-device:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: GSA security core used to authenticate and start AoC firmware
+
+  firmware-name:
+    maxItems: 1
+    description: Board-specific signed AoC firmware filename under /lib/firmware
+
+  sensor-1v8-supply:
+    description: 1.8 V sensor rail enabled before sensor-3v3-supply
+
+  sensor-3v3-supply:
+    description: 3.3 V sensor rail enabled after sensor-1v8-supply
+
+  sensor-mag-supply:
+    description: Optional magnetometer/auxiliary sensor supply
+
+  google,board-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: AoC board identifier passed in the boot parameter table
+
+  google,board-rev:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: AoC board revision passed in the boot parameter table
+
+  google,board-cfg:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Short AoC board configuration tag (e.g. MT5 or RG5)
+
+  google,gnss-type:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: GNSS receiver type identifier passed to AoC firmware
+
+  google,wifi-chip:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Optional Wi-Fi chip identifier passed to AoC firmware
+
+  google,force-vnom:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Override default VNOM boot parameter passed to AoC firmware
+
+  google,coredump-mbox:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Index in mboxes reserved for AoC coredump notifications
+
+  bt-shutdown-gpios:
+    maxItems: 1
+    description: Optional Bluetooth BT_REG_ON GPIO for AoC-routed Bluetooth
+
+  bt-ble-dbo-gpios:
+    maxItems: 1
+    description: Optional Bluetooth BLE DBO latch GPIO for AoC-routed Bluetooth
+
+  bt-device-wakeup-gpios:
+    maxItems: 1
+    description: Optional Bluetooth device-wakeup GPIO for AoC-routed Bluetooth
+
+  bt-wlan-reg-on-gpios:
+    maxItems: 1
+    description: Optional combo-chip WL_REG_ON GPIO for AoC-routed Bluetooth
+
+  wakeup-source: true
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - memory-region
+  - mboxes
+  - power-domains
+  - power-domain-names
+  - gsa-device
+
+additionalProperties: false
+
+examples:
+  - |
+    aoc@9000000 {
+        compatible = "google,lga-aoc";
+        reg = <0x0 0x09000000 0x0 0x02000000>,
+              <0x0 0x0b4c0000 0x0 0x0000be28>;
+        reg-names = "blk_aoc", "lcpm";
+        iommus = <&amb_smmu 0x8300>, <&amb_smmu 0x8309>;
+        memory-region = <&aoc_rmem>;
+        mboxes = <&aoc_ap_0_mba 0>, <&aoc_ap_1_mba 0>;
+        power-domains = <&sswrp_aoc_pd>, <&aoc_core_pd>;
+        power-domain-names = "sswrp_aoc_pd", "aoc_core_pd";
+        gsa-device = <&gsa>;
+        firmware-name = "google/aoc-mustang.bin";
+        google,board-id = <0x70503>;
+        google,board-rev = <0x10000>;
+        google,board-cfg = "MT5";
+        google,gnss-type = <2>;
+        google,coredump-mbox = <19>;
+        status = "disabled";
+    };

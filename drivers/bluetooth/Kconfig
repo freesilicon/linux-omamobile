@@ -472,4 +472,16 @@ config BT_INTEL_PCIE
 
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
+
+config BT_HCILGA_AOC
+	tristate "Google Laguna AoC Bluetooth HCI transport"
+	depends on GOOGLE_LGA_AOC && BT
+	select BT_BCM
+	help
+	  BlueZ HCI transport driver bridging standard H4 Bluetooth frames over
+	  Google Tensor G5 (Laguna) Always-on Compute (AoC) channelized IPC
+	  ("com.google.bt").
+
+	  Say Y here to compile support for Laguna AoC Bluetooth HCI into the
+	  kernel or say M to compile it as a module (hci_lga_aoc).
 endmenu

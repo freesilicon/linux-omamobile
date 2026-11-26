@@ -14,12 +14,24 @@ dtb-$(CONFIG_ARCH_EXYNOS) += \
 	lga-mustang.dtb \
 	lga-mustang-gpu.dtbo \
 	lga-mustang-gpu.dtb \
+	lga-mustang-aoc.dtb \
+	lga-mustang-bt.dtb \
+	lga-mustang-aoc.dtbo \
+	lga-mustang-bt.dtbo \
 	lga-rango.dtb \
 	lga-rango-gpu.dtbo \
-	lga-rango-gpu.dtb
+	lga-rango-gpu.dtb \
+	lga-rango-aoc.dtb \
+	lga-rango-bt.dtb \
+	lga-rango-aoc.dtbo \
+	lga-rango-bt.dtbo
 
 lga-mustang-gpu-dtbs := lga-mustang.dtb lga-mustang-gpu.dtbo
+lga-mustang-aoc-dtbs := lga-mustang.dtb lga-mustang-aoc.dtbo
+lga-mustang-bt-dtbs := lga-mustang.dtb lga-mustang-bt.dtbo
 lga-rango-gpu-dtbs := lga-rango.dtb lga-rango-gpu.dtbo
+lga-rango-aoc-dtbs := lga-rango.dtb lga-rango-aoc.dtbo
+lga-rango-bt-dtbs := lga-rango.dtb lga-rango-bt.dtbo
 
 # ABL applies board overlays, so keep symbols for labels
 DTC_FLAGS_gs101-bluejay += -@

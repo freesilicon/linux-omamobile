@@ -35,6 +35,16 @@ config GOOGLE_GSA_TRUSTY
 	  in Trusty, as Google's kernels do. Without it, only the mailbox
 	  command path can be tried (aoc_cmd_mbox=1 / tpu_cmd_mbox=1).
 
+config GOOGLE_LGA_AOC
+	tristate "Google Tensor G5 (Laguna) AoC boot and IPC core"
+	depends on GOOGLE_GSA && MAILBOX && GOOGLE_MBA_CTRL && DEBUG_FS
+	help
+	  Clean-room Stage 1 Always-on Compute (AoC) firmware boot, GSA
+	  authentication, google,mba-ctrl v2.0 doorbell messaging, and shared
+	  carve-out IPC service discovery driver for Google Tensor G5 (Laguna).
+	  Firmware loading is triggered explicitly from debugfs unless
+	  autoload=1 is specified.
+
 config GS201_AOC_SYSMMU
 	tristate "gs201 AoC System MMU static windows"
 	help

@@ -6,4 +6,15 @@ config SND_SOC_CHV3_I2S
 	help
 	  Enable support for the Google Chameleon v3 I2S device.
 
+config SND_SOC_GOOGLE_LGA_AOC
+	tristate "Google Tensor G5 (Laguna) AoC audio driver"
+	depends on GOOGLE_LGA_AOC
+	help
+	  Enable clean-room ALSA ASoC PCM playback, capture, and mixer
+	  controls backed by the Google Tensor G5 (Laguna) Always-on
+	  Compute (AoC) firmware IPC rings and control queues.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-soc-lga-aoc.
+
 endmenu

@@ -18,6 +18,7 @@
 #include <linux/io.h>
 #include <linux/lockdep.h>
 #include <linux/module.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
@@ -51,6 +52,8 @@
 #define DW_UART_QUIRK_APMC0D08		BIT(4)
 #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
 #define DW_UART_QUIRK_IER_KICK		BIT(6)
+#define DW_UART_QUIRK_NO_EMPTY_RX_READ	BIT(7)
+#define DW_UART_QUIRK_CLI_PM		BIT(8)
 
 /*
  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
@@ -73,6 +76,8 @@ struct dw8250_data {
 	struct clk		*clk;
 	struct clk		*pclk;
 	struct reset_control	*rst;
+	struct pinctrl		*pinctrl;
+	struct pinctrl_state	*cli_state;
 
 	unsigned int		skip_autocfg:1;
 	unsigned int		uart_16550_compatible:1;
@@ -434,12 +439,18 @@ static int dw8250_handle_irq(struct uart_port *p)
 	 * fire forever.
 	 *
 	 * This problem has only been observed so far when not in DMA mode
-	 * so we limit the workaround only to non-DMA mode.
+	 * so we limit the workaround only to non-DMA mode.  On platforms
+	 * with ECC-protected FIFO SRAM (DW_UART_QUIRK_NO_EMPTY_RX_READ),
+	 * reading UART_RX while FIFOs are enabled and empty triggers a
+	 * fatal synchronous external abort (ECC RAS error), so skip the
+	 * dummy read there.
 	 */
 	if (!up->dma && rx_timeout) {
 		status = serial_lsr_in(up);
 
-		if (!(status & (UART_LSR_DR | UART_LSR_BI)))
+		if (!(status & (UART_LSR_DR | UART_LSR_BI)) &&
+		    !((quirks & DW_UART_QUIRK_NO_EMPTY_RX_READ) &&
+		      (up->fcr & UART_FCR_ENABLE_FIFO)))
 			serial_port_in(p, UART_RX);
 	}
 
@@ -746,6 +757,17 @@ static int dw8250_probe(struct platform_device *pdev)
 	if (data->pdata)
 		dw8250_quirks(p, data);
 
+	if (data->pdata && (data->pdata->quirks & DW_UART_QUIRK_CLI_PM)) {
+		data->pinctrl = devm_pinctrl_get(dev);
+		if (IS_ERR(data->pinctrl)) {
+			data->pinctrl = NULL;
+		} else {
+			data->cli_state = pinctrl_lookup_state(data->pinctrl, "cli");
+			if (IS_ERR(data->cli_state))
+				data->cli_state = NULL;
+		}
+	}
+
 	/* If the Busy Functionality is not implemented, don't handle it */
 	if (data->uart_16550_compatible) {
 		p->handle_irq = NULL;
@@ -811,6 +833,11 @@ static int dw8250_resume(struct device *dev)
 static int dw8250_runtime_suspend(struct device *dev)
 {
 	struct dw8250_data *data = dev_get_drvdata(dev);
+	bool cli_pm = data->pdata && (data->pdata->quirks & DW_UART_QUIRK_CLI_PM) &&
+		      data->cli_state;
+
+	if (cli_pm)
+		pinctrl_pm_select_sleep_state(dev);
 
 	clk_disable_unprepare(data->clk);
 
@@ -823,6 +850,14 @@ static int dw8250_runtime_resume(struct device *dev)
 {
 	int ret;
 	struct dw8250_data *data = dev_get_drvdata(dev);
+	bool cli_pm = data->pdata && (data->pdata->quirks & DW_UART_QUIRK_CLI_PM) &&
+		      data->cli_state;
+
+	if (cli_pm) {
+		ret = pinctrl_select_state(data->pinctrl, data->cli_state);
+		if (ret)
+			return ret;
+	}
 
 	ret = clk_prepare_enable(data->pclk);
 	if (ret)
@@ -834,7 +869,24 @@ static int dw8250_runtime_resume(struct device *dev)
 		return ret;
 	}
 
+	if (cli_pm) {
+		ret = reset_control_deassert(data->rst);
+		if (ret)
+			goto err_clk;
+
+		ret = pinctrl_pm_select_default_state(dev);
+		if (ret)
+			goto err_rst;
+	}
+
 	return 0;
+
+err_rst:
+	reset_control_assert(data->rst);
+err_clk:
+	clk_disable_unprepare(data->clk);
+	clk_disable_unprepare(data->pclk);
+	return ret;
 }
 
 static _DEFINE_DEV_PM_OPS(dw8250_pm_ops, dw8250_suspend, dw8250_resume,
@@ -888,9 +940,17 @@ static const struct dw8250_platform_data dw8250_ultrarisc_dp1000_data = {
 	.quirks = DW_UART_QUIRK_CPR_VALUE,
 };
 
+static const struct dw8250_platform_data dw8250_lga_data = {
+	.usr_reg = DW_UART_USR,
+	.quirks = DW_UART_QUIRK_SKIP_SET_RATE |
+		  DW_UART_QUIRK_NO_EMPTY_RX_READ |
+		  DW_UART_QUIRK_CLI_PM,
+};
+
 static const struct of_device_id dw8250_of_match[] = {
 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
-	{ .compatible = "goog,goog-dw-apb-uart", .data = &dw8250_dw_apb },
+	{ .compatible = "google,lga-uart", .data = &dw8250_lga_data },
+	{ .compatible = "goog,goog-dw-apb-uart", .data = &dw8250_lga_data },
 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
 	{ .compatible = "marvell,armada-38x-uart", .data = &dw8250_armada_38x_data },
 	{ .compatible = "renesas,rzn1-uart", .data = &dw8250_renesas_rzn1_data },
