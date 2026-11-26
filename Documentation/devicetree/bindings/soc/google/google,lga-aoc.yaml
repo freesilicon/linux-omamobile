@@ -108,6 +108,10 @@ properties:
     maxItems: 1
     description: Optional Bluetooth BLE DBO latch GPIO for AoC-routed Bluetooth
 
+  bt-device-wakeup-gpios:
+    maxItems: 1
+    description: Optional Bluetooth device-wakeup GPIO for AoC-routed Bluetooth
+
   wakeup-source: true
 
 required:
