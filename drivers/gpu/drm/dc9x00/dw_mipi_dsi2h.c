@@ -293,6 +293,8 @@ static void dw_dsi2h_program_regs(struct dw_dsi2h *ctx)
 	u32 color_cfg;
 
 	writel(0, ctx->regs + DSI2H_PWR_UP);
+	readl(ctx->regs + DSI2H_PWR_UP);
+	udelay(1);
 	writel(DSI2H_MODE_IDLE, ctx->regs + DSI2H_MODE_CTRL);
 	writel(0, ctx->regs + DSI2H_CRI_TX_CTRL);
 
@@ -453,10 +455,14 @@ static void dw_dsi2h_bridge_atomic_post_disable(struct drm_bridge *bridge,
 						struct drm_atomic_commit *state)
 {
 	struct dw_dsi2h *ctx = bridge_to_dsi2h(bridge);
+	u32 sts;
 
 	mutex_lock(&ctx->lock);
 	ctx->host_ready = false;
 	dw_dsi2h_set_op_mode(ctx, DSI2H_MODE_IDLE);
+	if (readl_poll_timeout(ctx->regs + DSI2H_CORE_STATUS, sts, !sts,
+			       DSI2H_POLL_INTERVAL_US, DSI2H_POLL_TIMEOUT_US))
+		dw_dsi2h_dump_diag(ctx, "post_disable_idle_timeout");
 	writel(0, ctx->regs + DSI2H_PWR_UP);
 	phy_power_off(ctx->phy);
 	phy_exit(ctx->phy);

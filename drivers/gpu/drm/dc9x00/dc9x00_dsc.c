@@ -117,13 +117,17 @@ int dc9x00_dsc_configure(void __iomem *base, u8 panel_id,
 	u32 ob_max_addr, drb_max_addr, initial_lines;
 	const u32 hs = DC9X00_DSC_HS0_DWORD;
 
-	if (panel_id != 0)
+	if (panel_id == 0) {
+		split_cfg = FIELD_PREP(DC9X00_PANEL0_SPLIT_SRC_MASK,
+				       sw->enable ? DC9X00_PANEL0_SPLIT_SRC_DSC :
+						    DC9X00_PANEL0_SPLIT_SRC_PIPE);
+		writel(split_cfg, base + DC9X00_SH_PANEL0_SPLIT_CONFIG);
+	} else if (panel_id == 1) {
+		writel(sw->enable ? DC9X00_SH_PANEL1_DSC_COMP_EN : 0,
+		       base + DC9X00_SH_PANEL1_DSC_CONFIG);
+	} else {
 		return -ENODEV;
-
-	split_cfg = FIELD_PREP(DC9X00_PANEL0_SPLIT_SRC_MASK,
-			       sw->enable ? DC9X00_PANEL0_SPLIT_SRC_DSC :
-					    DC9X00_PANEL0_SPLIT_SRC_PIPE);
-	writel(split_cfg, base + DC9X00_SH_PANEL0_SPLIT_CONFIG);
+	}
 
 	if (!sw->enable || !dsc)
 		return 0;
