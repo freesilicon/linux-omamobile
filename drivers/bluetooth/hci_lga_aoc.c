@@ -92,6 +92,7 @@ enum lga_efw_fb_union_type {
 	LGA_EFW_FB_SET_POWER		= 3,
 	LGA_EFW_FB_SET_LPM		= 4,
 	LGA_EFW_FB_CONFIG_UART		= 5,
+	LGA_EFW_FB_DUMP_DEBUG		= 6,
 	LGA_EFW_FB_QUERY_STATE		= 7,
 };
 
@@ -180,6 +181,11 @@ module_param(efw_pmic_ctrl, bool, 0644);
 MODULE_PARM_DESC(efw_pmic_ctrl,
 		 "Request AoC-side PMIC/CPM BT power sequence in FlatBuffer SetPower");
 
+static bool efw_power_cycle = true;
+module_param(efw_power_cycle, bool, 0644);
+MODULE_PARM_DESC(efw_power_cycle,
+		 "Issue SetPower(0) before SetPower(1) when efw_pmic_ctrl=1 for a clean VBR_ON reset edge");
+
 static int efw_tx_flag = -1;
 module_param(efw_tx_flag, int, 0644);
 MODULE_PARM_DESC(efw_tx_flag,
@@ -194,6 +200,11 @@ static unsigned int efw_uart_baud;
 module_param(efw_uart_baud, uint, 0644);
 MODULE_PARM_DESC(efw_uart_baud,
 		 "Optional UART baud rate sent via EFW ConfigUART after SetPower (0=keep AoC default)");
+
+static int efw_uart_flow = -1;
+module_param(efw_uart_flow, int, 0644);
+MODULE_PARM_DESC(efw_uart_flow,
+		 "Optional EFW ConfigUART flow mode (-1=keep AoC default, 0/1=no flow, 2=HW RTS/CTS)");
 
 static bool toggle_bt_power = true;
 module_param(toggle_bt_power, bool, 0644);
@@ -540,8 +551,9 @@ static int hci_lga_aoc_efw_send_fb_uart(struct hci_lga_aoc *bt, u32 baud,
 					  NULL, 0, fb, sizeof(fb));
 }
 
-/* Canonical 32-byte FlatBuffer for QueryState (union_type=7, expects reply) */
-static int hci_lga_aoc_efw_send_fb_query_state(struct hci_lga_aoc *bt)
+/* Canonical 32-byte FlatBuffer for empty-subtable commands (DumpDebug=6, QueryState=7) */
+static int hci_lga_aoc_efw_send_fb_empty(struct hci_lga_aoc *bt, u8 union_type,
+					 u8 flags)
 {
 	u8 fb[32] = {};
 
@@ -551,15 +563,28 @@ static int hci_lga_aoc_efw_send_fb_query_state(struct hci_lga_aoc *bt)
 	put_unaligned_le16(4, fb + 8);
 	put_unaligned_le16(8, fb + 10);
 	put_unaligned_le32(8, fb + 12);
-	fb[16] = LGA_EFW_FB_QUERY_STATE;
+	fb[16] = union_type;
 	put_unaligned_le32(8, fb + 20);		/* subtable at offset 28 (20+8=28) */
 	put_unaligned_le16(4, fb + 24);		/* empty subtable vtable at 24 */
 	put_unaligned_le16(4, fb + 26);
 	put_unaligned_le32(4, fb + 28);		/* soffset back to 24 (28-4=24) */
 
 	return hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_FLATBUFFER,
-					  LGA_EFW_FLAG_EXPECT_REPLY,
-					  NULL, 0, fb, sizeof(fb));
+					  flags, NULL, 0, fb, sizeof(fb));
+}
+
+static const char *hci_lga_aoc_efw_state_str(u8 state)
+{
+	switch (state) {
+	case 0:
+		return "kUninitialized";
+	case 1:
+		return "kRecoverable";
+	case 2:
+		return "kUnrecoverable";
+	default:
+		return "unknown";
+	}
 }
 
 static u8 hci_lga_aoc_efw_msg_to_h4(u32 msg_type)
@@ -655,8 +680,9 @@ static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
 		if (hci_lga_aoc_efw_decode_reply(payload, payload_len,
 						 &utype, &state))
 			dev_info(bt->aoc_dev,
-				 "EFW reply seq=%u reply_to=%u len=%u fb_type=%u state=%u: %*ph\n",
+				 "EFW reply seq=%u reply_to=%u len=%u fb_type=%u state=%u (%s): %*ph\n",
 				 seq, reply_seq, payload_len, utype, state,
+				 utype == 1 ? hci_lga_aoc_efw_state_str(state) : "n/a",
 				 (int)min_t(u32, payload_len, 32U), payload);
 		else
 			dev_info(bt->aoc_dev,
@@ -1038,10 +1064,11 @@ static void hci_lga_aoc_latch_ble_dbo(struct hci_lga_aoc *bt)
 		return;
 
 	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 0);
-	usleep_range(1000, 2000);
+	usleep_range(10000, 12000);
 	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 1);
-	usleep_range(1000, 2000);
+	usleep_range(10000, 12000);
 	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 0);
+	usleep_range(10000, 12000);
 }
 
 static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
@@ -1097,15 +1124,17 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 
 	if (bt->bt_shutdown_gpio) {
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 0);
+		usleep_range(10000, 12000);
 		hci_lga_aoc_latch_ble_dbo(bt);
 		msleep(30);
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 1);
+		usleep_range(10000, 12000);
 		hci_lga_aoc_latch_ble_dbo(bt);
 	}
 	if (bt->bt_dev_wake_gpio)
 		gpiod_set_value_cansleep(bt->bt_dev_wake_gpio, 1);
 	if (bt->bt_shutdown_gpio || bt->bt_dev_wake_gpio)
-		msleep(100);
+		msleep(150);
 }
 
 static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
@@ -1189,7 +1218,8 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 	if (!lga_aoc_is_online(bt->aoc_dev))
 		return -ENODEV;
 
-	hci_lga_aoc_power_on(bt);
+	if (bt->mode != HCI_LGA_AOC_MODE_EFW)
+		hci_lga_aoc_power_on(bt);
 
 	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
 		if (lga_aoc_ipc_tx_pending(bt->aoc_dev, bt->tx_svc.index))
@@ -1231,6 +1261,21 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 			goto err_stop_efw;
 		}
 
+		if (efw_pmic_ctrl && efw_power_cycle) {
+			ret = hci_lga_aoc_efw_send_fb_u8_2(bt,
+							   LGA_EFW_FB_SET_POWER,
+							   0, 1);
+			if (ret) {
+				bt_dev_err(hdev,
+					   "EFW SetPower(off) cycle failed: %d",
+					   ret);
+				goto err_stop_efw;
+			}
+			lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
+					     msecs_to_jiffies(500));
+			msleep(30);
+		}
+
 		ret = hci_lga_aoc_efw_send_fb_u8_2(bt, LGA_EFW_FB_SET_POWER,
 						   1, efw_pmic_ctrl ? 1 : 0);
 		if (ret) {
@@ -1240,7 +1285,15 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 
 		lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
 				     msecs_to_jiffies(500));
-		msleep(100);
+
+		/*
+		 * When AP drives VBR_ON (efw_pmic_ctrl=0), toggle after AoC
+		 * has muxed XAOC_UART0 and asserted BT_DEV_WAKE.
+		 */
+		if (!efw_pmic_ctrl)
+			hci_lga_aoc_power_on(bt);
+		else
+			msleep(150);
 
 		if (efw_lpm_timeout >= 0) {
 			u8 lpm_en = efw_lpm_timeout > 0 ? 1 : 0;
@@ -1255,16 +1308,20 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 					    lpm_en, lpm_to, ret);
 		}
 
-		if (efw_uart_baud) {
-			ret = hci_lga_aoc_efw_send_fb_uart(bt, efw_uart_baud,
-							   1);
+		if (efw_uart_baud || efw_uart_flow >= 0) {
+			u32 baud = efw_uart_baud ?: 115200U;
+			u8 flow = efw_uart_flow >= 0 ?
+				  (u8)min(efw_uart_flow, 2) : 1U;
+
+			ret = hci_lga_aoc_efw_send_fb_uart(bt, baud, flow);
 			if (ret)
 				bt_dev_warn(hdev,
-					    "EFW ConfigUART(%u) failed: %d",
-					    efw_uart_baud, ret);
+					    "EFW ConfigUART(%u, flow=%u) failed: %d",
+					    baud, flow, ret);
 		}
 
-		ret = hci_lga_aoc_efw_send_fb_query_state(bt);
+		ret = hci_lga_aoc_efw_send_fb_empty(bt, LGA_EFW_FB_QUERY_STATE,
+						    LGA_EFW_FLAG_EXPECT_REPLY);
 		if (ret)
 			bt_dev_warn(hdev, "EFW QueryState failed: %d", ret);
 	} else if (bt->mode == HCI_LGA_AOC_MODE_AOCC) {
@@ -1397,6 +1454,7 @@ static int hci_lga_aoc_send(struct hci_dev *hdev, struct sk_buff *skb)
 
 static int hci_lga_aoc_setup(struct hci_dev *hdev)
 {
+	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
 	struct sk_buff *skb;
 	int ret;
 
@@ -1404,6 +1462,14 @@ static int hci_lga_aoc_setup(struct hci_dev *hdev)
 	if (IS_ERR(skb)) {
 		bt_dev_err(hdev, "HCI Reset over AoC failed: %ld",
 			   PTR_ERR(skb));
+		if (bt->mode == HCI_LGA_AOC_MODE_EFW && debug_rx &&
+		    bt->efw_connected && lga_aoc_is_online(bt->aoc_dev)) {
+			hci_lga_aoc_efw_send_fb_empty(bt, LGA_EFW_FB_DUMP_DEBUG,
+						      LGA_EFW_FLAG_NORMAL);
+			lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
+					     msecs_to_jiffies(250));
+			msleep(50);
+		}
 		return PTR_ERR(skb);
 	}
 	kfree_skb(skb);
