@@ -663,6 +663,80 @@ static bool hci_lga_aoc_efw_decode_reply(const u8 *fb, u32 len,
 	return true;
 }
 
+static void hci_lga_aoc_efw_log_debug_dump(struct hci_lga_aoc *bt, u32 seq,
+					   const u8 *payload, size_t body_len)
+{
+	size_t dump_len = min_t(size_t, body_len, 256U);
+	size_t off;
+
+	for (off = 0; off < dump_len; off += 32U) {
+		size_t chunk = min_t(size_t, dump_len - off, 32U);
+
+		dev_info(bt->aoc_dev,
+			 "EFW debug_dump seq=%u [%zu..%zu/%zu]: %*ph\n",
+			 seq, off, off + chunk - 1U, body_len,
+			 (int)chunk, payload + off);
+	}
+
+	off = 6U;
+	while (off + 5U <= body_len) {
+		u32 ts_ms = get_unaligned_le32(payload + off);
+		u8 tag = payload[off + 4U];
+
+		switch (tag) {
+		case 0x00:
+			if (off + 6U > body_len)
+				return;
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums power_state=%u\n",
+				 ts_ms, payload[off + 5U]);
+			off += 6U;
+			break;
+		case 0x01:
+			if (off + 6U > body_len)
+				return;
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums dev_wake=%u\n",
+				 ts_ms, payload[off + 5U]);
+			off += 6U;
+			break;
+		case 0x02:
+			if (off + 9U > body_len)
+				return;
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums baud=%u\n",
+				 ts_ms, get_unaligned_le32(payload + off + 5U));
+			off += 9U;
+			break;
+		case 0x03:
+			if (off + 7U > body_len)
+				return;
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums lpm=%u->%u\n",
+				 ts_ms, payload[off + 5U], payload[off + 6U]);
+			off += 7U;
+			break;
+		case 0x05:
+			if (off + 6U > body_len)
+				return;
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums host_wake=%u\n",
+				 ts_ms, payload[off + 5U]);
+			off += 6U;
+			break;
+		default: {
+			size_t rem = body_len - off;
+
+			dev_info(bt->aoc_dev,
+				 "EFW dbg t=%ums tag=%#02x tail(%zuB): %*ph\n",
+				 ts_ms, tag, rem,
+				 (int)min_t(size_t, rem, 32U), payload + off);
+			return;
+		}
+		}
+	}
+}
+
 static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
 					 const u8 *frame, u32 payload_len,
 					 u32 seq, u32 reply_seq, u8 pkt_kind)
@@ -713,11 +787,18 @@ static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
 	body_len = payload_len - sizeof(__le32);
 	payload += sizeof(__le32);
 
-	if (debug_rx)
-		dev_info(bt->aoc_dev,
-			 "EFW rx msg_type=%u seq=%u len=%zu: %*ph\n",
-			 msg_type, seq, body_len,
-			 (int)min_t(size_t, body_len, 32U), payload);
+	if (debug_rx) {
+		if (msg_type == LGA_EFW_MSG_HCI_TX_OR_EVT && body_len >= 6U &&
+		    payload[0] == 0xff && payload[2] == 0x58 &&
+		    payload[3] == 0x14 && payload[4] == 0x5a)
+			hci_lga_aoc_efw_log_debug_dump(bt, seq, payload,
+						       body_len);
+		else
+			dev_info(bt->aoc_dev,
+				 "EFW rx msg_type=%u seq=%u len=%zu: %*ph\n",
+				 msg_type, seq, body_len,
+				 (int)min_t(size_t, body_len, 64U), payload);
+	}
 
 	h4_type = hci_lga_aoc_efw_msg_to_h4(msg_type);
 	if (!h4_type) {
@@ -1130,6 +1211,12 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 1);
 		usleep_range(10000, 12000);
 		hci_lga_aoc_latch_ble_dbo(bt);
+		if (debug_rx)
+			dev_info(bt->aoc_dev,
+				 "AP VBR_ON latched: shutdown=%d ble_dbo=%d\n",
+				 gpiod_get_value_cansleep(bt->bt_shutdown_gpio),
+				 bt->bt_ble_dbo_gpio ?
+				 gpiod_get_value_cansleep(bt->bt_ble_dbo_gpio) : -1);
 	}
 	if (bt->bt_dev_wake_gpio)
 		gpiod_set_value_cansleep(bt->bt_dev_wake_gpio, 1);
@@ -1254,7 +1341,7 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 
 	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
 		ret = hci_lga_aoc_efw_send_fb_u8_2(bt, LGA_EFW_FB_ENABLE_HW,
-						   1, 0);
+						   1, debug_rx ? 1 : 0);
 		if (ret) {
 			bt_dev_err(hdev, "EFW EnableHWInterface failed: %d",
 				   ret);
