@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/soc/google/lga-aoc.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
@@ -465,6 +466,11 @@ static int lga_aoc_audio_cmd(struct lga_aoc_audio *audio, bool is_input,
 				       rx_buf, LGA_AOC_AUDIO_RSP_MAX);
 		if (ret <= 0)
 			break;
+		if (debug_cmd)
+			dev_info(audio->dev,
+				 "cmd drain [%s] stale len=%zd: %*ph\n",
+				 ctrl->name, ret,
+				 (int)min_t(ssize_t, ret, 32), rx_buf);
 	}
 
 	seq = atomic_inc_return(&audio->cmd_seq) & 0xff;
@@ -494,6 +500,7 @@ static int lga_aoc_audio_cmd(struct lga_aoc_audio *audio, bool is_input,
 	for (;;) {
 		struct lga_aoc_audio_hdr *rhdr;
 		long rem = deadline - jiffies;
+		u16 rx_id;
 		s16 reply;
 
 		if (rem <= 0) {
@@ -514,18 +521,49 @@ static int lga_aoc_audio_cmd(struct lga_aoc_audio *audio, bool is_input,
 			goto out_unlock;
 		}
 
-		if (ret < (ssize_t)sizeof(*rhdr))
-			continue;
+		if (ret == 4) {
+			u32 err_word = get_unaligned_le32(rx_buf);
 
+			dev_warn(audio->dev,
+				 "cmd rx [%s] id=%u short err=%#x\n",
+				 ctrl->name, cmd_id, err_word);
+			ret = -EREMOTEIO;
+			goto out_unlock;
+		}
+
+		if (ret < (ssize_t)sizeof(*rhdr)) {
+			if (debug_cmd)
+				dev_info(audio->dev,
+					 "cmd rx [%s] req_id=%u short len=%zd: %*ph\n",
+					 ctrl->name, cmd_id, ret,
+					 (int)ret, rx_buf);
+			continue;
+		}
+
+		/*
+		 * AoC audio control queues are serialized one command at a
+		 * time. DSP-forwarded commands (e.g. IN_MIC_SET_PARAMS 0x00e0
+		 * -> 0x0067, OUT_EP_SETUP 0x00ce -> 0x0134) return their
+		 * completion packet with an internal reply ID rather than
+		 * echoing req_id, so accept the serialized reply header
+		 * directly and check its signed reply status field.
+		 */
 		rhdr = (struct lga_aoc_audio_hdr *)rx_buf;
-		if (le16_to_cpu(rhdr->id) != cmd_id)
-			continue;
-
+		rx_id = le16_to_cpu(rhdr->id);
 		reply = (s16)le16_to_cpu(rhdr->reply);
-		if (debug_cmd)
-			dev_info(audio->dev,
-				 "cmd rx [%s] id=%u seq=%u reply=%d len=%zd\n",
-				 ctrl->name, cmd_id, rhdr->cntr, reply, ret);
+		if (debug_cmd) {
+			if (rx_id != cmd_id || reply < 0)
+				dev_info(audio->dev,
+					 "cmd rx [%s] req_id=%u rx_id=%u seq=%u rx_seq=%u reply=%d len=%zd: %*ph\n",
+					 ctrl->name, cmd_id, rx_id, seq,
+					 rhdr->cntr, reply, ret,
+					 (int)min_t(ssize_t, ret, 32), rx_buf);
+			else
+				dev_info(audio->dev,
+					 "cmd rx [%s] id=%u seq=%u reply=%d len=%zd\n",
+					 ctrl->name, rx_id, rhdr->cntr,
+					 reply, ret);
+		}
 
 		if (rsp_buf && rsp_len)
 			memcpy(rsp_buf, rx_buf,
@@ -747,7 +785,6 @@ static int lga_aoc_capture_setup(struct lga_aoc_stream *st,
 	struct lga_aoc_audio *audio = st->audio;
 	struct lga_aoc_cmd_in_mic_params params_cmd = { };
 	u8 sr_code, bits_code, cap_src, mic_mask;
-	unsigned int period_ms;
 	u8 i, slot = 0;
 	int ret;
 
@@ -770,20 +807,14 @@ static int lga_aoc_capture_setup(struct lga_aoc_stream *st,
 		st->powered_mics = mic_mask;
 	}
 
-	period_ms = (runtime->period_size * 1000U) / runtime->rate;
-	if (!period_ms)
-		period_ms = 10;
-	if (period_ms > 255)
-		period_ms = 255;
-
 	params_cmd.meta.chan = runtime->channels;
 	params_cmd.meta.bits = bits_code;
 	params_cmd.meta.sr = sr_code;
 	params_cmd.meta.format = LGA_AOC_FMT_FIXED_POINT;
 	params_cmd.meta.offset = 0;
 	params_cmd.pdm_mask = cap_src == 0 ? mic_mask : 0;
-	params_cmd.period_ms = period_ms;
-	params_cmd.num_periods = clamp_t(unsigned int, runtime->periods, 2, 16);
+	params_cmd.period_ms = 10;
+	params_cmd.num_periods = 4;
 	memset(params_cmd.interleaving, LGA_AOC_PDM_SLOT_UNUSED,
 	       sizeof(params_cmd.interleaving));
 	for (i = 0; i < LGA_AOC_PDM_MAX_MICS && slot < LGA_AOC_PDM_SLOTS; i++) {
@@ -1460,6 +1491,7 @@ static const struct snd_soc_component_driver lga_aoc_component_drv = {
 	.prepare = lga_aoc_pcm_prepare,
 	.trigger = lga_aoc_pcm_trigger,
 	.pointer = lga_aoc_pcm_pointer,
+	.module_get_upon_open = 1,
 };
 
 SND_SOC_DAILINK_DEF(lga_aoc_dummy_codec,
