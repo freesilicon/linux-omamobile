@@ -6,6 +6,7 @@
 
 #include <linux/init.h>
 #include <linux/irq.h>
+#include <linux/hardirq.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
 #include <linux/module.h>
@@ -20,6 +21,7 @@
 #include <linux/regulator/consumer.h>
 #include <soc/google/modem_notifier.h>
 #include <linux/reboot.h>
+#include <linux/rtc.h>
 #include <linux/suspend.h>
 #include <linux/time.h>
 #include <linux/timer.h>
@@ -27,8 +29,10 @@
 #if IS_ENABLED(CONFIG_S5910)
 #include <linux/s5910.h>
 #endif
+#if IS_REACHABLE(CONFIG_CP_PMIC)
+#include <soc/google/cp_pmic.h>
+#endif
 
-#include <linux/exynos-pci-ctrl.h>
 #include <linux/shm_ipc.h>
 
 #include "modem_prj.h"
@@ -38,10 +42,6 @@
 #include "link_device_memory.h"
 #include "s51xx_pcie.h"
 #include "modem_variation.h"
-
-#if IS_ENABLED(CONFIG_EXYNOS_BUSMONITOR)
-#include <linux/exynos-busmon.h>
-#endif
 
 #if IS_ENABLED(CONFIG_LINK_DEVICE_PCIE_IOMMU)
 #include "link_device_pcie_iommu.h"
@@ -55,6 +55,27 @@ static int s5100_lcd_notifier(struct notifier_block *notifier,
 #define msecs_to_loops(t) (loops_per_jiffy / 1000 * HZ * t)
 
 #define RUNTIME_PM_AFFINITY_CORE 2
+
+#define CRASH_WAKELOCK_TIMEOUT_MS	10000
+
+#define DEFAULT_TP_THRESHOLD		500 /* Mbps */
+#define DEFAULT_TP_HYSTERESIS		200 /* Mbps */
+
+#define PCIE_TIMEOUT_MS			1000
+#define LINK_SPEED_GEN1			1
+
+#define CPIF_TIME_AND_CHECK(op_name, timeout_ms, code_block) \
+	do { \
+		ktime_t start_time, end_time; \
+		s64 duration_ns; \
+		start_time = ktime_get(); \
+		code_block; \
+		end_time = ktime_get(); \
+		duration_ns = ktime_to_ns(ktime_sub(end_time, start_time)); \
+		if (duration_ns > (s64)(timeout_ms) * NSEC_PER_MSEC) \
+			mif_err("%s execution time %lld ms exceeded %d ms\n", \
+				(op_name), duration_ns / NSEC_PER_MSEC, (timeout_ms)); \
+	} while (0)
 
 static struct modem_ctl *g_mc;
 
@@ -76,12 +97,18 @@ static int s5100_reboot_handler(struct notifier_block *nb,
 
 static void print_mc_state(struct modem_ctl *mc)
 {
+	struct rtc_time rt;
 	int pwr = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_CP_PWR], false);
 	int reset = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_NRESET], false);
 	int pshold = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_PS_HOLD], false);
 
 	int ap_wakeup = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_WAKEUP], false);
-	int cp_wakeup = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], false);
+	int cp_wakeup;
+
+	if (mc->variant == MODEM_SEC_5400 && in_hardirq())
+		cp_wakeup = -1;
+	else
+		cp_wakeup = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], false);
 
 	int dump = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_DUMP_NOTI], false);
 	int ap_status = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], false);
@@ -89,16 +116,94 @@ static void print_mc_state(struct modem_ctl *mc)
 #if !IS_ENABLED(CONFIG_CP_WRESET_WA)
 	int wrst = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_CP_WRST_N], false);
 
+	rt = rtc_ktime_to_tm(ktime_get_real());
 	logbuffer_log(mc->log,
-		"%s: %ps:GPIO pwr:%d rst:%d phd:%d c2aw:%d a2cw:%d dmp:%d ap_act:%d cp_act:%d wrst:%d",
-		mc->name, CALLER, pwr, reset, pshold, ap_wakeup, cp_wakeup, dump,
+		"%ptRs %s: %ps:GPIO pwr:%d rst:%d phd:%d c2aw:%d a2cw:%d dmp:%d ap_act:%d cp_act:%d wrst:%d",
+		&rt, mc->name, CALLER, pwr, reset, pshold, ap_wakeup, cp_wakeup, dump,
 		ap_status, phone_active, wrst);
 #else
+	rt = rtc_ktime_to_tm(ktime_get_real());
 	logbuffer_log(mc->log,
-		"%s: %ps:GPIO pwr:%d rst:%d phd:%d c2aw:%d a2cw:%d dmp:%d ap_act:%d cp_act:%d",
-		mc->name, CALLER, pwr, reset, pshold, ap_wakeup, cp_wakeup, dump,
+		"%ptRs %s: %ps:GPIO pwr:%d rst:%d phd:%d c2aw:%d a2cw:%d dmp:%d ap_act:%d cp_act:%d",
+		&rt, mc->name, CALLER, pwr, reset, pshold, ap_wakeup, cp_wakeup, dump,
 		ap_status, phone_active);
 #endif
+}
+
+static void print_msi_space(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	void __iomem *msi_address = mld->msi_reg_base;
+	int i;
+
+	if (!msi_address)
+		return;
+
+	logbuffer_log(mc->log, "<%ps> offset: 0 4 8 C\n", CALLER);
+	for (i = 0x30; i < 0x50; i += 0x10) {
+		logbuffer_log(mc->log,
+			"MSI %04x: %08x %08x %08x %08x\n",
+			i,
+			ioread32(msi_address + i + 0x0),
+			ioread32(msi_address + i + 0x4),
+			ioread32(msi_address + i + 0x8),
+			ioread32(msi_address + i + 0xC));
+	}
+}
+
+static void print_ep_config_space(struct modem_ctl *mc)
+{
+	int i;
+	u32 val1, val2, val3, val4;
+
+	if (!mc->s51xx_pdev)
+		return;
+
+	logbuffer_log(mc->log, "<%ps> offset: 0 4 8 C\n", CALLER);
+	for (i = 0x100; i < 0x120; i += 0x10) {
+		pci_read_config_dword(mc->s51xx_pdev, i, &val1);
+		pci_read_config_dword(mc->s51xx_pdev, i + 0x4, &val2);
+		pci_read_config_dword(mc->s51xx_pdev, i + 0x8, &val3);
+		pci_read_config_dword(mc->s51xx_pdev, i + 0xC, &val4);
+		logbuffer_log(mc->log, "EP_CFG %04x: %08x %08x %08x %08x\n",
+			i, val1, val2, val3, val4);
+	}
+}
+
+static void print_doorbell_region(struct modem_ctl *mc)
+{
+	struct s51xx_pcie *s51xx_pcie;
+	u32 i;
+
+	if (!mc->s51xx_pdev)
+		return;
+
+	s51xx_pcie = pci_get_drvdata(mc->s51xx_pdev);
+	if (!s51xx_pcie || !s51xx_pcie->doorbell_addr)
+		return;
+
+	logbuffer_log(mc->log, "doorbell_addr = %#lx (PHYSICAL %#lx)\n",
+		(unsigned long)s51xx_pcie->doorbell_addr,
+		(unsigned long)s51xx_pcie->dbaddr_base);
+
+	logbuffer_log(mc->log, "<%ps> offset: 0 4 8 C\n", CALLER);
+	for (i = 0x9200; i < 0x9280; i += 0x10) {
+		logbuffer_log(mc->log,
+			"DB %04x: %08x %08x %08x %08x\n",
+			i,
+			ioread32(s51xx_pcie->doorbell_addr + i + 0x0),
+			ioread32(s51xx_pcie->doorbell_addr + i + 0x4),
+			ioread32(s51xx_pcie->doorbell_addr + i + 0x8),
+			ioread32(s51xx_pcie->doorbell_addr + i + 0xC));
+	}
+}
+
+static void ap2cp_wakeup_work(struct work_struct *work)
+{
+	struct modem_ctl *mc = container_of(work, struct modem_ctl, ap2cp_wakeup_work);
+
+	s5100_try_gpio_cp_wakeup(mc);
 }
 
 static void pcie_clean_dislink(struct modem_ctl *mc)
@@ -139,7 +244,7 @@ static void cp2ap_wakeup_work(struct work_struct *work)
 	mc->cp_power_stats.suspended = false;
 	spin_unlock_irqrestore(&mc->power_stats_lock, flags);
 
-	s5100_poweron_pcie(mc, false);
+	s5100_poweron_pcie(mc, LINK_MODE_ADAPTIVE_SPEED_BOOTED);
 }
 
 static void cp2ap_suspend_work(struct work_struct *work)
@@ -236,6 +341,13 @@ static ssize_t pcie_event_stats_show(struct device *dev,
 			"\nTotal CPL timeout retries recorded: %d\n",
 			pcie_cto_count);
 
+	if (mc->variant == MODEM_SEC_5400) {
+		for (i = 0; i < NUM_ENABLED_MSI; i++) {
+			count += scnprintf(&buf[count], PAGE_SIZE - count,
+					   "MSI%zu missed: %d\n", i, mc->msi_missed[i]);
+		}
+	}
+
 	return count;
 }
 
@@ -251,6 +363,97 @@ static struct attribute *modem_attrs[] = {
 static const struct attribute_group modem_group = {
 	.attrs = modem_attrs,
 	.name = "modem",
+};
+
+static ssize_t tp_threshold_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", mc->tp_threshold);
+}
+
+static ssize_t tp_threshold_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	u32 threshold;
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	if (kstrtou32(buf, 10, &threshold))
+		return -EINVAL;
+
+	dev_info(dev, "Dynamic PCIe link speed: Change threshold to %uMbps\n",
+		 threshold);
+	mc->tp_threshold = threshold;
+
+	return count;
+}
+
+static ssize_t tp_hysteresis_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", mc->tp_hysteresis);
+}
+
+static ssize_t tp_hysteresis_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	u32 hysteresis;
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	if (kstrtou32(buf, 10, &hysteresis))
+		return -EINVAL;
+
+	dev_info(dev, "Dynamic PCIe link speed: Change hysteresis to %uMbps\n",
+		 hysteresis);
+	mc->tp_hysteresis = hysteresis;
+
+	return count;
+}
+
+static ssize_t dynamic_spd_enable_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", mc->pcie_dynamic_spd_enabled);
+}
+
+static ssize_t dynamic_spd_enable_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	u32 enable;
+	struct modem_ctl *mc = dev_get_drvdata(dev);
+
+	if (kstrtou32(buf, 10, &enable))
+		return -EINVAL;
+
+	dev_info(dev, "Dynamic PCIe link speed is %s\n",
+		 enable ? "enabled" : "not enabled");
+	mc->pcie_dynamic_spd_enabled = enable;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(tp_threshold);
+static DEVICE_ATTR_RW(tp_hysteresis);
+static DEVICE_ATTR_RW(dynamic_spd_enable);
+
+static struct attribute *dynamic_pcie_spd_attrs[] = {
+	&dev_attr_tp_threshold.attr,
+	&dev_attr_tp_hysteresis.attr,
+	&dev_attr_dynamic_spd_enable.attr,
+	NULL,
+};
+
+static const struct attribute_group dynamic_pcie_spd_group = {
+	.attrs = dynamic_pcie_spd_attrs,
+	.name = "dynamic_pcie_spd",
 };
 
 #if IS_ENABLED(CONFIG_CPIF_AP_SUSPEND_DURING_VOICE_CALL)
@@ -312,8 +515,13 @@ static irqreturn_t ap_wakeup_handler(int irq, void *data)
 #if !IS_ENABLED(CONFIG_CP_WRESET_WA)
 	if (mc->mdm_data->mif_off_during_volte) {
 		int wrst_gpio_val = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_CP_WRST_N], true);
+		bool unlock = !!wrst_gpio_val;
+
+#if IS_ENABLED(CONFIG_CPIF_AP_SUSPEND_DURING_VOICE_CALL)
+		unlock = unlock || !mc->pcie_voice_call_on;
+#endif
 		/* To avoid holding on to the wakesource in case of a race condition */
-		if (wrst_gpio_val || !mc->pcie_voice_call_on)
+		if (unlock)
 			cpif_wake_unlock(mc->ws_wrst);
 	}
 #endif
@@ -384,6 +592,8 @@ static irqreturn_t cp_active_handler(int irq, void *data)
 		mif_err_limited("Phone_state is NOT ONLINE - IGNORING interrupt\n");
 		goto irq_done;
 	}
+
+	print_mc_state(mc);
 
 	cp_active = mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_CP_ACTIVE], true);
 	mif_err("[PHONE_ACTIVE Handler] state:%s cp_active:%d\n",
@@ -757,6 +967,33 @@ static void pktproc_kick_rx_queues(struct mem_link_device *mld)
 #endif
 }
 
+static void s51xx_pci_free_irq(struct link_device *ld)
+{
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	struct modem_ctl *mc = ld->mc;
+
+	if (!mc->s51xx_pdev)
+		return;
+
+	while (mc->irq_offset > 0) {
+		mc->irq_offset--;
+#if IS_ENABLED(CONFIG_CP_PKTPROC)
+		if (mld->pktproc.use_exclusive_irq &&
+		    mc->irq_offset >= DEFAULT_MSI_VEC_NUM) {
+			int idx = mc->irq_offset - DEFAULT_MSI_VEC_NUM;
+
+			pci_free_irq(mc->s51xx_pdev, mc->irq_offset,
+				     mld->pktproc.q[idx]);
+			if (mld->pktproc.q[idx])
+				mld->pktproc.q[idx]->irq = 0;
+			continue;
+		}
+#endif
+		pci_free_irq(mc->s51xx_pdev, mc->irq_offset, mld);
+	}
+	pci_free_irq_vectors(mc->s51xx_pdev);
+}
+
 static int request_pcie_int(struct link_device *ld, struct platform_device *pdev)
 {
 #define DOORBELL_INT_MASK(x)	((x) | 0x10000)
@@ -767,62 +1004,129 @@ static int request_pcie_int(struct link_device *ld, struct platform_device *pdev
 	struct device *dev = &pdev->dev;
 	struct modem_ctl *mc = ld->mc;
 	struct modem_data *modem = mc->mdm_data;
-	int irq_offset = 0;
 
 	/* Doorbell */
 	mld->intval_ap2cp_msg = DOORBELL_INT_MASK(modem->mbx->int_ap2cp_msg);
 	mld->intval_ap2cp_pcie_link_ack = DOORBELL_INT_MASK(modem->mbx->int_ap2cp_pcie_link_ack);
 
-	/* MSI */
-	base_irq = s51xx_pcie_request_msi_int(mc->s51xx_pdev, 4);
-	if (base_irq <= 0) {
-		mif_err("Can't get MSI IRQ!!!\n");
-		return -EFAULT;
-	}
-	mif_info("MSI base_irq(%d)\n", base_irq);
-
-	/*
-	 * This lock class tells lockdep that base_irqs are in a different
-	 * category than their parents, so it won't report false recursion.
-	 */
-	irq_set_lockdep_class(base_irq, &lock_class, &request_class);
-
-	ret = devm_request_irq(dev, base_irq + irq_offset, shmem_irq_handler,
-			       IRQF_SHARED, "mif_cp2ap_msg", mld);
-	if (ret) {
-		mif_err("Can't request cp2ap_msg interrupt!!!\n");
-		return -EIO;
-	}
-	irq_offset++;
-
-	ret = devm_request_irq(dev, base_irq + irq_offset, shmem_tx_state_handler,
-			       IRQF_SHARED, "mif_cp2ap_status", mld);
-	if (ret) {
-		mif_err("Can't request cp2ap_status interrupt!!!\n");
-		return -EIO;
-	}
-	irq_offset++;
+	if (mc->variant == MODEM_SEC_5400) {
+		int int_num = DEFAULT_MSI_VEC_NUM;
 
 #if IS_ENABLED(CONFIG_CP_PKTPROC)
-	if (mld->pktproc.use_exclusive_irq) {
-		struct pktproc_adaptor *ppa = &mld->pktproc;
-		unsigned int i;
+		if (mld->pktproc.use_exclusive_irq)
+			int_num += mld->pktproc.num_queue;
+#endif
+		base_irq = s51xx_pcie_request_msi_int(mc->s51xx_pdev, int_num,
+						      mld->pktproc.use_exclusive_irq);
+		if (base_irq <= 0) {
+			mc->irq_offset = -1;
+			mif_err("Can't get MSI IRQ!!!\n");
+			return -EFAULT;
+		}
+		base_irq = pci_irq_vector(mc->s51xx_pdev, 0);
+		mif_info("MSI base_irq(%d) vectors(%d)\n", base_irq, int_num);
 
-		for (i = 0; i < ppa->num_queue; i++) {
-			struct pktproc_queue *q = ppa->q[i];
+		mc->irq_offset = 0;
+		ret = pci_request_irq(mc->s51xx_pdev, mc->irq_offset,
+				      shmem_irq_handler, NULL, mld,
+				      "mif_cp2ap_msg");
+		if (ret) {
+			mif_err("Can't request cp2ap_msg interrupt!!!\n");
+			goto err_free_5400_irq;
+		}
+		mc->irq_offset++;
 
-			ret = register_separated_msi_vector(mc->pcie_ch_num, q->irq_handler, q,
-							    &q->irq);
-			if (ret < 0) {
-				mif_err("register_separated_msi_vector for pktproc q[%u] err:%d\n",
-					i, ret);
-				q->irq = 0;
-				return -EIO;
+		ret = pci_request_irq(mc->s51xx_pdev, mc->irq_offset,
+				      shmem_tx_state_handler, NULL, mld,
+				      "mif_cp2ap_status");
+		if (ret) {
+			mif_err("Can't request cp2ap_status interrupt!!!\n");
+			goto err_free_5400_irq;
+		}
+		mc->irq_offset++;
+
+#if IS_ENABLED(CONFIG_CP_PKTPROC)
+		if (mld->pktproc.use_exclusive_irq) {
+			struct pktproc_adaptor *ppa = &mld->pktproc;
+			unsigned int i;
+
+			for (i = 0; i < ppa->num_queue; i++) {
+				struct pktproc_queue *q = ppa->q[i];
+
+				q->irq = pci_irq_vector(mc->s51xx_pdev, mc->irq_offset);
+				ret = pci_request_irq(mc->s51xx_pdev, mc->irq_offset,
+						      q->irq_handler, NULL, q,
+						      "google-pcie-msi%u", i + 1);
+				if (ret) {
+					mif_err("pci_request_irq pktproc q[%u] err:%d\n",
+						i, ret);
+					q->irq = 0;
+					goto err_free_5400_irq;
+				}
+				mc->irq_offset++;
 			}
 		}
-	}
 #endif
+		goto out_enable_msi;
 
+err_free_5400_irq:
+		s51xx_pci_free_irq(ld);
+		mc->irq_offset = -1;
+		return -EIO;
+	}
+
+	/* S5300 (gs201) path */
+	{
+		int irq_offset = 0;
+
+		base_irq = s51xx_pcie_request_msi_int(mc->s51xx_pdev, 4, false);
+		if (base_irq <= 0) {
+			mif_err("Can't get MSI IRQ!!!\n");
+			return -EFAULT;
+		}
+		mif_info("MSI base_irq(%d)\n", base_irq);
+
+		irq_set_lockdep_class(base_irq, &lock_class, &request_class);
+
+		ret = devm_request_irq(dev, base_irq + irq_offset, shmem_irq_handler,
+				       IRQF_SHARED, "mif_cp2ap_msg", mld);
+		if (ret) {
+			mif_err("Can't request cp2ap_msg interrupt!!!\n");
+			return -EIO;
+		}
+		irq_offset++;
+
+		ret = devm_request_irq(dev, base_irq + irq_offset, shmem_tx_state_handler,
+				       IRQF_SHARED, "mif_cp2ap_status", mld);
+		if (ret) {
+			mif_err("Can't request cp2ap_status interrupt!!!\n");
+			return -EIO;
+		}
+		irq_offset++;
+
+#if IS_ENABLED(CONFIG_CP_PKTPROC)
+		if (mld->pktproc.use_exclusive_irq) {
+			struct pktproc_adaptor *ppa = &mld->pktproc;
+			unsigned int i;
+
+			for (i = 0; i < ppa->num_queue; i++) {
+				struct pktproc_queue *q = ppa->q[i];
+
+				ret = pcie_register_separated_msi_vector(mc->pcie_ch_num,
+									 q->irq_handler, q,
+									 &q->irq);
+				if (ret < 0) {
+					mif_err("register_separated_msi_vector for pktproc q[%u] err:%d\n",
+						i, ret);
+					q->irq = 0;
+					return -EIO;
+				}
+			}
+		}
+#endif
+	}
+
+out_enable_msi:
 	mld->msi_irq_base = base_irq;
 	mld->msi_irq_enabled = true;
 	set_pcie_msi_int(ld, true);
@@ -833,7 +1137,7 @@ static int request_pcie_int(struct link_device *ld, struct platform_device *pdev
 /*
  * Undo request_pcie_int() for the endpoint's own MSI vectors, which go
  * with the endpoint: s51xx_pcie_remove() calls this before it gives them
- * back. The packet queues' vectors are the controller's and stay.
+ * back. On gs201, the packet queues' vectors are the controller's and stay.
  */
 void s5100_free_pcie_int(struct modem_ctl *mc)
 {
@@ -852,8 +1156,26 @@ void s5100_free_pcie_int(struct modem_ctl *mc)
 		disable_irq_wake(irq);
 		mld->msi_irq_base_wake = false;
 	}
-	devm_free_irq(mc->dev, irq + 1, mld);	/* mif_cp2ap_status */
-	devm_free_irq(mc->dev, irq, mld);	/* mif_cp2ap_msg */
+#if IS_ENABLED(CONFIG_CP_PKTPROC)
+	if (mc->variant == MODEM_SEC_5400 && mld->pktproc.use_exclusive_irq) {
+		unsigned int i;
+
+		for (i = 0; i < mld->pktproc.num_queue; i++) {
+			struct pktproc_queue *q = mld->pktproc.q[i];
+
+			if (q && q->msi_irq_wake && q->irq) {
+				disable_irq_wake(q->irq);
+				q->msi_irq_wake = false;
+			}
+		}
+	}
+#endif
+	if (mc->variant == MODEM_SEC_5400) {
+		s51xx_pci_free_irq(ld);
+	} else {
+		devm_free_irq(mc->dev, irq + 1, mld);	/* mif_cp2ap_status */
+		devm_free_irq(mc->dev, irq, mld);	/* mif_cp2ap_msg */
+	}
 	mld->msi_irq_base = 0;
 }
 
@@ -885,6 +1207,7 @@ static int register_pcie(struct link_device *ld)
 	}
 
 	mc->s2mpu = s2mpu_fwnode_to_info(&s2mpu_dn->fwnode);
+	of_node_put(s2mpu_dn);
 	if (!mc->s2mpu) {
 		mif_err("Failed to get S2MPU\n");
 		return -EPROBE_DEFER;
@@ -924,22 +1247,23 @@ static int register_pcie(struct link_device *ld)
 
 	msleep(200);
 
-	s5100_poweron_pcie(mc, !!(mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE));
+	s5100_poweron_pcie(mc, LINK_MODE_MIN_SPEED_BOOTING);
 
 	if (is_registered == 0) {
 		/* initialize the pci_dev for modem_ctl */
 		mif_info("s51xx_pcie_init start\n");
+		cpif_pcie_set_google(mc->variant == MODEM_SEC_5400);
 		err = s51xx_pcie_init(mc);
 		if (err || !mc->s51xx_pdev) {
 			mif_err("s51xx_pdev is NULL. Check if CP wake up is done.\n");
 			return err ?: -ENODEV;
 		}
 
-		/* debug: check MSI 32bit or 64bit - should be set as 32bit before this point*/
-		// debug: pci_read_config_dword(s51xx_pcie.s51xx_pdev, 0x50, &msi_val);
-		// debug: mif_err("MSI Control Reg : 0x%x\n", msi_val);
-
-		request_pcie_int(ld, pdev);
+		err = request_pcie_int(ld, pdev);
+		if (err < 0) {
+			mif_err("request_pcie_int fail (%d)\n", err);
+			return err;
+		}
 		first_save_s51xx_status(mc->s51xx_pdev);
 
 		is_registered = 1;
@@ -958,6 +1282,32 @@ static int register_pcie(struct link_device *ld)
 	return 0;
 }
 
+#if IS_REACHABLE(CONFIG_S5910)
+static void gpio_power_off_cp_with_s5910_on(struct modem_ctl *mc)
+{
+#if IS_ENABLED(CONFIG_CP_WRESET_WA)
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_NRESET], 0, 50);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_CP_PWR], 0, 0);
+#else
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], 1, 10);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], 0, 0);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_NRESET], 0, 0);
+
+	/* Turn on S5910 clock buffer after AP resets CP */
+	if (mc->cp_ever_powered_on && mc->s5910_dev) {
+		udelay(10);
+		s5910_check_lpm_mode(mc->s5910_dev);
+		s5910_turn_on_sequence(mc->s5910_dev);
+		udelay(200);
+		s5910_check_lpm_mode(mc->s5910_dev);
+	}
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_CP_WRST_N], 0, 0);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_CP_PWR], 0, 30);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_PM_WRST_N], 0, 50);
+#endif
+}
+#endif
+
 static void gpio_power_off_cp(struct modem_ctl *mc)
 {
 #if IS_ENABLED(CONFIG_CP_WRESET_WA)
@@ -975,7 +1325,14 @@ static void gpio_power_off_cp(struct modem_ctl *mc)
 
 static void gpio_power_offon_cp(struct modem_ctl *mc)
 {
+#if IS_REACHABLE(CONFIG_S5910)
+	if (mc->s5910_dev)
+		gpio_power_off_cp_with_s5910_on(mc);
+	else
+		gpio_power_off_cp(mc);
+#else
 	gpio_power_off_cp(mc);
+#endif
 
 #if IS_ENABLED(CONFIG_CP_WRESET_WA)
 	udelay(50);
@@ -1020,11 +1377,20 @@ static void gpio_power_wreset_cp(struct modem_ctl *mc)
 #endif
 }
 
+static void gpio_power_preset_cp(struct modem_ctl *mc)
+{
+	print_mc_state(mc);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_PARTIAL_RST_N], 0, 50);
+	print_mc_state(mc);
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_PARTIAL_RST_N], 1, 50);
+	print_mc_state(mc);
+}
+
 static void clear_boot_stage(struct modem_ctl *mc)
 {
 	struct link_device *ld = get_current_link(mc->iod);
 	struct mem_link_device *mld = to_mem_link_device(ld);
-	int val;
+	u32 boot_stage, sub_boot_stage;
 
 	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
 		if (!mld->msi_reg_base) {
@@ -1036,11 +1402,21 @@ static void clear_boot_stage(struct modem_ctl *mc)
 			}
 		}
 
-		iowrite32(0, mld->msi_reg_base +
+		CLEAR_MSI_REG_FIELD(mld, boot_stage);
+		boot_stage = ioread32(mld->msi_reg_base +
 			offsetof(struct msi_reg_type, boot_stage));
-		val = ioread32(mld->msi_reg_base +
-			offsetof(struct msi_reg_type, boot_stage));
-		mif_info("Clear boot_stage == 0x%X\n", val);
+		CLEAR_MSI_REG_FIELD(mld, sub_boot_stage);
+		sub_boot_stage = ioread32(mld->msi_reg_base +
+			offsetof(struct msi_reg_type, sub_boot_stage));
+
+		CLEAR_MSI_REG_FIELD(mld, flag_cafe);
+		CLEAR_MSI_REG_FIELD(mld, otp_version);
+		CLEAR_MSI_REG_FIELD(mld, db_loop_cnt);
+		CLEAR_MSI_REG_FIELD(mld, db_received);
+		CLEAR_MSI_REG_FIELD(mld, boot_size);
+
+		mif_info("Clear boot_stage, sub_boot_stage to %X, %X\n",
+			 boot_stage, sub_boot_stage);
 	}
 }
 
@@ -1108,7 +1484,7 @@ static int power_off_cp(struct modem_ctl *mc)
 	if (mc->phone_state == STATE_OFFLINE)
 		goto exit;
 
-	if (!allow_poweroff) {
+	if (mc->variant != MODEM_SEC_5400 && !allow_poweroff) {
 		mif_err("%s: power off refused, the modem stays on (allow_poweroff=0)\n",
 			mc->name);
 		goto exit;
@@ -1150,20 +1526,67 @@ static int power_shutdown_cp(struct modem_ctl *mc)
 		msleep(20);
 	}
 
-#if IS_ENABLED(CONFIG_S5910)
+#if IS_REACHABLE(CONFIG_S5910)
 	if (mc->s5910_dev) {
 		mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_NRESET], 0, 50);
 		s5910_shutdown_sequence(mc->s5910_dev);
 	}
 #endif
 
+	if (mc->variant == MODEM_SEC_5400)
+		CPIF_TIME_AND_CHECK("pcie_poweroff", PCIE_TIMEOUT_MS,
+			pcie_poweroff(mc->pcie_ch_num);
+		);
+
 	gpio_power_off_cp(mc);
 	print_mc_state(mc);
 
-	pcie_clean_dislink(mc);
+	if (mc->variant != MODEM_SEC_5400)
+		pcie_clean_dislink(mc);
 
 exit:
 	mif_err("---\n");
+	return 0;
+}
+
+static int power_reset_partial_cp(struct modem_ctl *mc)
+{
+	struct s51xx_pcie *s51xx_pcie = NULL;
+	struct link_device *ld = get_current_link(mc->iod);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+
+	if (ld->sbd_ipc && hrtimer_active(&mld->sbd_print_timer))
+		hrtimer_cancel(&mld->sbd_print_timer);
+
+	mif_info("%s: +++\n", mc->name);
+
+	mc->phone_state = STATE_CRASH_EXIT;
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_ACTIVE]);
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_WAKEUP]);
+	drain_workqueue(mc->wakeup_wq);
+	pcie_clean_dislink(mc);
+
+	if (mc->s51xx_pdev != NULL)
+		s51xx_pcie = pci_get_drvdata(mc->s51xx_pdev);
+
+	if (s51xx_pcie && s51xx_pcie->link_status == 1) {
+		mif_info("link_satus:%d\n", s51xx_pcie->link_status);
+		s51xx_pcie_save_state(mc->s51xx_pdev);
+		pcie_clean_dislink(mc);
+	}
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_DUMP_NOTI], 0, 0);
+
+	mif_info("s5100_cp_reset_required:%d\n", mc->s5100_cp_reset_required);
+	if (mc->s5100_cp_reset_required)
+		gpio_power_offon_cp(mc);
+	else
+		gpio_power_preset_cp(mc);
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
+	print_mc_state(mc);
+
+	mif_info("---\n");
 	return 0;
 }
 
@@ -1183,6 +1606,12 @@ static int power_reset_dump_cp(struct modem_ctl *mc, bool silent)
 	mc->phone_state = STATE_CRASH_EXIT;
 	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_ACTIVE]);
 	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_WAKEUP]);
+
+	if (!cpif_wake_lock_active(mc->ws)) {
+		mif_info("Acquiring wakelock during modem crash, timeout: %dms!\n",
+			 CRASH_WAKELOCK_TIMEOUT_MS);
+		cpif_wake_lock_timeout(mc->ws, msecs_to_jiffies(CRASH_WAKELOCK_TIMEOUT_MS));
+	}
 
 	drain_workqueue(mc->wakeup_wq);
 	pcie_clean_dislink(mc);
@@ -1212,11 +1641,102 @@ static int power_reset_dump_cp(struct modem_ctl *mc, bool silent)
 	else
 		gpio_power_wreset_cp(mc);
 
+#if IS_REACHABLE(CONFIG_CP_PMIC)
+	if (mc->pmic_dev) {
+		int otp_version = pmic_get_otp(mc->pmic_dev);
+
+		if (otp_version < 0)
+			mif_info("PMIC OTP Version read fail\n");
+		else
+			mif_info("PMIC OTP Version %#x\n", otp_version);
+
+		pmic_warm_reset_sequence(mc->pmic_dev);
+	}
+#endif
+
 	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
 	print_mc_state(mc);
 
+	if (cpif_wake_lock_active(mc->ws)) {
+		mif_info("Release wakelock after modem crash\n");
+		cpif_wake_unlock(mc->ws);
+	}
+
 	mif_info("---\n");
 
+	return 0;
+}
+
+static int power_reset_warm_cp(struct modem_ctl *mc)
+{
+	struct s51xx_pcie *s51xx_pcie = NULL;
+	struct link_device *ld = get_current_link(mc->iod);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+
+	if (ld->sbd_ipc && hrtimer_active(&mld->sbd_print_timer))
+		hrtimer_cancel(&mld->sbd_print_timer);
+
+	mif_info("%s: +++\n", mc->name);
+
+	mc->phone_state = STATE_CRASH_EXIT;
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_ACTIVE]);
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_WAKEUP]);
+
+	if (!cpif_wake_lock_active(mc->ws)) {
+		mif_info("Acquiring wakelock during modem power reset, timeout: %dms!\n",
+			 CRASH_WAKELOCK_TIMEOUT_MS);
+		cpif_wake_lock_timeout(mc->ws, msecs_to_jiffies(CRASH_WAKELOCK_TIMEOUT_MS));
+	}
+
+	drain_workqueue(mc->wakeup_wq);
+
+	if (mc->phone_state != STATE_OFFLINE) {
+		change_modem_state(mc, STATE_RESET);
+		msleep(STATE_RESET_INTERVAL_MS);
+	}
+	change_modem_state(mc, STATE_OFFLINE);
+
+	pcie_clean_dislink(mc);
+
+	if (mc->s51xx_pdev != NULL)
+		s51xx_pcie = pci_get_drvdata(mc->s51xx_pdev);
+
+	if (s51xx_pcie && s51xx_pcie->link_status == 1) {
+		mif_info("link_satus:%d\n", s51xx_pcie->link_status);
+		s51xx_pcie_save_state(mc->s51xx_pdev);
+		pcie_clean_dislink(mc);
+	}
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_DUMP_NOTI], 0, 0);
+
+	mif_info("s5100_cp_reset_required:%d\n", mc->s5100_cp_reset_required);
+	if (mc->s5100_cp_reset_required)
+		gpio_power_offon_cp(mc);
+	else
+		gpio_power_wreset_cp(mc);
+
+#if IS_REACHABLE(CONFIG_CP_PMIC)
+	if (mc->pmic_dev) {
+		int otp_version = pmic_get_otp(mc->pmic_dev);
+
+		if (otp_version < 0)
+			mif_info("PMIC OTP Version read fail\n");
+		else
+			mif_info("PMIC OTP Version %#x\n", otp_version);
+
+		pmic_warm_reset_sequence(mc->pmic_dev);
+	}
+#endif
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
+	print_mc_state(mc);
+
+	if (cpif_wake_lock_active(mc->ws)) {
+		mif_info("Release wakelock after modem power reset!\n");
+		cpif_wake_unlock(mc->ws);
+	}
+
+	mif_info("---\n");
 	return 0;
 }
 
@@ -1314,7 +1834,10 @@ static int check_cp_status(struct modem_ctl *mc, unsigned int count, bool check_
 		if (check_msi) {
 			val = (int)ioread32(mld->msi_reg_base +
 				offsetof(struct msi_reg_type, boot_stage));
-			if (val == BOOT_STAGE_DONE_MASK) {
+			if (((mc->variant == MODEM_SEC_5400) &&
+			     (val == BOOT_STAGE_5400_DONE_MASK)) ||
+			    ((mc->variant == MODEM_SEC_5300) &&
+			     (val == BOOT_STAGE_5300_DONE_MASK))) {
 				check_done = true;
 				break;
 			}
@@ -1340,6 +1863,53 @@ static int check_cp_status(struct modem_ctl *mc, unsigned int count, bool check_
 		msleep(20);
 
 	return 0;
+}
+
+static int check_boot_status(struct modem_ctl *mc, unsigned int count, bool check_bl1)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	bool check_done = false;
+	int cnt = 0;
+	u32 val, otp_ver, sub_boot_stage;
+
+	do {
+		/* ensure that CP updates the value */
+		msleep(20);
+
+		val = ioread32(mld->msi_reg_base +
+			offsetof(struct msi_reg_type, boot_stage));
+		otp_ver = ioread32(mld->msi_reg_base +
+			offsetof(struct msi_reg_type, otp_version));
+		sub_boot_stage = ioread32(mld->msi_reg_base +
+			offsetof(struct msi_reg_type, sub_boot_stage));
+		mif_info_limited("boot_stage: %X sub_boot_stage: %X otp_version: %X (cnt %d)\n",
+			val, sub_boot_stage, otp_ver, cnt);
+		if (val == (check_bl1 ? BOOT_STAGE_BL1_DOWNLOAD_DONE_MASK
+				: BOOT_STAGE_5400_DONE_MASK)) {
+			check_done = true;
+			break;
+		}
+	} while (++cnt < count);
+
+	if (!check_done) {
+		mif_err("ERR! boot_stage == 0x%X (cnt %d)\n", val, cnt);
+		goto status_error;
+	}
+
+	mif_info("boot_stage == 0x%X (cnt %d)\n", val, cnt);
+	if (cnt == 0)
+		msleep(10);
+
+	return 0;
+
+status_error:
+	print_msi_space(mc);
+	if (mc->pcie_powered_on && pcie_check_link_status(mc->pcie_ch_num)) {
+		print_ep_config_space(mc);
+		print_doorbell_region(mc);
+	}
+	return -EFAULT;
 }
 
 static int set_cp_rom_boot_img(struct mem_link_device *mld)
@@ -1467,13 +2037,15 @@ static int start_normal_boot(struct modem_ctl *mc)
 		if (ret < 0)
 			goto status_error;
 
-		s5100_poweron_pcie(mc, false);
+		s5100_poweron_pcie(mc, LINK_MODE_MAX_SPEED_BOOTING);
 	} else {
 		ret = check_cp_status(mc, 200, false);
 		if (ret < 0)
 			goto status_error;
 
-		register_pcie(ld);
+		ret = register_pcie(ld);
+		if (ret < 0)
+			goto status_error;
 	}
 
 status_error:
@@ -1511,8 +2083,8 @@ static int complete_normal_boot(struct modem_ctl *mc)
 		goto exit;
 	}
 
-	/* Enable L1.2 after CP boot */
-	s51xx_pcie_l1ss_ctrl(1, mc->pcie_ch_num);
+	if (mc->variant != MODEM_SEC_5400 && mc->s51xx_pdev)
+		s51xx_pcie_l1ss_ctrl(1, pci_get_drvdata(mc->s51xx_pdev));
 
 	/* Read cp_active before enabling irq */
 	mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_CP_ACTIVE], true);
@@ -1537,6 +2109,7 @@ static int complete_normal_boot(struct modem_ctl *mc)
 	print_mc_state(mc);
 
 	mc->device_reboot = false;
+	mc->cp_ever_powered_on = true;
 
 	change_modem_state(mc, STATE_ONLINE);
 
@@ -1558,6 +2131,118 @@ static int complete_normal_boot(struct modem_ctl *mc)
 
 exit:
 	return err;
+}
+
+static int start_normal_boot_bl1(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	int ret = 0;
+
+	mif_info("+++\n");
+
+	if (init_control_messages(mc))
+		mif_err("Failed to initialize control messages\n");
+
+	/* 2cp dump WA */
+	if (timer_pending(&mld->crash_ack_timer))
+		timer_delete(&mld->crash_ack_timer);
+	atomic_set(&mld->forced_cp_crash, 0);
+
+	mif_info("Set link mode to LINK_MODE_BOOT.\n");
+
+	if (ld->link_prepare_normal_boot)
+		ld->link_prepare_normal_boot(ld, mc->bootd);
+
+	change_modem_state(mc, STATE_BOOTING);
+
+	mif_info("Disable phone active interrupt.\n");
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_ACTIVE]);
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
+	mc->phone_state = STATE_BOOTING;
+
+	if (ld->link_start_normal_boot) {
+		mif_info("link_start_normal_boot\n");
+		ld->link_start_normal_boot(ld, mc->iod);
+	}
+
+	ret = modem_ctrl_check_offset_data(mc);
+	if (ret) {
+		mif_err("modem_ctrl_check_offset_data() error:%d\n", ret);
+		return ret;
+	}
+
+	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
+		ret = register_pcie(ld);
+		if (ret < 0)
+			goto status_error;
+		if (mc->s51xx_pdev && mc->pcie_registered)
+			set_cp_rom_boot_img(mld);
+
+		ret = check_boot_status(mc, 200, true);
+		if (ret < 0)
+			goto status_error;
+	}
+
+status_error:
+	if (ret < 0) {
+		mif_err("ERR! check_cp_status fail (err %d)\n", ret);
+		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
+			debug_cp_rom_boot_img(mld);
+		if (cpif_wake_lock_active(mc->ws))
+			cpif_wake_unlock(mc->ws);
+
+		return ret;
+	}
+
+	mif_info("---\n");
+	return 0;
+}
+
+static int start_normal_boot_bootloader(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	int ret = 0;
+	int val;
+
+	mif_info("+++\n");
+
+	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
+		if (mc->s51xx_pdev && mc->pcie_registered)
+			set_cp_rom_boot_img(mld);
+
+		ret = check_boot_status(mc, 200, false);
+		if (ret < 0)
+			goto status_error;
+
+		iowrite32(0, mld->msi_reg_base + offsetof(struct msi_reg_type, boot_stage));
+		val = (int)ioread32(mld->msi_reg_base + offsetof(struct msi_reg_type, boot_stage));
+		mif_info("Clear boot_stage == 0x%X\n", val);
+
+		s5100_poweroff_pcie(mc, false);
+
+		ret = check_cp_status(mc, 200, false);
+		if (ret < 0)
+			goto status_error;
+
+		s5100_poweron_pcie(mc, LINK_MODE_MAX_SPEED_BOOTING);
+	}
+
+status_error:
+	if (ret < 0) {
+		mif_err("ERR! check_cp_status fail (err %d)\n", ret);
+		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
+			debug_cp_rom_boot_img(mld);
+		if (cpif_wake_lock_active(mc->ws))
+			cpif_wake_unlock(mc->ws);
+
+		return ret;
+	}
+
+	mif_info("---\n");
+	return 0;
 }
 
 static int trigger_cp_crash_internal(struct modem_ctl *mc)
@@ -1585,7 +2270,7 @@ static int trigger_cp_crash_internal(struct modem_ctl *mc)
 	}
 
 	print_mc_state(mc);
-	exynos_pcie_rc_print_msi_register(mc->pcie_ch_num);
+	pcie_print_rc_msi_register(mc->pcie_ch_num);
 
 	if (mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_CP_ACTIVE], true) == 1) {
 #if IS_ENABLED(CONFIG_LINK_DEVICE_PCIE_GPIO_WA)
@@ -1682,14 +2367,21 @@ static int start_dump_boot(struct modem_ctl *mc)
 	/* Change phone state to CRASH_EXIT */
 	mc->phone_state = STATE_CRASH_EXIT;
 
+	if (!cpif_wake_lock_active(mc->ws)) {
+		mif_info("Acquiring wakelock during modem crash, timeout: %dms!\n",
+			 CRASH_WAKELOCK_TIMEOUT_MS);
+		cpif_wake_lock_timeout(mc->ws, msecs_to_jiffies(CRASH_WAKELOCK_TIMEOUT_MS));
+	}
+
 	if (!ld->link_start_dump_boot) {
 		mif_err("%s: link_start_dump_boot is null\n", ld->name);
-		return -EFAULT;
+		err = -EFAULT;
+		goto error;
 	}
 
 	err = ld->link_start_dump_boot(ld, mc->bootd);
 	if (err)
-		return err;
+		goto error;
 
 	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
 	/* do not handle cp2ap_wakeup irq during dump process */
@@ -1714,13 +2406,15 @@ static int start_dump_boot(struct modem_ctl *mc)
 		if (err < 0)
 			goto status_error;
 
-		s5100_poweron_pcie(mc, false);
+		s5100_poweron_pcie(mc, LINK_MODE_MAX_SPEED_BOOTING);
 	} else {
 		err = check_cp_status(mc, 200, false);
 		if (err < 0)
 			goto status_error;
 
-		register_pcie(ld);
+		err = register_pcie(ld);
+		if (err < 0)
+			goto status_error;
 	}
 
 status_error:
@@ -1728,7 +2422,176 @@ status_error:
 		mif_err("ERR! check_cp_status fail (err %d)\n", err);
 		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
 			debug_cp_rom_boot_img(mld);
-		return err;
+		goto error;
+	}
+
+	mif_err("---\n");
+error:
+	if (cpif_wake_lock_active(mc->ws)) {
+		mif_info("Release wakelock after modem crash!\n");
+		cpif_wake_unlock(mc->ws);
+	}
+
+	return err;
+}
+
+static int start_dump_boot_bl1(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	int ret = 0;
+
+	mif_err("+++\n");
+
+	mc->phone_state = STATE_CRASH_EXIT;
+
+	if (!cpif_wake_lock_active(mc->ws)) {
+		mif_info("Acquiring wakelock during modem crash, timeout: %dms!\n",
+			 CRASH_WAKELOCK_TIMEOUT_MS);
+		cpif_wake_lock_timeout(mc->ws, msecs_to_jiffies(CRASH_WAKELOCK_TIMEOUT_MS));
+	}
+
+	if (!ld->link_start_dump_boot) {
+		mif_err("%s: link_start_dump_boot is null\n", ld->name);
+		ret = -EFAULT;
+		goto error;
+	}
+
+	ret = ld->link_start_dump_boot(ld, mc->bootd);
+	if (ret)
+		goto error;
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_WAKEUP]);
+
+	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
+		ret = register_pcie(ld);
+		if (ret < 0)
+			goto status_error;
+		if (mc->s51xx_pdev && mc->pcie_registered)
+			set_cp_rom_boot_img(mld);
+
+		ret = check_boot_status(mc, 200, true);
+		if (ret < 0)
+			goto status_error;
+	}
+
+status_error:
+	if (ret < 0) {
+		mif_err("ERR! check_cp_status fail (err %d)\n", ret);
+		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
+			debug_cp_rom_boot_img(mld);
+	}
+error:
+	if (cpif_wake_lock_active(mc->ws)) {
+		mif_info("Release wakelock after modem crash!\n");
+		cpif_wake_unlock(mc->ws);
+	}
+
+	mif_err("---\n");
+	return ret;
+}
+
+static int start_dump_boot_bootloader(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	int ret = 0;
+	int val;
+
+	mif_err("+++\n");
+
+	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
+		if (mc->s51xx_pdev && mc->pcie_registered)
+			set_cp_rom_boot_img(mld);
+
+		ret = check_boot_status(mc, 200, false);
+		if (ret < 0)
+			goto status_error;
+
+		iowrite32(0, mld->msi_reg_base + offsetof(struct msi_reg_type, boot_stage));
+		val = (int)ioread32(mld->msi_reg_base + offsetof(struct msi_reg_type, boot_stage));
+		mif_info("Clear boot_stage == 0x%X\n", val);
+
+		s5100_poweroff_pcie(mc, false);
+
+		ret = check_cp_status(mc, 200, false);
+		if (ret < 0)
+			goto status_error;
+
+		s5100_poweron_pcie(mc, LINK_MODE_MAX_SPEED_BOOTING);
+	}
+
+status_error:
+	if (ret < 0) {
+		mif_err("ERR! check_cp_status fail (err %d)\n", ret);
+		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
+			debug_cp_rom_boot_img(mld);
+		return ret;
+	}
+
+	mif_err("---\n");
+	return ret;
+}
+
+static int start_dump_boot_partial(struct modem_ctl *mc)
+{
+	struct link_device *ld = get_current_link(mc->bootd);
+	struct mem_link_device *mld = to_mem_link_device(ld);
+	int err = 0;
+
+	mif_err("+++\n");
+
+	if (ld->link_prepare_normal_boot)
+		ld->link_prepare_normal_boot(ld, mc->bootd);
+
+	change_modem_state(mc, STATE_BOOTING);
+	mif_info("Disable phone active interrupt.\n");
+	mif_disable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_ACTIVE]);
+
+	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_AP_ACTIVE], 1, 0);
+
+	mc->phone_state = STATE_BOOTING;
+
+	if (!cpif_wake_lock_active(mc->ws)) {
+		mif_info("Acquiring wakelock during partial reset, timeout: %dms!\n",
+			 CRASH_WAKELOCK_TIMEOUT_MS);
+		cpif_wake_lock_timeout(mc->ws, msecs_to_jiffies(CRASH_WAKELOCK_TIMEOUT_MS));
+	}
+
+	if (!ld->link_start_partial_boot) {
+		mif_err("%s: link_start_partial_boot is null\n", ld->name);
+		err = -EFAULT;
+		goto error;
+	}
+
+	err = ld->link_start_partial_boot(ld, mc->bootd);
+	if (err)
+		goto error;
+
+	if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE) {
+		err = check_cp_status(mc, 200, false);
+		if (err < 0)
+			goto status_error;
+
+		s5100_poweron_pcie(mc, LINK_MODE_MAX_SPEED_BOOTING);
+	} else {
+		mif_err("ERR! LINK_ATTR_XMIT_BTDLR_PCIE is not set\n");
+		err = -EFAULT;
+		goto error;
+	}
+
+status_error:
+	if (err < 0) {
+		mif_err("ERR! check_cp_status fail (err %d)\n", err);
+		if (mld->attrs & LINK_ATTR_XMIT_BTDLR_PCIE)
+			debug_cp_rom_boot_img(mld);
+	}
+
+error:
+	if (cpif_wake_lock_active(mc->ws)) {
+		mif_info("Release wakelock after partial reset!\n");
+		cpif_wake_unlock(mc->ws);
 	}
 
 	mif_err("---\n");
@@ -1752,6 +2615,10 @@ static int s5100_poweroff_pcie(struct modem_ctl *mc, bool force_off)
 		mif_info("Skip pci power off: already powered off\n");
 		goto exit;
 	}
+
+	if (pcie_get_sudden_linkdown_state(mc->pcie_ch_num) ||
+	    pcie_get_cpl_timeout_state(mc->pcie_ch_num))
+		force_off = true;
 
 	/* CP reads Tx RP (or tail) after CP2AP_WAKEUP = 1.
 	 * skip pci power off if CP2AP_WAKEUP = 1 or Tx pending.
@@ -1790,17 +2657,22 @@ static int s5100_poweroff_pcie(struct modem_ctl *mc, bool force_off)
 		mc->pcie_cto_retry_cnt = 0;
 	}
 
-	if (exynos_pcie_rc_get_sudden_linkdown_state(mc->pcie_ch_num)) {
-		exynos_pcie_rc_set_sudden_linkdown_state(mc->pcie_ch_num, false);
+	if (pcie_get_sudden_linkdown_state(mc->pcie_ch_num)) {
+		pcie_set_sudden_linkdown_state(mc->pcie_ch_num, false);
 		in_pcie_recovery = true;
 	}
 
-	if (exynos_pcie_rc_get_cpl_timeout_state(mc->pcie_ch_num)) {
-		exynos_pcie_rc_set_cpl_timeout_state(mc->pcie_ch_num, false);
+	if (pcie_get_cpl_timeout_state(mc->pcie_ch_num)) {
+		pcie_set_cpl_timeout_state(mc->pcie_ch_num, false);
 		in_pcie_recovery = true;
 	}
+
+	if (mc->variant == MODEM_SEC_5400 &&
+	    s51xx_check_pcie_link_status(mc->pcie_ch_num))
+		pcie_check_pending_msi(mc);
 
 	mc->pcie_powered_on = false;
+	reinit_completion(&mc->pcie_power_on_cmpl);
 
 	if (mc->s51xx_pdev != NULL && (mc->phone_state == STATE_ONLINE ||
 				mc->phone_state == STATE_BOOTING)) {
@@ -1814,7 +2686,12 @@ static int s5100_poweroff_pcie(struct modem_ctl *mc, bool force_off)
 	mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], 0, 5);
 	print_mc_state(mc);
 
-	exynos_pcie_poweroff(mc->pcie_ch_num);
+	CPIF_TIME_AND_CHECK("pcie_poweroff", PCIE_TIMEOUT_MS,
+		pcie_poweroff(mc->pcie_ch_num);
+	);
+
+	if (mc->variant == MODEM_SEC_5400)
+		reset_iommu_mapping(mc);
 
 	if (cpif_wake_lock_active(mc->ws))
 		cpif_wake_unlock(mc->ws);
@@ -1835,8 +2712,12 @@ exit:
 			if (s51xx_pcie_send_doorbell_int(mc->s51xx_pdev,
 						mld->intval_ap2cp_msg) != 0)
 				force_crash = true;
-		} else
-			s5100_try_gpio_cp_wakeup(mc);
+		} else {
+			if (mc->variant == MODEM_SEC_5400 && mc->ap2cp_wakeup_wq)
+				queue_work(mc->ap2cp_wakeup_wq, &mc->ap2cp_wakeup_work);
+			else
+				s5100_try_gpio_cp_wakeup(mc);
+		}
 	}
 	spin_unlock_irqrestore(&mc->pcie_tx_lock, flags);
 
@@ -1846,12 +2727,14 @@ exit:
 	return 0;
 }
 
-int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
+int s5100_poweron_pcie(struct modem_ctl *mc, enum link_mode mode)
 {
 	struct link_device *ld;
 	struct mem_link_device *mld;
 	bool force_crash = false;
 	unsigned long flags;
+	bool boot_on = (mode == LINK_MODE_MIN_SPEED_BOOTING);
+	int speed, width, ret;
 
 	if (mc == NULL) {
 		mif_err("Skip pci power on: mc is NULL\n");
@@ -1868,7 +2751,7 @@ int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
 
 	mutex_lock(&mc->pcie_onoff_lock);
 	mutex_lock(&mc->pcie_check_lock);
-	mif_debug("+++\n");
+	mif_debug("+++ mode: %d\n", mode);
 	if (mc->pcie_powered_on &&
 			(s51xx_check_pcie_link_status(mc->pcie_ch_num) != 0)) {
 		mif_info("Skip pci power on: already powered on\n");
@@ -1892,26 +2775,67 @@ int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
 	if (!boot_on)
 		mif_gpio_set_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], 1, 5);
 
+	if (!boot_on && mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_AP2CP_WAKEUP], true) == 0)
+		mif_err("Cannot set AP2CP_WAKEUP\n");
+
 	print_mc_state(mc);
 
 	spin_lock_irqsave(&mc->pcie_tx_lock, flags);
 	/* wait Tx done if it is running */
 	spin_unlock_irqrestore(&mc->pcie_tx_lock, flags);
 
-	if (exynos_pcie_rc_get_sudden_linkdown_state(mc->pcie_ch_num))
-		exynos_pcie_set_ready_cto_recovery(mc->pcie_ch_num);
+	if (pcie_get_sudden_linkdown_state(mc->pcie_ch_num))
+		pcie_set_ready_cto_recovery(mc->pcie_ch_num);
 
-	if (exynos_pcie_rc_get_cpl_timeout_state(mc->pcie_ch_num))
-		exynos_pcie_set_ready_cto_recovery(mc->pcie_ch_num);
+	if (pcie_get_cpl_timeout_state(mc->pcie_ch_num))
+		pcie_set_ready_cto_recovery(mc->pcie_ch_num);
 
-	exynos_pcie_set_msi_ctrl_addr(mc->pcie_ch_num, shm_get_msi_base());
-	if (exynos_pcie_poweron(mc->pcie_ch_num, (boot_on ? 1 : 3), (boot_on ? 1 : 2)) != 0)
+	pcie_set_msi_ctrl_addr(mc->pcie_ch_num, shm_get_msi_base());
+
+	if (mc->variant == MODEM_SEC_5400) {
+		if (mode == LINK_MODE_MIN_SPEED_BOOTING) {
+			speed = LINK_SPEED_GEN1;
+			width = 1;
+		} else {
+			speed = pcie_get_max_link_speed(mc->pcie_ch_num);
+			width = pcie_get_max_link_width(mc->pcie_ch_num);
+		}
+	} else {
+		speed = boot_on ? 1 : 3;
+		width = boot_on ? 1 : 2;
+	}
+
+	CPIF_TIME_AND_CHECK("pcie_poweron", PCIE_TIMEOUT_MS,
+		ret = pcie_poweron(mc->pcie_ch_num, speed, width);
+	);
+	if (ret != 0) {
+		if (boot_on) {
+			mif_err("PCIe gen1 linkup with CP ROM failed.\n");
+			logbuffer_log(mc->log, "PCIe gen1 linkup with CP ROM failed.");
+		}
 		goto exit;
+	}
+
+	if (mc->variant == MODEM_SEC_5400 &&
+	    (mode == LINK_MODE_ADAPTIVE_SPEED_BOOTED) && mc->pcie_dynamic_spd_enabled)
+		pcie_change_link_speed(mc->pcie_ch_num, LINK_SPEED_GEN1);
+
+	if (mc->variant == MODEM_SEC_5400)
+		setup_iommu_mapping(mc, boot_on);
+
+	if (boot_on)
+		mif_info("PCIe gen1 linkup with CP ROM succeed.\n");
+
+	if (boot_on)
+		mc->l1ss_disable = true;
+	else if (mc->phone_state == STATE_ONLINE)
+		mc->l1ss_disable = false;
 
 	mc->pcie_powered_on = true;
+	complete_all(&mc->pcie_power_on_cmpl);
 
 	if (mc->s51xx_pdev != NULL) {
-		s51xx_pcie_restore_state(mc->s51xx_pdev, boot_on);
+		s51xx_pcie_restore_state(mc->s51xx_pdev, boot_on, mc->variant);
 
 		/* DBG: check MSI sfr setting values */
 		print_msi_register(mc->s51xx_pdev);
@@ -1924,7 +2848,7 @@ int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
 
 	if ((mc->s51xx_pdev != NULL) && mc->pcie_registered && (mc->phone_state != STATE_CRASH_EXIT)) {
 		/* DBG */
-		logbuffer_log(mc->log, "DBG: doorbell: pcie_registered = %d", \
+		logbuffer_log(mc->log, "DBG: doorbell: pcie_registered = %d",
 				mc->pcie_registered);
 		if (s51xx_pcie_send_doorbell_int(mc->s51xx_pdev,
 						 mld->intval_ap2cp_pcie_link_ack) != 0) {
@@ -1945,6 +2869,11 @@ int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
 #endif
 
 exit:
+	if (mc->variant == MODEM_SEC_5400 &&
+	    (pcie_get_sudden_linkdown_state(mc->pcie_ch_num) ||
+	     pcie_get_cpl_timeout_state(mc->pcie_ch_num)))
+		pcie_set_ready_cto_recovery(mc->pcie_ch_num);
+
 	mif_debug("---\n");
 	mutex_unlock(&mc->pcie_check_lock);
 	mutex_unlock(&mc->pcie_onoff_lock);
@@ -1996,7 +2925,7 @@ int s5100_set_outbound_atu(struct modem_ctl *mc, struct cp_btl *btl, loff_t *pos
 	u32 atu_grp = (*pos) / map_size;
 
 	if (atu_grp != btl->last_pcie_atu_grp) {
-		ret = exynos_pcie_rc_set_outbound_atu(
+		ret = pcie_set_outbound_atu(
 			mc->pcie_ch_num, btl->mem.cp_p_base, (atu_grp * map_size), map_size);
 		btl->last_pcie_atu_grp = atu_grp;
 	}
@@ -2016,7 +2945,13 @@ static int suspend_cp(struct modem_ctl *mc)
 #endif
 
 		if (mif_gpio_get_value(&mc->cp_gpio[CP_GPIO_CP2AP_WAKEUP], true) == 1) {
-			mif_err("abort suspend\n");
+			mif_info("abort suspend\n");
+			return -EBUSY;
+		}
+
+		if (mc->cp_ever_powered_on && (mc->phone_state != STATE_ONLINE)) {
+			mif_info("Abort suspend since CP state (%s) is not ONLINE\n",
+				 cp_state_str(mc->phone_state));
 			return -EBUSY;
 		}
 	} while (0);
@@ -2127,11 +3062,18 @@ static void s5100_get_ops(struct modem_ctl *mc)
 	mc->ops.power_reset = power_reset_cp;
 	mc->ops.power_reset_dump = power_reset_dump_cp;
 	mc->ops.silent_reset = silent_reset_cp;
+	mc->ops.power_reset_partial = power_reset_partial_cp;
+	mc->ops.power_reset_warm = power_reset_warm_cp;
 
 	mc->ops.start_normal_boot = start_normal_boot;
 	mc->ops.complete_normal_boot = complete_normal_boot;
+	mc->ops.start_normal_boot_bl1 = start_normal_boot_bl1;
+	mc->ops.start_normal_boot_bootloader = start_normal_boot_bootloader;
 
 	mc->ops.start_dump_boot = start_dump_boot;
+	mc->ops.start_dump_boot_bl1 = start_dump_boot_bl1;
+	mc->ops.start_dump_boot_bootloader = start_dump_boot_bootloader;
+	mc->ops.start_dump_boot_partial = start_dump_boot_partial;
 	mc->ops.trigger_cp_crash = trigger_cp_crash;
 
 	mc->ops.suspend = suspend_cp;
@@ -2205,6 +3147,9 @@ static int s5100_get_pdata(struct modem_ctl *mc, struct modem_data *pdata)
 	 * numbers gave; outputs start low, as on stock. From the modem node
 	 * the board describes (cp_lines_node()), or from this node.
 	 */
+	mc->cp_gpio[CP_GPIO_AP2CP_PARTIAL_RST_N].label = "AP2CP_PARTIAL_RST_N";
+	mc->cp_gpio[CP_GPIO_AP2CP_PARTIAL_RST_N].node_name = "ap2cp-partial-rst-n";
+
 	lines = cp_lines_node(np);
 	for (i = 0; i < CP_GPIO_MAX; i++) {
 		struct gpio_desc *desc;
@@ -2247,7 +3192,11 @@ static int s5100_get_pdata(struct modem_ctl *mc, struct modem_data *pdata)
 	/* validate */
 	for (i = 0; i < CP_GPIO_MAX; i++) {
 		if (!mc->cp_gpio[i].valid) {
-			mif_err("Missing some of GPIOs\n");
+			if (i == CP_GPIO_AP2CP_PARTIAL_RST_N &&
+			    mc->variant != MODEM_SEC_5400)
+				continue;
+			mif_err("Missing some of GPIOs %s\n",
+				mc->cp_gpio[i].node_name);
 			return -EINVAL;
 		}
 	}
@@ -2261,6 +3210,30 @@ static int s5100_get_pdata(struct modem_ctl *mc, struct modem_data *pdata)
 
 	mc->sbi_ds_det_mask = pdata->sbi_ds_det_mask;
 	mc->sbi_ds_det_pos = pdata->sbi_ds_det_pos;
+
+	mc->pcie_dynamic_spd_enabled = of_property_read_bool(np, "use-dynamic-link-spd");
+	if (of_property_read_u32(np, "tp-threshold", &mc->tp_threshold))
+		mc->tp_threshold = DEFAULT_TP_THRESHOLD;
+	if (of_property_read_u32(np, "tp-hysteresis", &mc->tp_hysteresis))
+		mc->tp_hysteresis = DEFAULT_TP_HYSTERESIS;
+
+	mif_info("PCIe dynamic link speed: enable=%d, threshold=%u, hysteresis=%u\n",
+		 mc->pcie_dynamic_spd_enabled, mc->tp_threshold, mc->tp_hysteresis);
+
+	return 0;
+}
+
+static int s5100_wait_for_pcie_power(struct modem_ctl *mc)
+{
+	unsigned long timeout = msecs_to_jiffies(PCIE_TIMEOUT_MS);
+
+	if (mc->pcie_powered_on)
+		return 0;
+
+	if (!wait_for_completion_timeout(&mc->pcie_power_on_cmpl, timeout)) {
+		mif_err("Timeout waiting for modem PCIe to power on\n");
+		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
@@ -2292,6 +3265,9 @@ static int s5100_call_state_notifier(struct notifier_block *nb,
 			&mc->call_off_work);
 		break;
 	case MODEM_VOICE_CALL_ON:
+		if (s5100_wait_for_pcie_power(mc))
+			return NOTIFY_BAD;
+
 		mc->pcie_voice_call_on = true;
 		if (mc->mdm_data->mif_off_during_volte)
 			mif_enable_irq(&mc->cp_gpio_irq[CP_GPIO_IRQ_CP2AP_CP_WRST_N]);
@@ -2407,6 +3383,14 @@ int s5100_init_modemctl_device(struct modem_ctl *mc, struct modem_data *pdata)
 	INIT_WORK(&mc->wakeup_work, cp2ap_wakeup_work);
 	INIT_WORK(&mc->suspend_work, cp2ap_suspend_work);
 
+	mc->ap2cp_wakeup_wq = create_singlethread_workqueue("ap2cp_wakeup_wq");
+	if (!mc->ap2cp_wakeup_wq) {
+		mif_err("%s: ERR! fail to create ap2cp_wakeup_wq\n", mc->name);
+		ret = -EINVAL;
+		goto err_ap2cp_wq;
+	}
+	INIT_WORK(&mc->ap2cp_wakeup_work, ap2cp_wakeup_work);
+
 	mc->crash_wq = create_singlethread_workqueue("trigger_cp_crash_wq");
 	if (!mc->crash_wq) {
 		mif_err("%s: ERR! fail to create crash_wq\n", mc->name);
@@ -2453,6 +3437,9 @@ int s5100_init_modemctl_device(struct modem_ctl *mc, struct modem_data *pdata)
 		goto err_force_crash_notifier;
 	}
 
+	if (sysfs_create_group(&pdev->dev.kobj, &dynamic_pcie_spd_group))
+		mif_err("failed to create sysfs node for dynamic_pcie_spd\n");
+
 	if (sysfs_create_group(&pdev->dev.kobj, &sim_group))
 		mif_err("failed to create sysfs node related sim\n");
 
@@ -2476,6 +3463,7 @@ int s5100_init_modemctl_device(struct modem_ctl *mc, struct modem_data *pdata)
 err_dev_create_file:
 	sysfs_remove_group(&pdev->dev.kobj, &modem_group);
 	sysfs_remove_group(&pdev->dev.kobj, &sim_group);
+	sysfs_remove_group(&pdev->dev.kobj, &dynamic_pcie_spd_group);
 	unregister_modem_force_crash_handler(&mc->force_crash_nb);
 err_force_crash_notifier:
 #if IS_ENABLED(CONFIG_CPIF_AP_SUSPEND_DURING_VOICE_CALL)
@@ -2489,6 +3477,8 @@ err_pm_notifier:
 	unregister_reboot_notifier(&mc->reboot_nb);
 	destroy_workqueue(mc->crash_wq);
 err_crash_wq:
+	destroy_workqueue(mc->ap2cp_wakeup_wq);
+err_ap2cp_wq:
 	destroy_workqueue(mc->wakeup_wq);
 err_irq_get_chip:
 	cpif_wake_lock_unregister(mc->ws);
@@ -2507,6 +3497,7 @@ void s5100_uninit_modemctl_device(struct modem_ctl *mc, struct modem_data *pdata
 	device_remove_file(dev, &dev_attr_s5100_wake_lock);
 	sysfs_remove_group(&dev->kobj, &modem_group);
 	sysfs_remove_group(&dev->kobj, &sim_group);
+	sysfs_remove_group(&dev->kobj, &dynamic_pcie_spd_group);
 	unregister_modem_force_crash_handler(&mc->force_crash_nb);
 #if IS_ENABLED(CONFIG_CPIF_AP_SUSPEND_DURING_VOICE_CALL)
 	unregister_modem_voice_call_event_notifier(&mc->call_state_nb);
@@ -2515,6 +3506,7 @@ void s5100_uninit_modemctl_device(struct modem_ctl *mc, struct modem_data *pdata
 	unregister_pm_notifier(&mc->pm_notifier);
 	unregister_reboot_notifier(&mc->reboot_nb);
 	destroy_workqueue(mc->crash_wq);
+	destroy_workqueue(mc->ap2cp_wakeup_wq);
 	destroy_workqueue(mc->wakeup_wq);
 	mutex_destroy(&mc->pcie_check_lock);
 	mutex_destroy(&mc->pcie_onoff_lock);

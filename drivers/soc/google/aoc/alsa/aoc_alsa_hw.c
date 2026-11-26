@@ -11,6 +11,7 @@
 
 
 #include <linux/uio.h>
+#include <soc/google/modem_notifier.h>
 #include "aoc_alsa.h"
 #include "aoc_alsa_drv.h"
 #include "aoc_alsa_path.h"
@@ -3837,7 +3838,7 @@ int prepare_phonecall(struct aoc_alsa_stream *alsa_stream)
 	if (err < 0)
 		pr_err("ERR:%d Telephony modem start fail\n", err);
 
-#if IS_ENABLED(CONFIG_GOOGLE_MODEMCTL)
+#if IS_REACHABLE(CONFIG_GOOGLE_MODEMCTL)
 	modem_voice_call_notify_event(MODEM_VOICE_CALL_ON, NULL);
 #endif
 
@@ -3861,7 +3862,7 @@ int teardown_phonecall(struct aoc_alsa_stream *alsa_stream)
 	if (err < 0)
 		pr_err("ERR:%d Telephony modem stop fail\n", err);
 
-#if IS_ENABLED(CONFIG_GOOGLE_MODEMCTL)
+#if IS_REACHABLE(CONFIG_GOOGLE_MODEMCTL)
 	modem_voice_call_notify_event(MODEM_VOICE_CALL_OFF, NULL);
 #endif
 

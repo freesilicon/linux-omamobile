@@ -113,6 +113,34 @@ config GS201_AOC_ALSA
 	  the speaker amplifiers on TDM 0. The card enforces the speaker
 	  limits in device/cheetah/AUDIO-PLAN.md.
 
+config GOOGLE_MODEMCTL
+	tristate "Google modem event notifier chains"
+	help
+	  Provides raw notifier chains for cellular modem lifecycle events,
+	  voice-call state transitions, and external force-crash requests
+	  shared between Google modem interface drivers and audio subsystems
+	  on Google Tensor SoCs.
+
+config S5910
+	tristate "Google S5910 SPMI modem clock buffer"
+	depends on SPMI && OF
+	select REGMAP_SPMI
+	help
+	  This enables support for the S5910 SPMI reference clock buffer
+	  companion device used by Samsung cellular modems on Google Tensor
+	  platforms, executing power-on and shutdown register sequences over
+	  the sideband SPMI bus.
+
+config CP_PMIC
+	tristate "Google cellular modem companion PMIC over SPMI"
+	depends on SPMI && OF
+	select REGMAP_SPMI
+	help
+	  This enables support for the cellular modem companion PMIC over
+	  SPMI on Google Tensor platforms, providing OTP revision reads and
+	  warm-reset register sequencing for S5400-class modems during
+	  modem bring-up and recovery.
+
 source "drivers/soc/google/cpif/Kconfig"
 source "drivers/soc/google/gnssif_spi/Kconfig"
 

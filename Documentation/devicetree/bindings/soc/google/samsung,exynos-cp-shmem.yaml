@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/google/samsung,exynos-cp-shmem.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos/Google Cellular Modem Shared Memory Map
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description:
+  Describes shared memory regions carved out for the CPIF cellular modem
+  interface driver between the host AP and a Samsung S5300/S5400 modem.
+
+properties:
+  compatible:
+    const: samsung,exynos-cp-shmem
+
+  memory-region:
+    minItems: 1
+    maxItems: 8
+    description:
+      Phandles to reserved-memory regions backing modem IPC, MSI, packet
+      processor, and AoC voice shared memory.
+
+  cp_num:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Modem instance index (0 for primary modem).
+
+  use_mem_map_on_cp:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Non-zero if CP owns the physical memory mapping.
+
+  regions:
+    type: object
+    description: Named shared-memory sub-regions carved from memory-region.
+    additionalProperties:
+      type: object
+      properties:
+        region,name:
+          $ref: /schemas/types.yaml#/definitions/string
+          description: Human-readable region identifier (e.g. IPC, MSI, PKTPROC).
+        region,index:
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: CPIF region enum index.
+        region,rmem:
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Backing reserved-memory table index.
+        region,offset:
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Byte offset within the backing reserved-memory region.
+        region,size:
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Size in bytes of this shared-memory slice.
+        region,cached:
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Cacheability flag (1 for MEMREMAP_WB, 0 for MEMREMAP_WC).
+      required:
+        - region,name
+        - region,index
+        - region,rmem
+        - region,offset
+        - region,size
+      additionalProperties: false
+
+required:
+  - compatible
+  - cp_num
+  - regions
+
+additionalProperties: false
+
+examples:
+  - |
+    cp-shmem {
+        compatible = "samsung,exynos-cp-shmem";
+        memory-region = <&cp_rmem &cp_msi_rmem>;
+        cp_num = <0>;
+        use_mem_map_on_cp = <0>;
+
+        regions {
+            ipc {
+                region,name = "IPC";
+                region,index = <3>;
+                region,rmem = <0>;
+                region,offset = <0>;
+                region,size = <0x800000>;
+                region,cached = <1>;
+            };
+        };
+    };

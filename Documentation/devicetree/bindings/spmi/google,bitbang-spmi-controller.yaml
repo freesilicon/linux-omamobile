@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spmi/google,bitbang-spmi-controller.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google GPIO bit-banged SPMI controller
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+properties:
+  compatible:
+    const: google,bitbang-spmi-controller
+
+  "#address-cells":
+    const: 2
+
+  "#size-cells":
+    const: 0
+
+  clk-gpios:
+    maxItems: 1
+    description: GPIO connected to the SPMI SCLK signal.
+
+  dat-gpios:
+    maxItems: 1
+    description: GPIO connected to the SPMI SDATA signal.
+
+  delay-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    default: 100
+    description: Half-cycle clock delay in microseconds.
+
+  delay_us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    deprecated: true
+    description: Legacy spelling of delay-us.
+
+patternProperties:
+  "@[0-9a-f]$":
+    type: object
+    description: Child SPMI peripheral devices on the bit-banged bus.
+    properties:
+      reg:
+        items:
+          - items:
+              - minimum: 0
+                maximum: 0xf
+              - const: 0
+    required:
+      - reg
+    additionalProperties: true
+
+required:
+  - compatible
+  - "#address-cells"
+  - "#size-cells"
+  - clk-gpios
+  - dat-gpios
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/spmi/spmi.h>
+
+    spmi-bitbang {
+        compatible = "google,bitbang-spmi-controller";
+        #address-cells = <2>;
+        #size-cells = <0>;
+        clk-gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
+        dat-gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+        delay-us = <10>;
+
+        pmic@0 {
+            reg = <0 SPMI_USID>;
+        };
+    };

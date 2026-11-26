@@ -149,6 +149,7 @@ struct pktproc_adaptor_ul {
 #if IS_ENABLED(CONFIG_CP_PKTPROC_UL)
 extern int pktproc_create_ul(struct platform_device *pdev,
 		struct mem_link_device *mld, unsigned long memaddr, u32 memsize);
+extern void pktproc_destroy_ul(struct platform_device *pdev, struct mem_link_device *mld);
 extern int pktproc_init_ul(struct pktproc_adaptor_ul *ppa_ul);
 static inline int pktproc_check_support_ul(struct pktproc_adaptor_ul *ppa_ul)
 {
@@ -173,6 +174,8 @@ static inline bool pktproc_ul_q_empty(struct pktproc_q_info_ul *q_info)
 static inline int pktproc_create_ul(struct platform_device *pdev,
 		struct mem_link_device *mld,
 		unsigned long memaddr, unsigned long memsize) { return 0; }
+static inline void pktproc_destroy_ul(struct platform_device *pdev,
+		struct mem_link_device *mld) {}
 static inline int pktproc_init_ul(struct pktproc_adaptor_ul *ppa_ul) { return 0; }
 static inline int pktproc_check_support_ul(struct pktproc_adaptor_ul *ppa_ul)
 { return 0; }

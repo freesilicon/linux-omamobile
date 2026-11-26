@@ -50,6 +50,8 @@
 /* #define DEBUG_MODEM_IF_PS_DATA */
 /* #define DEBUG_MODEM_IF_IP_DATA */
 
+#define NUM_ENABLED_MSI 5
+
 /*
  * IOCTL commands
  */
@@ -66,6 +68,12 @@ enum cp_boot_mode {
 	CP_BOOT_REQ_CP_RAM_LOGGING = 5,
 	CP_BOOT_MODE_MANUAL = 7,
 	CP_BOOT_EXT_BAAW = 11,
+	CP_BOOT_MODE_NORMAL_BL1 = 32,
+	CP_BOOT_MODE_NORMAL_BOOTLOADER,
+	CP_BOOT_MODE_DUMP_BL1,
+	CP_BOOT_MODE_DUMP_BOOTLOADER,
+	CP_BOOT_MODE_DUMP_PARTIAL,
+	CP_BOOT_MODE_DUMP_WARM,
 	MAX_CP_BOOT_MODE
 };
 struct boot_mode {
@@ -244,6 +252,17 @@ enum link_state {
 	LINK_STATE_CP_CRASH
 };
 
+enum link_mode {
+	LINK_MODE_MIN_SPEED_BOOTING,
+	LINK_MODE_MAX_SPEED_BOOTING,
+	LINK_MODE_ADAPTIVE_SPEED_BOOTED,
+};
+
+enum modem_variant {
+	MODEM_SEC_5300,
+	MODEM_SEC_5400,
+};
+
 struct cp_power_stats {
 	u64 count;			/* count state was entered */
 	u64 duration_usec;		/* total time (usecs) in state */
@@ -358,6 +377,8 @@ struct io_device {
 
 	/* Rx queue of sk_buff */
 	struct sk_buff_head sk_rx_q;
+	unsigned long rx_q_access_time;
+	unsigned int q_high_watermark;
 
 	/* For keeping multi-frame packets temporarily */
 	struct sk_buff_head sk_multi_q[NUM_SIPC_MULTI_FRAME_IDS];
@@ -496,6 +517,7 @@ struct link_device {
 	int (*read_gnss_image)(struct link_device *ld, struct io_device *iod, unsigned long arg);
 	void (*link_prepare_normal_boot)(struct link_device *ld, struct io_device *iod);
 	int (*link_start_normal_boot)(struct link_device *ld, struct io_device *iod);
+	int (*link_start_partial_boot)(struct link_device *ld, struct io_device *iod);
 
 	void (*link_trigger_cp_crash)(struct mem_link_device *mld, u32 crash_reason_owner,
 			char *crash_reason_string);
@@ -546,9 +568,16 @@ struct modemctl_ops {
 	int (*power_reset)(struct modem_ctl *mc);
 	int (*power_reset_dump)(struct modem_ctl *mc, bool silent);
 	int (*silent_reset)(struct modem_ctl *mc);
+	int (*power_reset_partial)(struct modem_ctl *mc);
+	int (*power_reset_warm)(struct modem_ctl *mc);
 
 	int (*start_normal_boot)(struct modem_ctl *mc);
 	int (*complete_normal_boot)(struct modem_ctl *mc);
+	int (*start_normal_boot_bl1)(struct modem_ctl *mc);
+	int (*start_normal_boot_bootloader)(struct modem_ctl *mc);
+	int (*start_dump_boot_bl1)(struct modem_ctl *mc);
+	int (*start_dump_boot_bootloader)(struct modem_ctl *mc);
+	int (*start_dump_boot_partial)(struct modem_ctl *mc);
 
 	int (*trigger_cp_crash)(struct modem_ctl *mc);
 	int (*start_dump_boot)(struct modem_ctl *mc);
@@ -605,10 +634,14 @@ struct modem_shared {
 struct modem_ctl {
 	struct device *dev;
 	char *name;
+	enum modem_variant variant;
 	struct modem_data *mdm_data;
 	struct modem_shared *msd;
 #if IS_ENABLED(CONFIG_S5910)
 	struct device *s5910_dev;
+#endif
+#if IS_ENABLED(CONFIG_CP_PMIC)
+	struct device *pmic_dev;
 #endif
 
 	enum modem_state phone_state;
@@ -684,6 +717,8 @@ struct modem_ctl {
 	struct irq_chip *cp_wrst_irq_chip;
 	struct pci_dev *s51xx_pdev;
 	struct workqueue_struct *wakeup_wq;
+	struct workqueue_struct *ap2cp_wakeup_wq;
+	struct work_struct ap2cp_wakeup_work;
 	struct work_struct wakeup_work;
 	struct work_struct suspend_work;
 	struct workqueue_struct *crash_wq;
@@ -702,6 +737,7 @@ struct modem_ctl {
 	int pcie_linkdown_retry_cnt_all;
 	int pcie_cto_retry_cnt;
 	int pcie_cto_retry_cnt_all;
+	int sbb_debug;
 
 	bool reserve_doorbell_int;
 	bool pcie_registered;
@@ -710,6 +746,11 @@ struct modem_ctl {
 	bool pcie_pm_resume_wait;
 	int pcie_pm_resume_gpio_val;
 	bool device_reboot;
+	bool device_suspended;
+	bool l1ss_disable;
+
+	/* completion for waiting for PCIe power on */
+	struct completion pcie_power_on_cmpl;
 
 #if IS_ENABLED(CONFIG_CPIF_AP_SUSPEND_DURING_VOICE_CALL)
 	bool pcie_voice_call_on;
@@ -760,6 +801,12 @@ struct modem_ctl {
 	atomic_t mark_skb_wakeup;
 #endif
 	struct logbuffer *log;
+	u32 msi_missed[NUM_ENABLED_MSI];
+	bool cp_ever_powered_on;
+	u32 tp_threshold;
+	u32 tp_hysteresis;
+	bool pcie_dynamic_spd_enabled;
+	int irq_offset;
 };
 
 static inline bool cp_offline(struct modem_ctl *mc)

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/google/google,cp-pmic-spmi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Companion Modem PMIC SPMI Slave
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+properties:
+  compatible:
+    const: google,cp-pmic-spmi
+
+  reg:
+    items:
+      - items:
+          - minimum: 0
+            maximum: 0xf
+          - const: 0
+
+  pmic-otp-reg:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Register address containing the companion PMIC OTP version.
+
+  warm_reset_seq:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Warm-reset register write sequence encoded as (reg, val, delay_ms) triples.
+
+required:
+  - compatible
+  - reg
+  - warm_reset_seq
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/spmi/spmi.h>
+
+    spmi-bitbang {
+        #address-cells = <2>;
+        #size-cells = <0>;
+
+        pmic@0 {
+            compatible = "google,cp-pmic-spmi";
+            reg = <0 SPMI_USID>;
+            pmic-otp-reg = <0x30e>;
+            warm_reset_seq = <0x675 0xa1 0 0x67d 0xbe 0>;
+        };
+    };

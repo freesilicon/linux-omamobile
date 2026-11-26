@@ -26,7 +26,7 @@ enum modem_voice_call_event {
 	MODEM_VOICE_CALL_ON	= 1,
 };
 
-#if IS_ENABLED(CONFIG_GOOGLE_MODEMCTL)
+#if IS_ENABLED(CONFIG_GOOGLE_MODEMCTL) || defined(__MODEM_NOTIFIER_IMPL)
 
 extern int modem_force_crash_exit_ext(const char *buf);
 extern int register_modem_force_crash_handler(struct notifier_block *nb);
