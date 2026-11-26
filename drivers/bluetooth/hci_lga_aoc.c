@@ -137,6 +137,7 @@ struct hci_lga_aoc {
 	struct gpio_desc *bt_shutdown_gpio;
 	struct gpio_desc *bt_ble_dbo_gpio;
 	struct gpio_desc *bt_dev_wake_gpio;
+	struct gpio_desc *bt_wlan_reg_on_gpio;
 
 	u32 channel_id;
 	u32 efw_tx_seq;
@@ -215,6 +216,11 @@ static bool toggle_bt_power = true;
 module_param(toggle_bt_power, bool, 0644);
 MODULE_PARM_DESC(toggle_bt_power,
 		 "Assert optional bt-ble-dbo/bt-shutdown GPIOs on hci open/close");
+
+static bool assert_wlan_reg_on;
+module_param(assert_wlan_reg_on, bool, 0644);
+MODULE_PARM_DESC(assert_wlan_reg_on,
+		 "Assert optional bt-wlan-reg-on (AP2WLAN_REG_ON_1V2) before BT power-on for combo-chip testing (default: false)");
 
 static bool run_btbcm_setup;
 module_param(run_btbcm_setup, bool, 0644);
@@ -1202,6 +1208,28 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 		return;
 
 	/*
+	 * Optional combo-chip diagnostic: assert AP2WLAN_REG_ON_1V2
+	 * (bt-wlan-reg-on) and allow 200 ms PMU/oscillator startup before
+	 * BT_REG_ON / SetPower(1) to discriminate BCM4390 shared WL_REG_ON
+	 * power dependency. Disabled by default.
+	 */
+	if (assert_wlan_reg_on && !bt->bt_wlan_reg_on_gpio) {
+		gp = gpiod_get_optional(bt->aoc_dev, "bt-wlan-reg-on",
+					GPIOD_OUT_HIGH);
+		if (IS_ERR(gp)) {
+			dev_info(bt->aoc_dev,
+				 "bt-wlan-reg-on GPIO unavailable (%ld), continuing without WL_REG_ON\n",
+				 PTR_ERR(gp));
+		} else if (gp) {
+			bt->bt_wlan_reg_on_gpio = gp;
+			msleep(200);
+			dev_info(bt->aoc_dev,
+				 "bt-wlan-reg-on asserted (val=%d)\n",
+				 gpiod_get_value_cansleep(gp));
+		}
+	}
+
+	/*
 	 * In EFW mode with AoC PMIC control enabled, AoC's BT power controller
 	 * drives VBR_ON_IN/VBR_ON_LE over CPM MBA and owns XAOC_GPIO1
 	 * (BT_DEV_WAKE). Avoid claiming those lines on AP so AP does not fight
@@ -1283,6 +1311,11 @@ static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
 		gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 0);
 		gpiod_put(bt->bt_ble_dbo_gpio);
 		bt->bt_ble_dbo_gpio = NULL;
+	}
+	if (bt->bt_wlan_reg_on_gpio) {
+		gpiod_set_value_cansleep(bt->bt_wlan_reg_on_gpio, 0);
+		gpiod_put(bt->bt_wlan_reg_on_gpio);
+		bt->bt_wlan_reg_on_gpio = NULL;
 	}
 }
 
@@ -1406,13 +1439,13 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 		}
 
 		/*
-		 * When AP drives VBR_ON (efw_pmic_ctrl=0), latch BT_REG_ON
-		 * before SetPower(1, 0) muxes XAOC_UART0 and asserts
-		 * BT_DEV_WAKE, matching AoC's own SetPower(1, 1) ordering so
-		 * UART/wake pads stay idle across the BT_REG_ON rising edge.
+		 * Assert optional bt-wlan-reg-on (when assert_wlan_reg_on=1)
+		 * and, when AP drives VBR_ON (efw_pmic_ctrl=0), latch BT_REG_ON
+		 * before SetPower(1) muxes XAOC_UART0 and asserts BT_DEV_WAKE,
+		 * matching AoC's own SetPower(1, 1) ordering so UART/wake pads
+		 * stay idle across the BT_REG_ON rising edge.
 		 */
-		if (!efw_pmic_ctrl)
-			hci_lga_aoc_power_on(bt);
+		hci_lga_aoc_power_on(bt);
 
 		ret = hci_lga_aoc_efw_send_fb_u8_2(bt, LGA_EFW_FB_SET_POWER,
 						   1, efw_pmic_ctrl ? 1 : 0);
