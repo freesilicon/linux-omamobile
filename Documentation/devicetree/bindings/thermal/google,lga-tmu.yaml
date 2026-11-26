@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/thermal/google,lga-tmu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Laguna (Tensor G5) CPM Thermal Management Unit
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description:
+  On Google Tensor G5 (Laguna), on-die Thermal Management Unit (TMU) sensors
+  are managed by the Central Power Manager (CPM) firmware. The operating system
+  polls temperatures asynchronously over the CPM mailbox interface instead of
+  accessing TMU MMIO registers directly.
+
+  Standard sensor indices exposed via "#thermal-sensor-cells" map to the CPM
+  firmware zones BIG (0), BIG_MID (1), MID (2), LITTLE (3), GPU (4), TPU (5),
+  AUR (6), ISP (7), MEM (8), and AOC (9).
+
+properties:
+  compatible:
+    const: google,lga-tmu
+
+  mboxes:
+    description: Phandle to the Google CPM mailbox interface node.
+    maxItems: 1
+
+  '#thermal-sensor-cells':
+    const: 1
+
+required:
+  - compatible
+  - mboxes
+  - '#thermal-sensor-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    thermal-sensor {
+        compatible = "google,lga-tmu";
+        mboxes = <&goog_mba_cpm_iface>;
+        #thermal-sensor-cells = <1>;
+    };

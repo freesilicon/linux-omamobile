@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cpufreq/google,lga-cpufreq.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Laguna (Tensor G5) CPM CPUFreq and Fast-Switch Controller
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+description:
+  On Google Tensor G5 (Laguna), per-cluster CPU Operating Performance Points
+  (OPPs) are discovered at runtime from the Central Power Manager (CPM) power
+  block firmware service over the CPM mailbox interface, while frequency
+  transitions write the target hardware pf_state index directly into dedicated
+  cluster MMIO request registers.
+
+properties:
+  compatible:
+    const: google,lga-cpufreq
+
+  reg:
+    maxItems: 1
+
+  mboxes:
+    description: Phandle to the Google CPM mailbox interface node.
+    maxItems: 1
+
+  google,domain-names:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 8
+    description:
+      Ordered list of CPM power-block domain names corresponding sequentially
+      to the 8-byte-strided MMIO pf_state CSR slots in the register window.
+
+  google,cpu-domain-map:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 16
+    description:
+      Zero-based domain index (into google,domain-names and MMIO CSR slots)
+      assigned to each logical CPU ID in order.
+
+required:
+  - compatible
+  - reg
+  - mboxes
+  - google,domain-names
+  - google,cpu-domain-map
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        cpufreq@200c0790 {
+            compatible = "google,lga-cpufreq";
+            reg = <0x0 0x200c0790 0x0 0x20>;
+            mboxes = <&goog_mba_cpm_iface>;
+            google,domain-names = "cpu0", "cpu1g0", "cpu1g1", "cpu2";
+            google,cpu-domain-map = <0 0 1 1 1 2 2 3>;
+        };
+    };
