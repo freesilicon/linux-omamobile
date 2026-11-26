@@ -974,6 +974,12 @@ static int lga_aoc_capture_pump(void *data)
 	return 0;
 }
 
+static struct lga_aoc_audio *
+lga_aoc_comp_to_audio(struct snd_soc_component *component)
+{
+	return snd_soc_card_get_drvdata(component->card);
+}
+
 static struct lga_aoc_stream *
 lga_aoc_substream_to_stream(struct lga_aoc_audio *audio,
 			    struct snd_pcm_substream *substream)
@@ -995,7 +1001,7 @@ static int lga_aoc_pcm_new(struct snd_soc_component *component,
 static int lga_aoc_pcm_open(struct snd_soc_component *component,
 			    struct snd_pcm_substream *substream)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 	struct snd_pcm_hardware hw = lga_aoc_pcm_hw;
 	int (*pump_fn)(void *data);
@@ -1037,7 +1043,7 @@ static int lga_aoc_pcm_open(struct snd_soc_component *component,
 static int lga_aoc_pcm_close(struct snd_soc_component *component,
 			     struct snd_pcm_substream *substream)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 
 	atomic_set(&st->running, 0);
@@ -1060,7 +1066,7 @@ static int lga_aoc_pcm_close(struct snd_soc_component *component,
 static int lga_aoc_pcm_hw_free(struct snd_soc_component *component,
 			       struct snd_pcm_substream *substream)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 
 	atomic_set(&st->running, 0);
@@ -1080,7 +1086,7 @@ static int lga_aoc_pcm_hw_free(struct snd_soc_component *component,
 static int lga_aoc_pcm_prepare(struct snd_soc_component *component,
 			       struct snd_pcm_substream *substream)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 
 	atomic_set(&st->running, 0);
@@ -1104,7 +1110,7 @@ static int lga_aoc_pcm_prepare(struct snd_soc_component *component,
 static int lga_aoc_pcm_trigger(struct snd_soc_component *component,
 			       struct snd_pcm_substream *substream, int cmd)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 	int ret = 0;
 
@@ -1193,7 +1199,7 @@ static int lga_aoc_pcm_trigger(struct snd_soc_component *component,
 static snd_pcm_uframes_t lga_aoc_pcm_pointer(struct snd_soc_component *component,
 					     struct snd_pcm_substream *substream)
 {
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(component);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(component);
 	struct lga_aoc_stream *st = lga_aoc_substream_to_stream(audio, substream);
 
 	return bytes_to_frames(substream->runtime, atomic_read(&st->xfer_pos));
@@ -1204,7 +1210,7 @@ static int lga_aoc_pb_route_get(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 
 	mutex_lock(&audio->mixer_lock);
 	ucontrol->value.enumerated.item[0] = audio->pb_route;
@@ -1216,7 +1222,7 @@ static int lga_aoc_pb_route_put(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	unsigned int val = ucontrol->value.enumerated.item[0];
 
 	if (val >= ARRAY_SIZE(lga_aoc_pb_route_texts))
@@ -1236,7 +1242,7 @@ static int lga_aoc_cap_src_get(struct snd_kcontrol *kcontrol,
 			       struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 
 	mutex_lock(&audio->mixer_lock);
 	ucontrol->value.enumerated.item[0] = audio->cap_src;
@@ -1248,7 +1254,7 @@ static int lga_aoc_cap_src_put(struct snd_kcontrol *kcontrol,
 			       struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	unsigned int val = ucontrol->value.enumerated.item[0];
 
 	if (val >= ARRAY_SIZE(lga_aoc_cap_src_texts))
@@ -1268,7 +1274,7 @@ static int lga_aoc_pb_switch_get(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 
 	mutex_lock(&audio->mixer_lock);
 	ucontrol->value.integer.value[0] = audio->pb_unmuted ? 1 : 0;
@@ -1280,7 +1286,7 @@ static int lga_aoc_pb_switch_put(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	bool unmuted = !!ucontrol->value.integer.value[0];
 	u32 vol;
 	u8 sink;
@@ -1305,7 +1311,7 @@ static int lga_aoc_pb_vol_get(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 
 	mutex_lock(&audio->mixer_lock);
 	ucontrol->value.integer.value[0] = audio->pb_volume;
@@ -1317,7 +1323,7 @@ static int lga_aoc_pb_vol_put(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	long val = ucontrol->value.integer.value[0];
 	bool apply;
 	u8 sink;
@@ -1345,7 +1351,7 @@ static int lga_aoc_mic_mask_get(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 
 	mutex_lock(&audio->mixer_lock);
 	ucontrol->value.integer.value[0] = audio->mic_mask;
@@ -1357,7 +1363,7 @@ static int lga_aoc_mic_mask_put(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	long val = ucontrol->value.integer.value[0];
 
 	if (val < 0 || val > GENMASK(LGA_AOC_PDM_MAX_MICS - 1, 0))
@@ -1377,7 +1383,7 @@ static int lga_aoc_dsp_state_get(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
-	struct lga_aoc_audio *audio = snd_soc_component_get_drvdata(comp);
+	struct lga_aoc_audio *audio = lga_aoc_comp_to_audio(comp);
 	struct lga_aoc_cmd_out_dsp_state cmd = { };
 	int ret;
 
@@ -1537,8 +1543,6 @@ static int lga_aoc_audio_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	platform_set_drvdata(pdev, audio);
-
 	ret = devm_snd_soc_register_component(&pdev->dev,
 					      &lga_aoc_component_drv,
 					      &lga_aoc_dai_drv, 1);
@@ -1568,6 +1572,7 @@ static int lga_aoc_audio_probe(struct platform_device *pdev)
 	audio->card.driver_name = LGA_AOC_AUDIO_DRV_NAME;
 	audio->card.dai_link = &audio->dai_link;
 	audio->card.num_links = 1;
+	snd_soc_card_set_drvdata(&audio->card, audio);
 
 	ret = devm_snd_soc_register_card(&pdev->dev, &audio->card);
 	if (ret)
