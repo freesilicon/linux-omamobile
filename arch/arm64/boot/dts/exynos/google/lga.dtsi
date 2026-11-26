@@ -19,6 +19,7 @@
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/spmi/spmi.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "google,lga";
@@ -304,6 +305,9 @@
 			reg = <0x0>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x102>;
+			dynamic-power-coefficient = <135>;
+			operating-points-v2 = <&cpu_opp_little>;
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@100 {
@@ -312,6 +316,9 @@
 			reg = <0x100>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x102>;
+			dynamic-power-coefficient = <135>;
+			operating-points-v2 = <&cpu_opp_little>;
+			#cooling-cells = <2>;
 		};
 
 		cpu2: cpu@200 {
@@ -320,6 +327,9 @@
 			reg = <0x200>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x37b>;
+			dynamic-power-coefficient = <370>;
+			operating-points-v2 = <&cpu_opp_mid0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu3: cpu@300 {
@@ -328,6 +338,9 @@
 			reg = <0x300>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x37b>;
+			dynamic-power-coefficient = <370>;
+			operating-points-v2 = <&cpu_opp_mid0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu4: cpu@400 {
@@ -336,6 +349,9 @@
 			reg = <0x400>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x37b>;
+			dynamic-power-coefficient = <370>;
+			operating-points-v2 = <&cpu_opp_mid0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@500 {
@@ -344,6 +360,9 @@
 			reg = <0x500>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x37c>;
+			dynamic-power-coefficient = <370>;
+			operating-points-v2 = <&cpu_opp_mid1>;
+			#cooling-cells = <2>;
 		};
 
 		cpu6: cpu@600 {
@@ -352,6 +371,9 @@
 			reg = <0x600>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x37c>;
+			dynamic-power-coefficient = <370>;
+			operating-points-v2 = <&cpu_opp_mid1>;
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@700 {
@@ -360,7 +382,30 @@
 			reg = <0x700>;
 			enable-method = "psci";
 			capacity-dmips-mhz = <0x400>;
+			dynamic-power-coefficient = <840>;
+			operating-points-v2 = <&cpu_opp_big>;
+			#cooling-cells = <2>;
 		};
+	};
+
+	cpu_opp_little: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+	};
+
+	cpu_opp_mid0: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+	};
+
+	cpu_opp_mid1: opp-table-2 {
+		compatible = "operating-points-v2";
+		opp-shared;
+	};
+
+	cpu_opp_big: opp-table-3 {
+		compatible = "operating-points-v2";
+		opp-shared;
 	};
 
 	psci {
@@ -803,6 +848,12 @@
 			lpcm-id = <0x6>;
 			reset-num = <0x5>;
 		};
+	};
+
+	tmu_thermal: thermal-sensor {
+		compatible = "google,lga-tmu";
+		mboxes = <&goog_mba_cpm_iface>;
+		#thermal-sensor-cells = <1>;
 	};
 
 	da9188mfd: pmic {
@@ -2935,6 +2986,14 @@
 			memory-region = <&gpu_fw_rmem>;
 			status = "disabled";
 		};
+
+		cpufreq: cpufreq@200c0790 {
+			compatible = "google,lga-cpufreq";
+			reg = <0x0 0x200c0790 0x0 0x20>;
+			mboxes = <&goog_mba_cpm_iface>;
+			google,domain-names = "cpu0", "cpu1g0", "cpu1g1", "cpu2";
+			google,cpu-domain-map = <0 0 1 1 1 2 2 3>;
+		};
 	};
 
 	gsa: gsa {
@@ -3351,6 +3410,116 @@
 				iod,io_type = <1>;
 				iod,link_type = <1>;
 				iod,attrs = <0>;
+			};
+		};
+	};
+
+	thermal-zones {
+		big-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_thermal 0>;
+
+			trips {
+				big_trip0: big-trip0 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				big_crit: big-crit {
+					temperature = <115000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&big_trip0>;
+					cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		big-mid-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_thermal 1>;
+
+			trips {
+				big_mid_trip0: big-mid-trip0 {
+					temperature = <100000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				big_mid_crit: big-mid-crit {
+					temperature = <115000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&big_mid_trip0>;
+					cooling-device = <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		mid-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_thermal 2>;
+
+			trips {
+				mid_trip0: mid-trip0 {
+					temperature = <100000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				mid_crit: mid-crit {
+					temperature = <115000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&mid_trip0>;
+					cooling-device = <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		little-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_thermal 3>;
+
+			trips {
+				little_trip0: little-trip0 {
+					temperature = <100000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				little_crit: little-crit {
+					temperature = <115000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&little_trip0>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
 			};
 		};
 	};
