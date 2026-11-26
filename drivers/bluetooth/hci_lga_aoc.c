@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Clean-room BlueZ HCI transport driver over Google Tensor G5 (Laguna)
- * Always-on Compute (AoC) channelized IPC ("com.google.bt").
+ * Always-on Compute (AoC) IPC.
  *
- * Bridges standard Linux Bluetooth HCI H4 frames onto Laguna AoC's
- * multiplexed channel IPC service exposed by google,lga-aoc, registering
- * a standard BlueZ HCI_PRIMARY controller (hciX).
+ * Supports both:
+ *  - Laguna's EFW AP offload transport over the split AoC services
+ *    "chre_bt_offload_ctl" (queue), "chre_bt_offload_data_tx" (TX ring),
+ *    and "chre_bt_offload_data_rx" (RX ring), including the control-queue
+ *    CONNECT/CREDIT/DISCONNECT handshake, FlatBuffer hardware/power/UART
+ *    bring-up messages, and 32-byte-aligned H4 framing; and
+ *  - Legacy "com.google.bt" 4-byte channel-muxed AOCC framing (or raw H4).
  */
 
+#include <linux/align.h>
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
@@ -21,6 +26,7 @@
 #include <linux/notifier.h>
 #include <linux/slab.h>
 #include <linux/soc/google/lga-aoc.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 
 #include <net/bluetooth/bluetooth.h>
@@ -35,6 +41,65 @@
 
 #define LGA_AOCC_TX_TIMEOUT_MS		1000U
 #define LGA_AOCC_RX_POLL_MS		250U
+
+/* Laguna EFW AP transport constants (chre_bt_offload_{ctl,data_tx,data_rx}) */
+#define LGA_EFW_CTL_SERVICE_DEFAULT	"chre_bt_offload_ctl"
+#define LGA_EFW_TX_SERVICE_DEFAULT	"chre_bt_offload_data_tx"
+#define LGA_EFW_RX_SERVICE_DEFAULT	"chre_bt_offload_data_rx"
+
+#define LGA_EFW_CTL_MSG_SIZE		56U
+#define LGA_EFW_PROTO_VER		2U
+#define LGA_EFW_AP_HDR_SIZE		17U
+#define LGA_EFW_AOC_HDR_SIZE_DEFAULT	30U
+#define LGA_EFW_AOC_HDR_SIZE_MIN	30U
+#define LGA_EFW_AOC_HDR_SIZE_MAX	64U
+#define LGA_EFW_RING_ALIGN		32U
+#define LGA_EFW_MAX_FRAME_SIZE		4096U
+#define LGA_EFW_RX_STREAM_SIZE		8192U
+#define LGA_EFW_CTL_TIMEOUT_MS		2000U
+#define LGA_EFW_RX_POLL_MS		100U
+
+#define LGA_EFW_FLAG_NORMAL		0U
+#define LGA_EFW_FLAG_EXPECT_REPLY	1U
+
+#define LGA_EFW_PKT_KIND_NORMAL		0U
+#define LGA_EFW_PKT_KIND_REPLY		1U
+#define LGA_EFW_PKT_KIND_ECHO		2U
+#define LGA_EFW_PKT_KIND_STATS		3U
+
+enum lga_efw_ctl_type {
+	LGA_EFW_CTL_DISCONNECT		= 0,
+	LGA_EFW_CTL_DISCONNECT_ACK	= 1,
+	LGA_EFW_CTL_CONNECT		= 2,
+	LGA_EFW_CTL_CONNECT_ACK		= 3,
+	LGA_EFW_CTL_CREDIT		= 4,
+	LGA_EFW_CTL_ERROR		= 5,
+	LGA_EFW_CTL_SYNC		= 6,
+	LGA_EFW_CTL_SYNC_ACK		= 7,
+};
+
+enum lga_efw_msg_type {
+	LGA_EFW_MSG_HCI_TX_OR_EVT	= 8,
+	LGA_EFW_MSG_HCI_ACL_RX		= 9,
+	LGA_EFW_MSG_HCI_SCO_RX		= 10,
+	LGA_EFW_MSG_HCI_ISO_RX		= 11,
+	LGA_EFW_MSG_HCI_DIAG_RX		= 14,
+	LGA_EFW_MSG_FLATBUFFER		= 39,
+};
+
+enum lga_efw_fb_union_type {
+	LGA_EFW_FB_ENABLE_HW		= 2,
+	LGA_EFW_FB_SET_POWER		= 3,
+	LGA_EFW_FB_SET_LPM		= 4,
+	LGA_EFW_FB_CONFIG_UART		= 5,
+	LGA_EFW_FB_QUERY_STATE		= 7,
+};
+
+enum hci_lga_aoc_mode {
+	HCI_LGA_AOC_MODE_RAW		= 0,
+	HCI_LGA_AOC_MODE_AOCC		= 1,
+	HCI_LGA_AOC_MODE_EFW		= 2,
+};
 
 enum lga_aocc_cmd_code {
 	LGA_AOCC_CMD_OPEN_CHANNEL	= 0,
@@ -56,9 +121,13 @@ struct hci_lga_aoc {
 	struct hci_dev *hdev;
 	struct lga_aoc_service_info tx_svc;
 	struct lga_aoc_service_info rx_svc;
+	struct lga_aoc_service_info ctl_svc;
+	bool has_ctl_svc;
+	enum hci_lga_aoc_mode mode;
 
 	struct task_struct *rx_task;
 	struct mutex tx_lock; /* serializes TX frames on the AoC channel */
+	struct mutex ctl_lock; /* serializes control-queue writes */
 	struct mutex rx_lock; /* protects rx_skb reassembly against flush() */
 	struct sk_buff *rx_skb;
 	size_t rx_hdr_len;
@@ -68,8 +137,13 @@ struct hci_lga_aoc {
 	struct gpio_desc *bt_ble_dbo_gpio;
 	struct gpio_desc *bt_dev_wake_gpio;
 
-	bool use_aocc_framing;
 	u32 channel_id;
+	u32 efw_tx_seq;
+	u32 efw_aoc_hdr_size;
+	u32 efw_tx_ring_size;
+	u32 efw_rx_ring_size;
+	bool efw_connected;
+
 	size_t tx_max_msg;
 	size_t rx_max_msg;
 	size_t max_payload;
@@ -79,17 +153,42 @@ struct hci_lga_aoc {
 static char *service_name = "com.google.bt";
 module_param(service_name, charp, 0444);
 MODULE_PARM_DESC(service_name,
-		 "AoC IPC TX/bidirectional service name (default: com.google.bt)");
+		 "AoC IPC TX/bidirectional service name (auto-falls back to chre_bt_offload_data_tx)");
 
 static char *rx_service_name = "";
 module_param(rx_service_name, charp, 0444);
 MODULE_PARM_DESC(rx_service_name,
-		 "Optional AoC IPC RX service name for split TX/RX rings (e.g. chre_bt_offload_data_rx)");
+		 "Optional AoC IPC RX service name for split TX/RX rings");
+
+static char *ctl_service_name = "";
+module_param(ctl_service_name, charp, 0444);
+MODULE_PARM_DESC(ctl_service_name,
+		 "Optional AoC IPC control queue service name (default: chre_bt_offload_ctl in EFW mode)");
 
 static bool aocc_framing = true;
 module_param(aocc_framing, bool, 0444);
 MODULE_PARM_DESC(aocc_framing,
-		 "Use 4-byte AoC channel mux header and open/close control messages");
+		 "Use 4-byte AoC channel mux framing when not using EFW transport");
+
+static bool efw_transport = true;
+module_param(efw_transport, bool, 0444);
+MODULE_PARM_DESC(efw_transport,
+		 "Enable EFW AP transport handshake on chre_bt_offload_{ctl,data_tx,data_rx}");
+
+static bool efw_pmic_ctrl = true;
+module_param(efw_pmic_ctrl, bool, 0644);
+MODULE_PARM_DESC(efw_pmic_ctrl,
+		 "Request AoC-side PMIC/CPM BT power sequence in FlatBuffer SetPower");
+
+static unsigned char efw_tx_flag;
+module_param(efw_tx_flag, byte, 0644);
+MODULE_PARM_DESC(efw_tx_flag,
+		 "Leading control byte prepended to H4 TX frames in EFW msg_type=8 (default: 0)");
+
+static unsigned int efw_uart_baud;
+module_param(efw_uart_baud, uint, 0644);
+MODULE_PARM_DESC(efw_uart_baud,
+		 "Optional UART baud rate sent via EFW ConfigUART after SetPower (0=keep AoC default)");
 
 static bool toggle_bt_power = true;
 module_param(toggle_bt_power, bool, 0644);
@@ -103,11 +202,23 @@ MODULE_PARM_DESC(run_btbcm_setup,
 
 static bool debug_rx;
 module_param(debug_rx, bool, 0644);
-MODULE_PARM_DESC(debug_rx, "Log incoming com.google.bt payload bytes");
+MODULE_PARM_DESC(debug_rx, "Log incoming AoC BT control and payload frames");
 
 static DEFINE_MUTEX(hci_lga_aoc_lock);
 static struct hci_lga_aoc *hci_lga_aoc_inst;
 static atomic_t hci_lga_aoc_chan_seq = ATOMIC_INIT(1);
+
+static const char *hci_lga_aoc_mode_str(enum hci_lga_aoc_mode mode)
+{
+	switch (mode) {
+	case HCI_LGA_AOC_MODE_EFW:
+		return "efw";
+	case HCI_LGA_AOC_MODE_AOCC:
+		return "aocc";
+	default:
+		return "raw";
+	}
+}
 
 static int hci_lga_aoc_send_ctrl(struct hci_lga_aoc *bt,
 				 enum lga_aocc_cmd_code cmd, u32 chan_id)
@@ -138,7 +249,7 @@ static int hci_lga_aoc_send_chunk(struct hci_lga_aoc *bt, const u8 *data,
 		return -EMSGSIZE;
 
 	mutex_lock(&bt->tx_lock);
-	if (bt->use_aocc_framing) {
+	if (bt->mode == HCI_LGA_AOC_MODE_AOCC) {
 		__le32 hdr = cpu_to_le32(bt->channel_id & LGA_AOCC_CHAN_MASK);
 
 		memcpy(bt->tx_buf, &hdr, LGA_AOCC_HDR_SIZE);
@@ -156,6 +267,484 @@ static int hci_lga_aoc_send_chunk(struct hci_lga_aoc *bt, const u8 *data,
 
 	return ret < 0 ? (int)ret : 0;
 }
+
+/* ---- Laguna EFW AP transport helpers ---- */
+
+static int hci_lga_aoc_efw_ctl_write(struct hci_lga_aoc *bt,
+				     const u8 msg[LGA_EFW_CTL_MSG_SIZE])
+{
+	ssize_t ret;
+
+	mutex_lock(&bt->ctl_lock);
+	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->ctl_svc.index,
+					msg, LGA_EFW_CTL_MSG_SIZE,
+					msecs_to_jiffies(LGA_EFW_CTL_TIMEOUT_MS));
+	mutex_unlock(&bt->ctl_lock);
+
+	return ret < 0 ? (int)ret : 0;
+}
+
+static int hci_lga_aoc_efw_send_credit(struct hci_lga_aoc *bt, u32 delta_bytes)
+{
+	u8 msg[LGA_EFW_CTL_MSG_SIZE] = {};
+
+	if (!delta_bytes)
+		return 0;
+
+	msg[0] = LGA_EFW_CTL_CREDIT;
+	put_unaligned_le32(delta_bytes, msg + 1);
+	msg[5] = 0; /* primary RX ring */
+
+	return hci_lga_aoc_efw_ctl_write(bt, msg);
+}
+
+static int hci_lga_aoc_efw_send_disconnect(struct hci_lga_aoc *bt)
+{
+	u8 msg[LGA_EFW_CTL_MSG_SIZE] = {};
+
+	msg[0] = LGA_EFW_CTL_DISCONNECT;
+	return hci_lga_aoc_efw_ctl_write(bt, msg);
+}
+
+static void hci_lga_aoc_efw_drain_ctl(struct hci_lga_aoc *bt)
+{
+	u8 rep[LGA_EFW_CTL_MSG_SIZE];
+	ssize_t n;
+
+	for (;;) {
+		n = lga_aoc_ipc_read(bt->aoc_dev, bt->ctl_svc.index,
+				     rep, sizeof(rep));
+		if (n <= 0)
+			break;
+
+		if (rep[0] == LGA_EFW_CTL_ERROR)
+			bt_dev_warn(bt->hdev,
+				    "EFW ctl ERROR code=%u (%zd B)",
+				    n > 1 ? rep[1] : 0, n);
+		else if (debug_rx)
+			dev_info(bt->aoc_dev,
+				 "EFW ctl rx type=%u len=%zd: %*ph\n",
+				 rep[0], n, (int)min_t(ssize_t, n, 24), rep);
+	}
+}
+
+static int hci_lga_aoc_efw_wait_ctl(struct hci_lga_aoc *bt, u8 want_type,
+				    u8 rep[LGA_EFW_CTL_MSG_SIZE],
+				    unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+
+	for (;;) {
+		long rem = deadline - jiffies;
+		ssize_t n;
+
+		if (rem <= 0)
+			return -ETIMEDOUT;
+
+		n = lga_aoc_ipc_read_timeout(bt->aoc_dev, bt->ctl_svc.index,
+					     rep, LGA_EFW_CTL_MSG_SIZE, rem);
+		if (n == -ETIMEDOUT)
+			return -ETIMEDOUT;
+		if (n == -ERESTARTSYS || n == -EAGAIN)
+			continue;
+		if (n < 0)
+			return (int)n;
+		if (n == 0)
+			continue;
+
+		if (debug_rx)
+			dev_info(bt->aoc_dev,
+				 "EFW ctl rx type=%u len=%zd: %*ph\n",
+				 rep[0], n, (int)min_t(ssize_t, n, 24), rep);
+
+		if (rep[0] == want_type)
+			return (int)n;
+		if (rep[0] == LGA_EFW_CTL_ERROR) {
+			bt_dev_warn(bt->hdev,
+				    "EFW ctl returned ERROR code=%u while waiting for %u",
+				    n > 1 ? rep[1] : 0, want_type);
+			return -EPROTO;
+		}
+	}
+}
+
+static int hci_lga_aoc_efw_connect(struct hci_lga_aoc *bt)
+{
+	u8 req[LGA_EFW_CTL_MSG_SIZE] = {};
+	u8 rep[LGA_EFW_CTL_MSG_SIZE] = {};
+	u8 stale[256];
+	int attempt, ret;
+
+	/* Drain any stale messages left in the control queue or RX ring */
+	hci_lga_aoc_efw_drain_ctl(bt);
+	while (lga_aoc_ipc_read(bt->aoc_dev, bt->rx_svc.index,
+				stale, sizeof(stale)) > 0)
+		;
+
+	req[0] = LGA_EFW_CTL_CONNECT;
+	put_unaligned_le32(LGA_EFW_AP_HDR_SIZE, req + 1);
+	req[5] = 1; /* required protocol mode byte */
+	req[6] = LGA_EFW_PROTO_VER;
+	req[7] = 0; /* single RX ring (primary chre_bt_offload_data_rx) */
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = hci_lga_aoc_efw_ctl_write(bt, req);
+		if (ret)
+			return ret;
+
+		ret = hci_lga_aoc_efw_wait_ctl(bt, LGA_EFW_CTL_CONNECT_ACK,
+					       rep, LGA_EFW_CTL_TIMEOUT_MS);
+		if (ret >= 15) {
+			u32 tx_sz = get_unaligned_le32(rep + 1);
+			u32 rx_sz = get_unaligned_le32(rep + 5);
+			u32 aoc_hdr = get_unaligned_le32(rep + 9);
+
+			if (aoc_hdr < LGA_EFW_AOC_HDR_SIZE_MIN ||
+			    aoc_hdr > LGA_EFW_AOC_HDR_SIZE_MAX)
+				aoc_hdr = LGA_EFW_AOC_HDR_SIZE_DEFAULT;
+
+			bt->efw_tx_ring_size = tx_sz;
+			bt->efw_rx_ring_size = rx_sz;
+			bt->efw_aoc_hdr_size = aoc_hdr;
+			bt->efw_tx_seq = 0;
+			bt->efw_connected = true;
+
+			bt_dev_info(bt->hdev,
+				    "EFW CONNECT_ACK: tx_ring=%u rx_ring=%u aoc_hdr=%u mode=%u ver=%u",
+				    tx_sz, rx_sz, aoc_hdr, rep[13], rep[14]);
+			return 0;
+		}
+
+		if (ret == -EPROTO && attempt == 0) {
+			bt_dev_info(bt->hdev,
+				    "EFW state reset via DISCONNECT before retrying CONNECT");
+			hci_lga_aoc_efw_send_disconnect(bt);
+			hci_lga_aoc_efw_wait_ctl(bt, LGA_EFW_CTL_DISCONNECT_ACK,
+						 rep, 1000U);
+			continue;
+		}
+
+		break;
+	}
+
+	return ret < 0 ? ret : -EIO;
+}
+
+static int hci_lga_aoc_efw_send_frame(struct hci_lga_aoc *bt, u32 msg_type,
+				      u8 flags, const u8 *prefix,
+				      size_t prefix_len, const u8 *body,
+				      size_t body_len)
+{
+	size_t payload_len = sizeof(__le32) + prefix_len + body_len;
+	size_t raw_len = LGA_EFW_AP_HDR_SIZE + payload_len;
+	size_t frame_len = ALIGN(raw_len, LGA_EFW_RING_ALIGN);
+	ssize_t ret;
+	u8 *p;
+
+	if (frame_len > bt->tx_max_msg)
+		return -EMSGSIZE;
+
+	mutex_lock(&bt->tx_lock);
+	p = bt->tx_buf;
+	put_unaligned_le64(0, p);
+	put_unaligned_le32(payload_len, p + 8);
+	put_unaligned_le32(bt->efw_tx_seq, p + 12);
+	p[16] = flags;
+	put_unaligned_le32(msg_type, p + LGA_EFW_AP_HDR_SIZE);
+
+	p += LGA_EFW_AP_HDR_SIZE + sizeof(__le32);
+	if (prefix_len) {
+		memcpy(p, prefix, prefix_len);
+		p += prefix_len;
+	}
+	if (body_len) {
+		memcpy(p, body, body_len);
+		p += body_len;
+	}
+	if (frame_len > raw_len)
+		memset(p, 0, frame_len - raw_len);
+
+	ret = lga_aoc_ipc_write_timeout(bt->aoc_dev, bt->tx_svc.index,
+					bt->tx_buf, frame_len,
+					msecs_to_jiffies(LGA_AOCC_TX_TIMEOUT_MS));
+	if (ret >= 0)
+		bt->efw_tx_seq++;
+	mutex_unlock(&bt->tx_lock);
+
+	return ret < 0 ? (int)ret : 0;
+}
+
+/*
+ * Canonical 40-byte FlatBuffer for union tables with two boolean fields at
+ * vtable offsets +4 and +6 (EnableHWInterface=2 and SetPower=3).
+ */
+static int hci_lga_aoc_efw_send_fb_bool2(struct hci_lga_aoc *bt, u8 union_type,
+					 bool field4, bool field6)
+{
+	u8 fb[40] = {};
+
+	put_unaligned_le32(12, fb + 0);		/* root table offset */
+	/* Root vtable at offset 4 */
+	put_unaligned_le16(8, fb + 4);		/* vtable size */
+	put_unaligned_le16(12, fb + 6);		/* table size */
+	put_unaligned_le16(4, fb + 8);		/* union_type field offset */
+	put_unaligned_le16(8, fb + 10);		/* union_table field offset */
+	/* Root table at offset 12 */
+	put_unaligned_le32(8, fb + 12);		/* soffset back to vtable (12-8=4) */
+	fb[16] = union_type;
+	put_unaligned_le32(12, fb + 20);	/* relative offset to subtable (20+12=32) */
+	/* Subtable vtable at offset 24 */
+	put_unaligned_le16(8, fb + 24);		/* vtable size */
+	put_unaligned_le16(8, fb + 26);		/* table size */
+	put_unaligned_le16(4, fb + 28);		/* field +4 offset */
+	put_unaligned_le16(6, fb + 30);		/* field +6 offset */
+	/* Subtable at offset 32 */
+	put_unaligned_le32(8, fb + 32);		/* soffset back to vtable (32-8=24) */
+	fb[36] = field4 ? 1 : 0;
+	fb[38] = field6 ? 1 : 0;
+
+	return hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_FLATBUFFER,
+					  LGA_EFW_FLAG_NORMAL,
+					  NULL, 0, fb, sizeof(fb));
+}
+
+/* Canonical 44-byte FlatBuffer for ConfigUART (union_type=5: u32 baud, u8 flow) */
+static int hci_lga_aoc_efw_send_fb_uart(struct hci_lga_aoc *bt, u32 baud,
+					u8 flow)
+{
+	u8 fb[44] = {};
+
+	put_unaligned_le32(12, fb + 0);
+	put_unaligned_le16(8, fb + 4);
+	put_unaligned_le16(12, fb + 6);
+	put_unaligned_le16(4, fb + 8);
+	put_unaligned_le16(8, fb + 10);
+	put_unaligned_le32(8, fb + 12);
+	fb[16] = LGA_EFW_FB_CONFIG_UART;
+	put_unaligned_le32(12, fb + 20);
+	put_unaligned_le16(8, fb + 24);
+	put_unaligned_le16(12, fb + 26);
+	put_unaligned_le16(4, fb + 28);
+	put_unaligned_le16(8, fb + 30);
+	put_unaligned_le32(8, fb + 32);
+	put_unaligned_le32(baud, fb + 36);
+	fb[40] = flow;
+
+	return hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_FLATBUFFER,
+					  LGA_EFW_FLAG_NORMAL,
+					  NULL, 0, fb, sizeof(fb));
+}
+
+/* Canonical 32-byte FlatBuffer for QueryState (union_type=7, expects reply) */
+static int hci_lga_aoc_efw_send_fb_query_state(struct hci_lga_aoc *bt)
+{
+	u8 fb[32] = {};
+
+	put_unaligned_le32(12, fb + 0);
+	put_unaligned_le16(8, fb + 4);
+	put_unaligned_le16(12, fb + 6);
+	put_unaligned_le16(4, fb + 8);
+	put_unaligned_le16(8, fb + 10);
+	put_unaligned_le32(8, fb + 12);
+	fb[16] = LGA_EFW_FB_QUERY_STATE;
+	put_unaligned_le32(8, fb + 20);		/* subtable at offset 28 (20+8=28) */
+	put_unaligned_le16(4, fb + 24);		/* empty subtable vtable at 24 */
+	put_unaligned_le16(4, fb + 26);
+	put_unaligned_le32(4, fb + 28);		/* soffset back to 24 (28-4=24) */
+
+	return hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_FLATBUFFER,
+					  LGA_EFW_FLAG_EXPECT_REPLY,
+					  NULL, 0, fb, sizeof(fb));
+}
+
+static u8 hci_lga_aoc_efw_msg_to_h4(u32 msg_type)
+{
+	switch (msg_type) {
+	case LGA_EFW_MSG_HCI_TX_OR_EVT:
+		return HCI_EVENT_PKT;
+	case LGA_EFW_MSG_HCI_ACL_RX:
+		return HCI_ACLDATA_PKT;
+	case LGA_EFW_MSG_HCI_SCO_RX:
+		return HCI_SCODATA_PKT;
+	case LGA_EFW_MSG_HCI_ISO_RX:
+		return HCI_ISODATA_PKT;
+	default:
+		return 0;
+	}
+}
+
+static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
+					 const u8 *frame, u32 payload_len,
+					 u32 seq, u32 reply_seq, u8 pkt_kind)
+{
+	const u8 *payload = frame + bt->efw_aoc_hdr_size;
+	struct hci_dev *hdev = bt->hdev;
+	struct sk_buff *skb;
+	u32 msg_type;
+	u8 h4_type;
+	size_t body_len;
+
+	if (pkt_kind == LGA_EFW_PKT_KIND_REPLY) {
+		dev_info(bt->aoc_dev,
+			 "EFW reply seq=%u reply_to=%u len=%u: %*ph\n",
+			 seq, reply_seq, payload_len,
+			 (int)min_t(u32, payload_len, 32U), payload);
+		return;
+	}
+
+	if (pkt_kind != LGA_EFW_PKT_KIND_NORMAL) {
+		if (debug_rx)
+			dev_info(bt->aoc_dev,
+				 "EFW rx kind=%u seq=%u len=%u: %*ph\n",
+				 pkt_kind, seq, payload_len,
+				 (int)min_t(u32, payload_len, 32U), payload);
+		return;
+	}
+
+	if (payload_len < sizeof(__le32)) {
+		bt_dev_warn_ratelimited(hdev,
+					"short EFW normal payload (%u B)",
+					payload_len);
+		hdev->stat.err_rx++;
+		return;
+	}
+
+	msg_type = get_unaligned_le32(payload);
+	body_len = payload_len - sizeof(__le32);
+	payload += sizeof(__le32);
+
+	if (debug_rx)
+		dev_info(bt->aoc_dev,
+			 "EFW rx msg_type=%u seq=%u len=%zu: %*ph\n",
+			 msg_type, seq, body_len,
+			 (int)min_t(size_t, body_len, 32U), payload);
+
+	h4_type = hci_lga_aoc_efw_msg_to_h4(msg_type);
+	if (!h4_type) {
+		if (msg_type != LGA_EFW_MSG_HCI_DIAG_RX)
+			bt_dev_dbg(hdev, "ignoring EFW msg_type=%u (%zu B)",
+				   msg_type, body_len);
+		return;
+	}
+
+	if (!body_len || body_len > HCI_MAX_FRAME_SIZE) {
+		bt_dev_err_ratelimited(hdev,
+				       "invalid EFW HCI body length %zu (msg_type=%u)",
+				       body_len, msg_type);
+		hdev->stat.err_rx++;
+		return;
+	}
+
+	skb = bt_skb_alloc(body_len, GFP_KERNEL);
+	if (!skb) {
+		hdev->stat.err_rx++;
+		return;
+	}
+
+	hci_skb_pkt_type(skb) = h4_type;
+	skb_put_data(skb, payload, body_len);
+	hdev->stat.byte_rx += body_len + 1U;
+	hci_recv_frame(hdev, skb);
+}
+
+static int hci_lga_aoc_efw_rx_thread(struct hci_lga_aoc *bt)
+{
+	u8 *stream;
+	size_t buffered = 0;
+
+	stream = kmalloc(LGA_EFW_RX_STREAM_SIZE, GFP_KERNEL);
+	if (!stream)
+		return -ENOMEM;
+
+	while (!kthread_should_stop()) {
+		size_t space = LGA_EFW_RX_STREAM_SIZE - buffered;
+		size_t off = 0;
+		u32 credit_delta = 0;
+		ssize_t n;
+
+		hci_lga_aoc_efw_drain_ctl(bt);
+
+		if (!space) {
+			bt_dev_err(bt->hdev, "EFW RX stream overflow, resetting");
+			buffered = 0;
+			space = LGA_EFW_RX_STREAM_SIZE;
+		}
+
+		n = lga_aoc_ipc_read_timeout(bt->aoc_dev, bt->rx_svc.index,
+					     stream + buffered, space,
+					     msecs_to_jiffies(LGA_EFW_RX_POLL_MS));
+		if (n == -ETIMEDOUT || n == -ERESTARTSYS || n == -EAGAIN)
+			continue;
+
+		if (n < 0) {
+			if (n == -ENODEV) {
+				set_current_state(TASK_INTERRUPTIBLE);
+				if (!kthread_should_stop())
+					schedule();
+				set_current_state(TASK_RUNNING);
+				continue;
+			}
+			bt_dev_err_ratelimited(bt->hdev,
+					       "EFW AoC RX read failed: %zd", n);
+			msleep(20);
+			continue;
+		}
+
+		buffered += (size_t)n;
+
+		while (buffered - off >= bt->efw_aoc_hdr_size) {
+			const u8 *f = stream + off;
+			u32 payload_len = get_unaligned_le32(f + 16);
+			u32 seq = get_unaligned_le32(f + 20);
+			u32 reply_seq = get_unaligned_le32(f + 24);
+			u8 pkt_kind = f[28];
+			size_t raw_len, frame_len;
+
+			if (payload_len > LGA_EFW_RX_STREAM_SIZE -
+					  bt->efw_aoc_hdr_size) {
+				bt_dev_err_ratelimited(bt->hdev,
+						       "corrupt EFW RX header (payload_len=%u kind=%u), dropping %zu B",
+						       payload_len, pkt_kind,
+						       buffered - off);
+				credit_delta += ALIGN_DOWN(buffered - off,
+							   LGA_EFW_RING_ALIGN);
+				off = buffered;
+				break;
+			}
+
+			raw_len = bt->efw_aoc_hdr_size + payload_len;
+			frame_len = ALIGN(raw_len, LGA_EFW_RING_ALIGN);
+			if (frame_len > LGA_EFW_RX_STREAM_SIZE) {
+				credit_delta += ALIGN_DOWN(buffered - off,
+							   LGA_EFW_RING_ALIGN);
+				off = buffered;
+				break;
+			}
+
+			if (buffered - off < frame_len)
+				break;
+
+			hci_lga_aoc_efw_handle_frame(bt, f, payload_len, seq,
+						     reply_seq, pkt_kind);
+			off += frame_len;
+			credit_delta += frame_len;
+		}
+
+		if (off) {
+			if (off < buffered)
+				memmove(stream, stream + off, buffered - off);
+			buffered -= off;
+		}
+
+		if (credit_delta)
+			hci_lga_aoc_efw_send_credit(bt, credit_delta);
+	}
+
+	kfree(stream);
+	return 0;
+}
+
+/* ---- Legacy AOCC / raw H4 reassembly ---- */
 
 static void hci_lga_aoc_rx_reset_locked(struct hci_lga_aoc *bt)
 {
@@ -295,6 +884,9 @@ static int hci_lga_aoc_rx_thread(void *arg)
 	struct hci_lga_aoc *bt = arg;
 	u8 *rx_buf;
 
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW)
+		return hci_lga_aoc_efw_rx_thread(bt);
+
 	rx_buf = kmalloc(bt->rx_max_msg, GFP_KERNEL);
 	if (!rx_buf)
 		return -ENOMEM;
@@ -324,7 +916,7 @@ static int hci_lga_aoc_rx_thread(void *arg)
 			continue;
 		}
 
-		if (bt->use_aocc_framing) {
+		if (bt->mode == HCI_LGA_AOC_MODE_AOCC) {
 			u32 hdr, rx_chan;
 
 			if ((size_t)n < LGA_AOCC_HDR_SIZE) {
@@ -406,7 +998,7 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 	gp = gpiod_get_optional(bt->aoc_dev, "bt-device-wakeup", GPIOD_OUT_LOW);
 	if (IS_ERR(gp)) {
 		dev_info(bt->aoc_dev,
-			 "bt-device-wakeup GPIO unavailable (%ld), skipping\n",
+			 "bt-device-wakeup GPIO unavailable (%ld), skipping AP power toggle\n",
 			 PTR_ERR(gp));
 	} else {
 		bt->bt_dev_wake_gpio = gp;
@@ -448,35 +1040,78 @@ static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
 static int hci_lga_aoc_open(struct hci_dev *hdev)
 {
 	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
-	u32 chan;
 	int ret;
 
 	if (!lga_aoc_is_online(bt->aoc_dev))
 		return -ENODEV;
 
-	chan = (u32)atomic_inc_return(&hci_lga_aoc_chan_seq);
-	if (chan == 0 || chan >= LGA_AOCC_MAX_CHAN_ID) {
-		atomic_set(&hci_lga_aoc_chan_seq, 1);
-		chan = 1;
-	}
-	bt->channel_id = chan;
-
 	hci_lga_aoc_power_on(bt);
+
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
+		ret = hci_lga_aoc_efw_connect(bt);
+		if (ret) {
+			bt_dev_err(hdev, "EFW CONNECT handshake failed: %d",
+				   ret);
+			hci_lga_aoc_power_off(bt);
+			return ret;
+		}
+	} else {
+		u32 chan = (u32)atomic_inc_return(&hci_lga_aoc_chan_seq);
+
+		if (chan == 0 || chan >= LGA_AOCC_MAX_CHAN_ID) {
+			atomic_set(&hci_lga_aoc_chan_seq, 1);
+			chan = 1;
+		}
+		bt->channel_id = chan;
+	}
 
 	bt->rx_task = kthread_run(hci_lga_aoc_rx_thread, bt, "hci-lga-aoc");
 	if (IS_ERR(bt->rx_task)) {
 		ret = PTR_ERR(bt->rx_task);
 		bt->rx_task = NULL;
+		if (bt->mode == HCI_LGA_AOC_MODE_EFW && bt->efw_connected) {
+			hci_lga_aoc_efw_send_disconnect(bt);
+			bt->efw_connected = false;
+		}
 		hci_lga_aoc_power_off(bt);
 		return ret;
 	}
 
-	if (bt->use_aocc_framing) {
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
+		ret = hci_lga_aoc_efw_send_fb_bool2(bt, LGA_EFW_FB_ENABLE_HW,
+						    true, false);
+		if (ret) {
+			bt_dev_err(hdev, "EFW EnableHWInterface failed: %d",
+				   ret);
+			goto err_stop_efw;
+		}
+
+		ret = hci_lga_aoc_efw_send_fb_bool2(bt, LGA_EFW_FB_SET_POWER,
+						    true, efw_pmic_ctrl);
+		if (ret) {
+			bt_dev_err(hdev, "EFW SetPower(on) failed: %d", ret);
+			goto err_stop_efw;
+		}
+
+		msleep(50);
+
+		if (efw_uart_baud) {
+			ret = hci_lga_aoc_efw_send_fb_uart(bt, efw_uart_baud,
+							   1);
+			if (ret)
+				bt_dev_warn(hdev,
+					    "EFW ConfigUART(%u) failed: %d",
+					    efw_uart_baud, ret);
+		}
+
+		ret = hci_lga_aoc_efw_send_fb_query_state(bt);
+		if (ret)
+			bt_dev_warn(hdev, "EFW QueryState failed: %d", ret);
+	} else if (bt->mode == HCI_LGA_AOC_MODE_AOCC) {
 		ret = hci_lga_aoc_send_ctrl(bt, LGA_AOCC_CMD_OPEN_CHANNEL,
 					    bt->channel_id);
 		if (ret) {
-			bt_dev_err(hdev,
-				   "failed to open AoC channel %u: %d",
+			bt_dev_err(hdev, "failed to open AoC channel %u: %d",
 				   bt->channel_id, ret);
 			kthread_stop(bt->rx_task);
 			bt->rx_task = NULL;
@@ -486,21 +1121,37 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 	}
 
 	bt_dev_info(hdev,
-		    "opened AoC TX '%s' (idx=%u) / RX '%s' (idx=%u) chan=%u framing=%u",
+		    "opened AoC TX '%s' (idx=%u) / RX '%s' (idx=%u) mode=%s",
 		    bt->tx_svc.name, bt->tx_svc.index,
 		    bt->rx_svc.name, bt->rx_svc.index,
-		    bt->channel_id, bt->use_aocc_framing);
+		    hci_lga_aoc_mode_str(bt->mode));
 	return 0;
+
+err_stop_efw:
+	hci_lga_aoc_efw_send_disconnect(bt);
+	bt->efw_connected = false;
+	kthread_stop(bt->rx_task);
+	bt->rx_task = NULL;
+	hci_lga_aoc_power_off(bt);
+	return ret;
 }
 
 static int hci_lga_aoc_close(struct hci_dev *hdev)
 {
 	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
 
-	if (bt->use_aocc_framing && bt->channel_id &&
-	    lga_aoc_is_online(bt->aoc_dev))
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
+		if (bt->efw_connected && lga_aoc_is_online(bt->aoc_dev)) {
+			hci_lga_aoc_efw_send_fb_bool2(bt, LGA_EFW_FB_SET_POWER,
+						      false, efw_pmic_ctrl);
+			hci_lga_aoc_efw_send_disconnect(bt);
+		}
+		bt->efw_connected = false;
+	} else if (bt->mode == HCI_LGA_AOC_MODE_AOCC && bt->channel_id &&
+		   lga_aoc_is_online(bt->aoc_dev)) {
 		hci_lga_aoc_send_ctrl(bt, LGA_AOCC_CMD_CLOSE_CHANNEL,
 				      bt->channel_id);
+	}
 
 	if (bt->rx_task) {
 		kthread_stop(bt->rx_task);
@@ -551,6 +1202,22 @@ static int hci_lga_aoc_send(struct hci_dev *hdev, struct sk_buff *skb)
 		return -EILSEQ;
 	}
 
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW) {
+		u8 prefix[2] = { efw_tx_flag, pkt_type };
+
+		ret = hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_HCI_TX_OR_EVT,
+						 LGA_EFW_FLAG_NORMAL,
+						 prefix, sizeof(prefix),
+						 skb->data, skb->len);
+		if (ret) {
+			hdev->stat.err_tx++;
+			return ret;
+		}
+		hdev->stat.byte_tx += skb->len + 1U;
+		kfree_skb(skb);
+		return 0;
+	}
+
 	/* Prepend H4 packet indicator byte before chunking onto AoC IPC */
 	memcpy(skb_push(skb, 1), &pkt_type, 1);
 	src = skb->data;
@@ -597,11 +1264,11 @@ static int hci_lga_aoc_setup(struct hci_dev *hdev)
 }
 
 static int hci_lga_aoc_calc_msg_len(const struct lga_aoc_service_info *svc,
-				    bool is_tx, size_t *out_len)
+				    bool is_tx, size_t limit, size_t *out_len)
 {
 	u32 slots = is_tx ? svc->down_slots : svc->up_slots;
 	u32 size = is_tx ? svc->down_size : svc->up_size;
-	size_t max_msg = LGA_AOCC_MAX_MSG_SIZE;
+	size_t max_msg = limit;
 
 	if (svc->type == LGA_AOC_SVC_BUFFER)
 		return -EOPNOTSUPP;
@@ -625,12 +1292,15 @@ static int hci_lga_aoc_calc_msg_len(const struct lga_aoc_service_info *svc,
 static int hci_lga_aoc_attach_locked(void)
 {
 	struct device *aoc_dev;
-	struct lga_aoc_service_info tx_svc, rx_svc;
-	const char *rx_name;
+	struct lga_aoc_service_info tx_svc, rx_svc, ctl_svc = {};
+	const char *tx_name = service_name;
+	const char *rx_name = rx_service_name;
+	const char *ctl_name = ctl_service_name;
 	struct hci_lga_aoc *bt;
 	struct hci_dev *hdev;
-	bool use_framing = aocc_framing;
-	size_t tx_max_msg, rx_max_msg, hdr_overhead;
+	enum hci_lga_aoc_mode mode;
+	bool has_ctl = false;
+	size_t tx_limit, tx_max_msg, rx_max_msg, hdr_overhead;
 	int ret;
 
 	if (hci_lga_aoc_inst)
@@ -645,24 +1315,32 @@ static int hci_lga_aoc_attach_locked(void)
 		return -EAGAIN;
 	}
 
-	ret = lga_aoc_find_service(aoc_dev, service_name, &tx_svc);
+	ret = lga_aoc_find_service(aoc_dev, tx_name, &tx_svc);
+	if (ret && !strcmp(tx_name, "com.google.bt") && efw_transport) {
+		ret = lga_aoc_find_service(aoc_dev, LGA_EFW_TX_SERVICE_DEFAULT,
+					   &tx_svc);
+		if (!ret) {
+			tx_name = LGA_EFW_TX_SERVICE_DEFAULT;
+			if (!rx_name || !*rx_name)
+				rx_name = LGA_EFW_RX_SERVICE_DEFAULT;
+			if (!ctl_name || !*ctl_name)
+				ctl_name = LGA_EFW_CTL_SERVICE_DEFAULT;
+		}
+	}
 	if (ret) {
 		dev_err(aoc_dev, "AoC service '%s' not found: %d\n",
-			service_name, ret);
-		if (!strcmp(service_name, "com.google.bt") &&
-		    !lga_aoc_find_service(aoc_dev, "chre_bt_offload_data_tx",
-					  &tx_svc) &&
-		    !lga_aoc_find_service(aoc_dev, "chre_bt_offload_data_rx",
-					  &rx_svc))
-			dev_info(aoc_dev,
-				 "Laguna AoC publishes split rings 'chre_bt_offload_data_tx'/'chre_bt_offload_data_rx' instead of 'com.google.bt'\n");
+			tx_name, ret);
 		put_device(aoc_dev);
 		return ret;
 	}
 
-	rx_name = (rx_service_name && *rx_service_name) ? rx_service_name :
-							  service_name;
-	if (!strcmp(rx_name, service_name)) {
+	if ((!rx_name || !*rx_name) &&
+	    !strcmp(tx_name, LGA_EFW_TX_SERVICE_DEFAULT))
+		rx_name = LGA_EFW_RX_SERVICE_DEFAULT;
+	if (!rx_name || !*rx_name)
+		rx_name = tx_name;
+
+	if (!strcmp(rx_name, tx_name)) {
 		rx_svc = tx_svc;
 	} else {
 		ret = lga_aoc_find_service(aoc_dev, rx_name, &rx_svc);
@@ -674,7 +1352,39 @@ static int hci_lga_aoc_attach_locked(void)
 		}
 	}
 
-	ret = hci_lga_aoc_calc_msg_len(&tx_svc, true, &tx_max_msg);
+	if (efw_transport && (!ctl_name || !*ctl_name) &&
+	    !strcmp(tx_name, LGA_EFW_TX_SERVICE_DEFAULT))
+		ctl_name = LGA_EFW_CTL_SERVICE_DEFAULT;
+
+	if (efw_transport && ctl_name && *ctl_name) {
+		ret = lga_aoc_find_service(aoc_dev, ctl_name, &ctl_svc);
+		if (ret) {
+			dev_err(aoc_dev, "AoC ctl service '%s' not found: %d\n",
+				ctl_name, ret);
+			put_device(aoc_dev);
+			return ret;
+		}
+		if (ctl_svc.type != LGA_AOC_SVC_QUEUE ||
+		    ctl_svc.down_size < LGA_EFW_CTL_MSG_SIZE + 8U ||
+		    ctl_svc.up_size < LGA_EFW_CTL_MSG_SIZE + 8U) {
+			dev_err(aoc_dev,
+				"AoC ctl service '%s' incompatible (type=%u down=%u up=%u)\n",
+				ctl_svc.name, ctl_svc.type,
+				ctl_svc.down_size, ctl_svc.up_size);
+			put_device(aoc_dev);
+			return -EINVAL;
+		}
+		has_ctl = true;
+		mode = HCI_LGA_AOC_MODE_EFW;
+	} else {
+		mode = aocc_framing ? HCI_LGA_AOC_MODE_AOCC :
+				      HCI_LGA_AOC_MODE_RAW;
+	}
+
+	tx_limit = mode == HCI_LGA_AOC_MODE_EFW ? LGA_EFW_MAX_FRAME_SIZE :
+						  LGA_AOCC_MAX_MSG_SIZE;
+
+	ret = hci_lga_aoc_calc_msg_len(&tx_svc, true, tx_limit, &tx_max_msg);
 	if (ret) {
 		dev_err(aoc_dev, "AoC TX service '%s' unsupported/invalid: %d\n",
 			tx_svc.name, ret);
@@ -682,7 +1392,8 @@ static int hci_lga_aoc_attach_locked(void)
 		return ret;
 	}
 
-	ret = hci_lga_aoc_calc_msg_len(&rx_svc, false, &rx_max_msg);
+	ret = hci_lga_aoc_calc_msg_len(&rx_svc, false, LGA_AOCC_MAX_MSG_SIZE,
+				       &rx_max_msg);
 	if (ret) {
 		dev_err(aoc_dev, "AoC RX service '%s' unsupported/invalid: %d\n",
 			rx_svc.name, ret);
@@ -690,8 +1401,14 @@ static int hci_lga_aoc_attach_locked(void)
 		return ret;
 	}
 
-	hdr_overhead = use_framing ? LGA_AOCC_HDR_SIZE : 0;
-	if (tx_max_msg <= hdr_overhead + 1U || rx_max_msg <= hdr_overhead + 1U) {
+	if (mode == HCI_LGA_AOC_MODE_EFW)
+		hdr_overhead = LGA_EFW_AP_HDR_SIZE + sizeof(__le32) + 2U;
+	else if (mode == HCI_LGA_AOC_MODE_AOCC)
+		hdr_overhead = LGA_AOCC_HDR_SIZE;
+	else
+		hdr_overhead = 0;
+
+	if (tx_max_msg <= hdr_overhead + 1U || rx_max_msg <= 1U) {
 		dev_err(aoc_dev,
 			"AoC service '%s'/'%s' message size (%zu/%zu) too small\n",
 			tx_svc.name, rx_svc.name, tx_max_msg, rx_max_msg);
@@ -721,12 +1438,16 @@ static int hci_lga_aoc_attach_locked(void)
 	}
 
 	mutex_init(&bt->tx_lock);
+	mutex_init(&bt->ctl_lock);
 	mutex_init(&bt->rx_lock);
 	bt->aoc_dev = aoc_dev;
 	bt->hdev = hdev;
 	bt->tx_svc = tx_svc;
 	bt->rx_svc = rx_svc;
-	bt->use_aocc_framing = use_framing;
+	bt->ctl_svc = ctl_svc;
+	bt->has_ctl_svc = has_ctl;
+	bt->mode = mode;
+	bt->efw_aoc_hdr_size = LGA_EFW_AOC_HDR_SIZE_DEFAULT;
 	bt->tx_max_msg = tx_max_msg;
 	bt->rx_max_msg = rx_max_msg;
 	bt->max_payload = tx_max_msg - hdr_overhead;
@@ -755,9 +1476,13 @@ static int hci_lga_aoc_attach_locked(void)
 
 	hci_lga_aoc_inst = bt;
 	dev_info(aoc_dev,
-		 "registered %s over AoC TX '%s' (idx=%u mbox=%u) / RX '%s' (idx=%u) max_payload=%zu\n",
-		 hdev->name, tx_svc.name, tx_svc.index, tx_svc.mbox_index,
-		 rx_svc.name, rx_svc.index, bt->max_payload);
+		 "registered %s over AoC mode=%s TX '%s' (idx=%u mbox=%u) / RX '%s' (idx=%u)%s%s%s\n",
+		 hdev->name, hci_lga_aoc_mode_str(mode),
+		 tx_svc.name, tx_svc.index, tx_svc.mbox_index,
+		 rx_svc.name, rx_svc.index,
+		 has_ctl ? " / CTL '" : "",
+		 has_ctl ? ctl_svc.name : "",
+		 has_ctl ? "'" : "");
 	return 0;
 }
 
