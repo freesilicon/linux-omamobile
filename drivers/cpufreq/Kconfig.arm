@@ -83,6 +83,20 @@ config ARM_BRCMSTB_AVS_CPUFREQ
 
 	  Say Y, if you have a Broadcom SoC with AVS support for DFS or DVFS.
 
+config ARM_GOOGLE_LGA_CPUFREQ
+	tristate "Google Laguna (Tensor G5) CPUFreq support"
+	depends on (ARCH_EXYNOS && ARM64) || COMPILE_TEST
+	depends on GOOGLE_MBA_CPM_INTERFACE
+	select PM_OPP
+	select REGMAP_MMIO
+	help
+	  This adds CPUFreq driver support for Google Tensor G5 (Laguna)
+	  SoCs. Per-cluster OPPs are discovered from the Central Power
+	  Manager (CPM) firmware over the CPM mailbox interface, while
+	  frequency transitions use MMIO fast-switch request registers.
+
+	  If in doubt, say N.
+
 config ARM_HIGHBANK_CPUFREQ
 	tristate "Calxeda Highbank-based"
 	depends on ARCH_HIGHBANK || COMPILE_TEST
