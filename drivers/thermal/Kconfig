@@ -530,4 +530,18 @@ config LOONGSON2_THERMAL
 	  is higher than the high temperature threshold or lower than the low
 	  temperature threshold, the interrupt will occur.
 
+config GOOGLE_LGA_TMU
+	tristate "Google Laguna (Tensor G5) CPM thermal sensor driver"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on GOOGLE_MBA_CPM_INTERFACE
+	depends on THERMAL_OF
+	help
+	  Enable support for the Thermal Management Unit (TMU) sensors on
+	  Google Tensor G5 (Laguna) SoCs. Temperatures for CPU clusters and
+	  subsystem domains are queried from the Central Power Manager (CPM)
+	  firmware over the CPM mailbox interface.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called google_lga_tmu.
+
 endif
