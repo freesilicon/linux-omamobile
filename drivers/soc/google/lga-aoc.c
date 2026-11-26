@@ -2071,9 +2071,10 @@ static int lga_aoc_log_show(struct seq_file *s, void *unused)
 	}
 
 	/*
-	 * Snapshot AoC's circular overwrite logging queue non-destructively
-	 * without mutating rx/rp: AoC advances rx together with tx so standard
-	 * queue reads see tx == rx and return -EAGAIN.
+	 * Snapshot AoC's logging queue non-destructively without mutating
+	 * rx/rp so repeated reads inspect the current ring window. AoC stops
+	 * pushing once tx - rx == slots; writing "1"/"clear"/"drain" to this
+	 * file advances rx/rp to unblock live post-boot log lines.
 	 */
 	tx = le32_to_cpu(READ_ONCE(reg->tx));
 	rx = le32_to_cpu(READ_ONCE(reg->rx));
@@ -2091,8 +2092,8 @@ static int lga_aoc_log_show(struct seq_file *s, void *unused)
 	memcpy(snap, aoc->dram + aoc->ipc_offset + offset, total_bytes);
 	mutex_unlock(&aoc->lock);
 
-	seq_printf(s, "# logging up: tx=%u rx=%u wp=%u rp=%u slots=%u size=%u\n",
-		   tx, rx, wp, rp, slots, size);
+	seq_printf(s, "# logging up: tx=%u rx=%u unread=%u wp=%u rp=%u slots=%u size=%u\n",
+		   tx, rx, (u32)(tx - rx), wp, rp, slots, size);
 
 	if (!tx) {
 		seq_puts(s, "(empty)\n");
@@ -2142,7 +2143,86 @@ static int lga_aoc_log_show(struct seq_file *s, void *unused)
 	kvfree(snap);
 	return 0;
 }
-DEFINE_SHOW_ATTRIBUTE(lga_aoc_log);
+
+static int lga_aoc_log_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, lga_aoc_log_show, inode->i_private);
+}
+
+static ssize_t lga_aoc_log_write(struct file *file, const char __user *ubuf,
+				 size_t count, loff_t *ppos)
+{
+	struct seq_file *seq = file->private_data;
+	struct lga_aoc *aoc = seq->private;
+	struct lga_aoc_ipc_service_hdr *hdr;
+	struct lga_aoc_ipc_region *reg;
+	u32 svc_idx = 0, offset, size, slots, tx, wp, i;
+	char cmd[16];
+	bool found = false;
+
+	if (!count || count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+	strim(cmd);
+
+	if (strcmp(cmd, "1") && strcmp(cmd, "clear") &&
+	    strcmp(cmd, "drain") && strcmp(cmd, "reset"))
+		return -EINVAL;
+
+	mutex_lock(&aoc->lock);
+	if (!aoc->online) {
+		mutex_unlock(&aoc->lock);
+		return -ENODEV;
+	}
+
+	for (i = 0; i < aoc->num_services; i++) {
+		if (!strcmp(aoc->services[i].name, "logging")) {
+			svc_idx = i;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		mutex_unlock(&aoc->lock);
+		return -ENOENT;
+	}
+
+	hdr = lga_aoc_service_hdr(aoc, svc_idx);
+	if (!hdr || aoc->services[svc_idx].type != LGA_AOC_SVC_QUEUE) {
+		mutex_unlock(&aoc->lock);
+		return -EOPNOTSUPP;
+	}
+
+	reg = &hdr->regions[LGA_AOC_DIR_UP];
+	offset = le32_to_cpu(reg->offset);
+	size = le32_to_cpu(reg->size);
+	slots = le32_to_cpu(reg->slots);
+	if (!lga_aoc_region_bounds_ok(aoc, offset, size, slots)) {
+		mutex_unlock(&aoc->lock);
+		return -EIO;
+	}
+
+	tx = le32_to_cpu(READ_ONCE(reg->tx));
+	wp = le32_to_cpu(READ_ONCE(reg->wp));
+	dma_rmb();
+
+	WRITE_ONCE(reg->rx, cpu_to_le32(tx));
+	WRITE_ONCE(reg->rp, cpu_to_le32(wp % slots));
+	dma_wmb();
+	mutex_unlock(&aoc->lock);
+
+	return count;
+}
+
+static const struct file_operations lga_aoc_log_fops = {
+	.open = lga_aoc_log_open,
+	.read = seq_read,
+	.write = lga_aoc_log_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 static void lga_aoc_read_soc_info(struct lga_aoc *aoc)
 {
@@ -2383,7 +2463,7 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	debugfs_create_file("ipc_ring", 0400, aoc->debugfs, aoc,
 			    &lga_aoc_ipc_ring_fops);
 	debugfs_create_file("mbox", 0600, aoc->debugfs, aoc, &lga_aoc_mbox_fops);
-	debugfs_create_file("log", 0400, aoc->debugfs, aoc, &lga_aoc_log_fops);
+	debugfs_create_file("log", 0600, aoc->debugfs, aoc, &lga_aoc_log_fops);
 
 	dev_info(dev,
 		 "Laguna AoC ready (cfg=%s board=%#x/%#x soc=%u/%#x carveout=%pa+%#zx mboxes=%u)\n",
