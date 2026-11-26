@@ -1901,7 +1901,6 @@
 			power-domains = <&sswrp_gpu_pd>;
 			iommus = <&gpu_smmu 0>, <&gpu_smmu 1>;
 			iommu-idmapped;
-			dma-coherent;
 			memory-region = <&gpu_fw_rmem>;
 			status = "disabled";
 		};

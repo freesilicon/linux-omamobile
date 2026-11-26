@@ -44,6 +44,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -1671,6 +1672,104 @@ out_unlock:
 	mutex_unlock(&pvr_dev->kccb.ccb.lock);
 }
 
+struct pvr_laguna_ctx_put_work {
+	struct work_struct work;
+	struct pvr_context *ctx;
+};
+
+static void pvr_laguna_ctx_put_worker(struct work_struct *work)
+{
+	struct pvr_laguna_ctx_put_work *item =
+		container_of(work, struct pvr_laguna_ctx_put_work, work);
+
+	pvr_context_put(item->ctx);
+	kfree(item);
+}
+
+static void pvr_laguna_put_ctx_from_irq(struct pvr_device *pvr_dev,
+					struct pvr_context *ctx)
+{
+	struct pvr_laguna_ctx_put_work *item;
+
+	/*
+	 * Fast path: if userspace still holds a reference, drop ours inline
+	 * without risking pvr_context_release() KCCB waits inside IRQ thread.
+	 */
+	if (refcount_dec_not_one(&ctx->ref_count.refcount))
+		return;
+
+	if (pvr_dev->sched_wq) {
+		item = kzalloc_obj(*item, GFP_ATOMIC);
+		if (item) {
+			INIT_WORK(&item->work, pvr_laguna_ctx_put_worker);
+			item->ctx = ctx;
+			queue_work(pvr_dev->sched_wq, &item->work);
+			return;
+		}
+	}
+
+	pvr_context_put(ctx);
+}
+
+static bool pvr_laguna_reset_reason_is_guilty(u32 reason)
+{
+	switch (reason) {
+	case ROGUE_CONTEXT_RESET_REASON_GUILTY_LOCKUP:
+	case ROGUE_CONTEXT_RESET_REASON_GUILTY_OVERRUNING:
+	case ROGUE_CONTEXT_RESET_REASON_WGP_CHECKSUM:
+	case ROGUE_CONTEXT_RESET_REASON_TRP_CHECKSUM:
+	case ROGUE_CONTEXT_RESET_REASON_GPU_ECC_HWR:
+	case ROGUE_CONTEXT_RESET_REASON_FW_ECC_ERR:
+	case ROGUE_CONTEXT_RESET_REASON_FW_WATCHDOG:
+	case ROGUE_CONTEXT_RESET_REASON_FW_PAGEFAULT:
+	case ROGUE_CONTEXT_RESET_REASON_FW_EXEC_ERR:
+	case ROGUE_CONTEXT_RESET_REASON_HOST_WDG_FW_ERR:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void
+pvr_laguna_handle_context_reset(struct pvr_device *pvr_dev,
+				const struct pvr_laguna_fwif_fwccb_ctx_reset *data)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	struct pvr_context *ctx;
+
+	drm_err(from_pvr_device(pvr_dev),
+		"Laguna FW context reset (ctx=%u, dm=%u, reason=%u, job_ref=%u, pc=%#llx, mmu=%#llx/%#llx, cdm_cs=%#llx)\n",
+		data->server_common_context_id, data->dm, data->reset_reason,
+		data->reset_job_ref, data->pc_address, data->mmu_status[0],
+		data->mmu_status[1],
+		laguna ? READ_ONCE(laguna->last_cdm_cs_base) : 0ULL);
+
+	pvr_laguna_log_mmu_fault(pvr_dev, "ctx-reset",
+				 data->mmu_status[0], data->mmu_status[1]);
+
+	ctx = pvr_context_lookup_id(pvr_dev, data->server_common_context_id);
+	if (ctx) {
+		/*
+		 * Fence off guilty reset contexts immediately so a back-to-back
+		 * submit on the same context fails cleanly with -EIO instead of
+		 * re-kicking a reset FW context into hardware (gnoc_error).
+		 */
+		if (pvr_laguna_reset_reason_is_guilty(data->reset_reason))
+			atomic_set(&ctx->faulty, 1);
+
+		if (data->mmu_status[0] & VOLCANIC_CR_MMU_FAULT_STATUS1_FAULT_EN) {
+			u64 fault_va = data->mmu_status[0] &
+				       VOLCANIC_CR_MMU_FAULT_STATUS1_ADDRESS_MASK;
+
+			pvr_vm_dump_va(ctx->vm_ctx, fault_va, "ctx-reset");
+		}
+
+		pvr_laguna_put_ctx_from_irq(pvr_dev, ctx);
+	}
+
+	pvr_laguna_dump_fw_state(pvr_dev, "ctx-reset");
+}
+
 void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 {
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
@@ -1728,20 +1827,8 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 				 cmd.data.fl_reconstruct.freelist_count);
 			break;
 		case PVR_LAGUNA_FWCCB_CMD_CONTEXT_RESET:
-			drm_err(from_pvr_device(pvr_dev),
-				"Laguna FW context reset (ctx=%u, dm=%u, reason=%u, job_ref=%u, pc=%#llx, mmu=%#llx/%#llx, cdm_cs=%#llx)\n",
-				cmd.data.ctx_reset.server_common_context_id,
-				cmd.data.ctx_reset.dm,
-				cmd.data.ctx_reset.reset_reason,
-				cmd.data.ctx_reset.reset_job_ref,
-				cmd.data.ctx_reset.pc_address,
-				cmd.data.ctx_reset.mmu_status[0],
-				cmd.data.ctx_reset.mmu_status[1],
-				READ_ONCE(laguna->last_cdm_cs_base));
-			pvr_laguna_log_mmu_fault(pvr_dev, "ctx-reset",
-						 cmd.data.ctx_reset.mmu_status[0],
-						 cmd.data.ctx_reset.mmu_status[1]);
-			pvr_laguna_dump_fw_state(pvr_dev, "ctx-reset");
+			pvr_laguna_handle_context_reset(pvr_dev,
+							&cmd.data.ctx_reset);
 			break;
 		case PVR_LAGUNA_FWCCB_CMD_DEBUG_DUMP:
 			drm_warn(from_pvr_device(pvr_dev),

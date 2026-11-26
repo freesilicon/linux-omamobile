@@ -92,6 +92,31 @@ dma_addr_t pvr_vm_get_page_table_root_addr(struct pvr_vm_context *vm_ctx)
 }
 
 /**
+ * pvr_vm_dump_va() - Non-blocking dump of page-table entries for a faulting VA.
+ * @vm_ctx: Target VM context.
+ * @device_addr: Faulting device-virtual address.
+ * @tag: Short diagnostic tag for log context.
+ */
+void pvr_vm_dump_va(struct pvr_vm_context *vm_ctx, u64 device_addr,
+		    const char *tag)
+{
+	if (!vm_ctx || !vm_ctx->mmu_ctx)
+		return;
+
+	if (!mutex_trylock(&vm_ctx->lock)) {
+		dma_addr_t pc_pa = pvr_vm_get_page_table_root_addr(vm_ctx);
+
+		drm_err(from_pvr_device(vm_ctx->pvr_dev),
+			"Laguna MMU walk [%s]: va=%#llx pc_pa=%pad (vm lock busy)\n",
+			tag, device_addr, &pc_pa);
+		return;
+	}
+
+	pvr_mmu_dump_va(vm_ctx->mmu_ctx, device_addr, tag);
+	mutex_unlock(&vm_ctx->lock);
+}
+
+/**
  * pvr_vm_get_dma_resv() - Expose the dma_resv owned by the VM context.
  * @vm_ctx: Target VM context.
  *

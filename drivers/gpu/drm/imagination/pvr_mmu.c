@@ -1896,6 +1896,54 @@ dma_addr_t pvr_mmu_get_root_table_dma_addr(struct pvr_mmu_context *ctx)
 }
 
 /**
+ * pvr_mmu_dump_va() - Log raw L2/L1/L0 page-table entries for a device VA.
+ * @ctx: Target MMU context.
+ * @device_addr: Faulting device-virtual address.
+ * @tag: Short diagnostic tag for log context.
+ */
+void pvr_mmu_dump_va(struct pvr_mmu_context *ctx, u64 device_addr,
+		     const char *tag)
+{
+	struct drm_device *drm_dev = from_pvr_device(ctx->pvr_dev);
+	struct pvr_page_table_l2 *l2 = &ctx->page_table_l2;
+	struct pvr_page_table_l1 *l1 = NULL;
+	struct pvr_page_table_l0 *l0 = NULL;
+	u16 l2_idx, l1_idx, l0_idx;
+	u32 pc_val;
+	u64 pd_val = 0, pt_val = 0;
+	dma_addr_t pc_pa = l2->backing_page.dma_addr;
+	dma_addr_t pd_pa = 0, pt_pa = 0;
+
+	if (device_addr >= PVR_PAGE_TABLE_ADDR_SPACE_SIZE) {
+		drm_err(drm_dev,
+			"Laguna MMU walk [%s]: va=%#llx out of range (pc_pa=%pad)\n",
+			tag, device_addr, &pc_pa);
+		return;
+	}
+
+	l2_idx = pvr_page_table_l2_idx(device_addr);
+	l1_idx = pvr_page_table_l1_idx(device_addr);
+	l0_idx = pvr_page_table_l0_idx(device_addr);
+
+	pc_val = READ_ONCE(pvr_page_table_l2_get_entry_raw(l2, l2_idx)->val);
+	l1 = l2->entries[l2_idx];
+	if (l1) {
+		pd_pa = l1->backing_page.dma_addr;
+		pd_val = READ_ONCE(pvr_page_table_l1_get_entry_raw(l1, l1_idx)->val);
+		l0 = l1->entries[l1_idx];
+		if (l0) {
+			pt_pa = l0->backing_page.dma_addr;
+			pt_val = READ_ONCE(pvr_page_table_l0_get_entry_raw(l0, l0_idx)->val);
+		}
+	}
+
+	drm_err(drm_dev,
+		"Laguna MMU walk [%s]: va=%#llx pc_pa=%pad pc[%u]=%#x pd_pa=%pad pd[%u]=%#llx pt_pa=%pad pt[%u]=%#llx\n",
+		tag, device_addr, &pc_pa, l2_idx, pc_val, &pd_pa, l1_idx,
+		pd_val, &pt_pa, l0_idx, pt_val);
+}
+
+/**
  * pvr_page_table_l1_alloc() - Allocate a l1 page_table object.
  * @ctx: MMU context of owning VM context.
  *

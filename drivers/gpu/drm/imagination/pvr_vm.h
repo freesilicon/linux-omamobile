@@ -45,6 +45,8 @@ int pvr_vm_unmap(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size);
 void pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx);
 
 dma_addr_t pvr_vm_get_page_table_root_addr(struct pvr_vm_context *vm_ctx);
+void pvr_vm_dump_va(struct pvr_vm_context *vm_ctx, u64 device_addr,
+		    const char *tag);
 struct dma_resv *pvr_vm_get_dma_resv(struct pvr_vm_context *vm_ctx);
 
 int pvr_static_data_areas_get(const struct pvr_device *pvr_dev,

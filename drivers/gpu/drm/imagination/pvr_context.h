@@ -193,7 +193,7 @@ pvr_context_lookup_id(struct pvr_device *pvr_dev, u32 id)
 	 * destroyed.
 	 */
 	ctx = xa_load(&pvr_dev->ctx_ids, id);
-	if (!kref_get_unless_zero(&ctx->ref_count))
+	if (!ctx || !kref_get_unless_zero(&ctx->ref_count))
 		ctx = NULL;
 
 	xa_unlock(&pvr_dev->ctx_ids);
