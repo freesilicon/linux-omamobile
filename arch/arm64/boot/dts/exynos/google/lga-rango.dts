@@ -301,3 +301,94 @@
 &gpu_stage0_probe {
 	status = "okay";
 };
+
+&spmi0 {
+	master_arb_en = <0>;
+	prescalar = <4>;
+	status = "okay";
+};
+
+&max77779_fg {
+	status = "okay";
+};
+
+&hsios_level_gia_6 {
+	status = "okay";
+};
+
+&inftcu_level_gia_3 {
+	status = "okay";
+};
+
+&inftcu_pulse_gia_0 {
+	status = "okay";
+};
+
+&inf_smmu {
+	status = "okay";
+};
+
+&pinctrl_hsios_stby {
+	status = "okay";
+};
+
+&pinctrl_hsios {
+	status = "okay";
+};
+
+&ufs0 {
+	google,enable-phy-calibration;
+	google,toggle-resetb-on-reset;
+	phy-cal-data = <0x2dd3129 0x2f23329 0x76311e 0x76331e 0x723120 0x723320 0x723122 0x703322
+			0x723124 0x703324 0x1ffe0162 0x3021 0x3221 0x80803022 0x80803222
+			0x80803023 0x80803223 0x3039 0x3239 0x313c 0x333c 0x2010313d 0x2010333d
+			0x2010313e 0x200d333e 0x2014313f 0x200e333f 0x20103140 0x20103340
+			0x20103141 0x200d3341 0x20143142 0x200e3342 0x24383143 0x24383343
+			0x24383144 0x24383344 0x3145 0x3345 0x3146 0x3346 0x1f690163 0xf3024
+			0xf3224 0x7ea33025 0x7ea03225 0x80803026 0x80803226 0x1303a 0x1323a
+			0xf3147 0xf3347 0x20103148 0x20103348 0x23303149 0x208d3349 0x2054314a
+			0x226e334a 0x2010314b 0x2010334b 0x2010314c 0x200d334c 0x2014314d
+			0x200e334d 0x2438314e 0x2338334e 0x2438314f 0x2438334f 0x13150 0x13350
+			0x3151 0x3351>;
+	status = "okay";
+};
+
+/ {
+	wlan_reg_on: regulator-wlan-reg-on {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-reg-on";
+		gpio = <&pinctrl_hsios 13 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <200000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ap2wlan_reg_on_1v2>;
+	};
+};
+
+&hsios_pulse_gia_3 {
+	status = "okay";
+};
+
+&hsios_pulse_gia_4 {
+	status = "okay";
+};
+
+&pcie1 {
+	status = "okay";
+
+	pcie@0,0 {
+		compatible = "pciclass,0604";
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <0x01 0xff>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		vpcie3v3-supply = <&wlan_reg_on>;
+
+		wifi@0,0 {
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			brcm,board-type = "google,lga-rango";
+		};
+	};
+};

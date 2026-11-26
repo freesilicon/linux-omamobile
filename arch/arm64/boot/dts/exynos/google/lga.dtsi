@@ -18,6 +18,7 @@
 #include <dt-bindings/input/linux-event-codes.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "google,lga";
@@ -45,6 +46,7 @@
 		serial0 = &uart16;
 		serial2 = &uart9;
 		ufs0 = &ufs0;
+		pcie1 = &pcie1;
 	};
 
 	/*
@@ -511,6 +513,30 @@
 			rpm-always-on;
 		};
 
+		hsio_s_ufs_prep_pd: hsio_s_ufs_prep_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x18>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			subdomain-id = <0x3>;
+			on-at-init;
+		};
+
+		hsio_s_ufs_pd: hsio_s_ufs_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x18>;
+			power-domains = <&hsio_s_ufs_prep_pd>;
+			subdomain-id = <0x0>;
+			on-at-init;
+			rpm-always-on;
+		};
+
+		hsio_s_pcie_pd: hsio_s_pcie_pd {
+			#power-domain-cells = <0>;
+			sswrp-id = <0x18>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			subdomain-id = <0x1>;
+		};
+
 		sswrp_tpu_pd: sswrp_tpu_pd {
 			#power-domain-cells = <0>;
 			sswrp-id = <0x20>;
@@ -685,6 +711,26 @@
 			clock-id = <0x1>;
 			rates = <0x0 0x493e000 0x0 0x249f000>;
 		};
+
+		hsios_gpio_ref_tcx0_clk: hsios_gpio_ref_tcx0_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x6>;
+			clock-id = <0x3>;
+			use-smc;
+		};
+
+		hsios_aux_clk: hsios_aux_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x6>;
+			clock-id = <0x10>;
+			use-smc;
+		};
+
+		hsios_phy_fw_clk: hsios_phy_fw_clk {
+			#clock-cells = <0>;
+			lpcm-id = <0x6>;
+			clock-id = <0xa>;
+		};
 	};
 
 	cpm_rst: reset-controller {
@@ -766,10 +812,44 @@
 				};
 
 				da9189 {
+					buck_11s_reg: buck_11s {
+						regulator-name = "buck_11s";
+						regulator-min-microvolt = <2500000>;
+						regulator-max-microvolt = <2500000>;
+						google,buck-rail;
+						google,monitor-only;
+						regulator-always-on;
+					};
+
+					buck_13s_reg: buck_13s {
+						regulator-name = "buck_13s";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+						google,buck-rail;
+						google,monitor-only;
+						regulator-always-on;
+					};
+
+					ldo_1s_reg: ldo_1s {
+						regulator-name = "ldo_1s";
+						regulator-min-microvolt = <750000>;
+						regulator-max-microvolt = <750000>;
+						google,monitor-only;
+						regulator-always-on;
+					};
+
 					ldo_18s_reg: ldo_18s {
 						regulator-name = "ldo_18s";
 						regulator-min-microvolt = <3100000>;
 						regulator-max-microvolt = <3100000>;
+					};
+
+					ldo_24s_reg: ldo_24s {
+						regulator-name = "ldo_24s";
+						regulator-min-microvolt = <1200000>;
+						regulator-max-microvolt = <1200000>;
+						google,monitor-only;
+						regulator-always-on;
 					};
 
 					ldo_26s_reg: ldo_26s {
@@ -1163,6 +1243,14 @@
 				output-disable;
 				function = "cpm_int";
 			};
+
+			wlan2ap_host_wake_1v2: wlan2ap_host_wake_1v2 {
+				pins = "XCPM_EINT_8";
+				bias-pull-down;
+				input-enable;
+				output-disable;
+				function = "cpm_int";
+			};
 		};
 
 		pinctrl_aoc: pinctrl@b400000 {
@@ -1385,6 +1473,21 @@
 			power-domains = <&sswrp_hsio_s_pd>;
 			power-domain-names = "pad_function_pd";
 			status = "disabled";
+
+			hsios_stby_ufs_refclk: hsios-stby-ufs-refclk {
+				pins = "XHSIOS_UFS_REFCLK";
+				function = "hsios_stby_ufs";
+				drive-strength = <1>;
+				output-enable;
+				bias-disable;
+			};
+
+			hsios_stby_ufs_refclk_sleep: hsios-stby-ufs-refclk-sleep {
+				pins = "XHSIOS_UFS_REFCLK";
+				function = "hsios_stby_ufs";
+				drive-strength = <0>;
+				bias-pull-down;
+			};
 		};
 
 		pinctrl_hsios: pinctrl@3c590000 {
@@ -1396,7 +1499,86 @@
 			gpio-reserved-ranges = <0x9 0x1>;
 			power-domains = <&sswrp_hsio_s_pd>;
 			power-domain-names = "csr_access_pd";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&hsios_level_gia_6 9>,
+					      <&hsios_level_gia_6 7>,
+					      <&hsios_level_gia_6 8>,
+					      <&hsios_level_gia_6 0>,
+					      <&hsios_level_gia_6 1>,
+					      <&hsios_level_gia_6 2>,
+					      <&hsios_level_gia_6 3>,
+					      <&hsios_level_gia_6 4>,
+					      <&hsios_level_gia_6 10>,
+					      <&hsios_level_gia_6 11>,
+					      <&hsios_level_gia_6 12>,
+					      <&hsios_level_gia_6 5>,
+					      <&hsios_level_gia_6 6>,
+					      <&hsios_level_gia_6 13>;
+			irq-pad-mapping = <0x0 0x1 0x2 0x3 0x4 0x5 0x6 0x7
+					   0x8 0xa 0xb 0xc 0xd 0xe>;
 			status = "disabled";
+
+			hsios_ufs_resetb: hsios-ufs-resetb {
+				pins = "XHSIOS_UFS_RESETB";
+				function = "hsios_ufs";
+				bias-disable;
+				drive-strength = <1>;
+				input-enable;
+				output-enable;
+			};
+
+			hsios_ufs_pwr_en: hsios-ufs-pwr-en {
+				pins = "XHSIOS_UFS_PWR_EN";
+				function = "hsios_ufs";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
+
+			hsios_pcie1_perst: hsios-pcie1-perst {
+				pins = "XHSIOS_PCIE1_PERSTN0";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
+
+			hsios_pcie1_clkreq_func: hsios-pcie1-clkreq-func {
+				pins = "XHSIOS_PCIE1_CLKREQN0";
+				function = "hsios_pcie1";
+				bias-disable;
+				input-enable;
+				output-disable;
+			};
+
+			hsios_pcie1_clkreq_idle: hsios-pcie1-clkreq-idle {
+				pins = "XHSIOS_PCIE1_CLKREQN0";
+				function = "hsios_gpio";
+				bias-disable;
+				input-enable;
+				output-disable;
+			};
+
+			ap2wlan_dev_wake_1v2: ap2wlan-dev-wake-1v2 {
+				pins = "XHSIOS_GPIO5";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
+
+			ap2wlan_reg_on_1v2: ap2wlan-reg-on-1v2 {
+				pins = "XHSIOS_GPIO6";
+				function = "hsios_gpio";
+				bias-disable;
+				drive-strength = <0>;
+				input-enable;
+				output-enable;
+			};
 		};
 
 		pinctrl_lsion: pinctrl@da00000 {
@@ -1574,6 +1756,69 @@
 			status = "disabled";
 		};
 
+		hsios_level_gia_6: interrupt-controller@3c253060 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3c253060 0x0 0x10>;
+			interrupts = <GIC_SPI 669 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			status = "disabled";
+		};
+
+		hsios_pulse_gia_3: interrupt-controller@3c253000 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3c253000 0x0 0x14>;
+			interrupts = <GIC_SPI 558 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			status = "disabled";
+		};
+
+		hsios_pulse_gia_4: interrupt-controller@3c253020 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x3c253020 0x0 0x14>;
+			interrupts = <GIC_SPI 559 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&sswrp_hsio_s_pd>;
+			status = "disabled";
+		};
+
+		inftcu_level_gia_3: interrupt-controller@350d7000 {
+			compatible = "google,level-gia";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x350d7000 0x0 0x10>;
+			interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_HIGH 0>;
+			status = "disabled";
+		};
+
+		inftcu_pulse_gia_0: interrupt-controller@350d1000 {
+			compatible = "google,pulse-gia";
+			interrupt-controller;
+			interrupt-parent = <&inftcu_level_gia_3>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0x350d1000 0x0 0x14>;
+			interrupts = <0>;
+			status = "disabled";
+		};
+
+		inf_smmu: iommu@35100000 {
+			compatible = "arm,smmu-v3";
+			reg = <0x0 0x35100000 0x0 0x40000>;
+			dma-coherent;
+			interrupts-extended = <&inftcu_pulse_gia_0 0>,
+					      <&inftcu_pulse_gia_0 2>,
+					      <&inftcu_pulse_gia_0 7>;
+			interrupt-names = "eventq", "gerror", "priq";
+			#iommu-cells = <1>;
+			arm,instdata-override;
+			arm,max-sid-bits = <16>;
+			status = "disabled";
+		};
+
 		gsa_mba_syscon: syscon@e000000 {
 			compatible = "google,gsa-mba-global", "syscon";
 			reg = <0x0 0x0e000000 0x0 0x30>;
@@ -1684,10 +1929,85 @@
 			      <0x0 0x3c00d210 0x0 0x4>,
 			      <0x0 0x3c00e108 0x0 0x4>;
 			reg-names = "ufs_hc", "ufs_top", "ufs_phy_sram",
-				    "psm_status_hsios", "psm_status_ufs_hc", "psm_status_ufs_phy";
+				    "psm_status_hsios", "psm_status_ufs_hc",
+				    "psm_status_ufs_phy";
+			clocks = <&hsios_gpio_ref_tcx0_clk>, <&hsios_aux_clk>;
+			clock-names = "ref_clk", "aux_clk";
+			interrupts-extended = <&hsios_level_gia_6 17>,
+					      <&gic GIC_SPI 542 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 543 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 544 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 545 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 546 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 547 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 548 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 549 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 550 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 551 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 552 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 553 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 554 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 555 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 556 IRQ_TYPE_LEVEL_HIGH 0>,
+					      <&gic GIC_SPI 557 IRQ_TYPE_LEVEL_HIGH 0>;
+			iommus = <&inf_smmu 0x8100>;
 			resets = <&hsios_resets 0x3>;
 			reset-names = "phy_rst";
+			pinctrl-0 = <&hsios_ufs_resetb &hsios_ufs_pwr_en>;
+			pinctrl-1 = <&hsios_stby_ufs_refclk>;
+			pinctrl-2 = <&hsios_stby_ufs_refclk_sleep>;
+			pinctrl-names = "default", "refclk_on", "refclk_off";
+			reset-gpios = <&pinctrl_hsios 0 GPIO_ACTIVE_HIGH>;
+			power-gpios = <&pinctrl_hsios 8 GPIO_ACTIVE_HIGH>;
+			power-domains = <&hsio_s_ufs_prep_pd>, <&hsio_s_ufs_pd>;
+			power-domain-names = "ufs_prep_pd", "ufs_pd";
+			vdd0p75-supply = <&ldo_1s_reg>;
+			vdd1p2-supply = <&ldo_24s_reg>;
+			vcc-supply = <&buck_11s_reg>;
+			vccq-supply = <&buck_13s_reg>;
 			gsa-device = <&gsa>;
+			dma-coherent;
+			status = "disabled";
+		};
+
+		pcie1: pcie@3c500000 {
+			compatible = "google,lga-pcie";
+			reg = <0x0 0x3c500000 0x0 0x94>,
+			      <0x0 0x3c520000 0x0 0xbc>,
+			      <0x0 0x3c550000 0x0 0xa000>,
+			      <0x0 0x3c800000 0x0 0xd00>,
+			      <0x0 0x3cb00000 0x0 0x1000>,
+			      <0x0 0x60000000 0x0 0x100000>;
+			reg-names = "sii", "top", "phy_sram", "dbi", "atu", "config";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			device_type = "pci";
+			linux,pci-domain = <1>;
+			bus-range = <0x00 0xff>;
+			ranges = <0x01000000 0x0 0x60100000 0x0 0x60100000 0x0 0x100000>,
+				 <0x02000000 0x0 0x60200000 0x0 0x60200000 0x0 0x1fe00000>;
+			clocks = <&hsios_phy_fw_clk>, <&hsios_aux_clk>;
+			clock-names = "phy_fw", "aux_clk";
+			resets = <&hsios_resets 4>,
+				 <&hsios_resets 0>,
+				 <&hsios_resets 1>,
+				 <&hsios_resets 2>;
+			reset-names = "init", "perst", "app_hold_phy", "power_up";
+			power-domains = <&hsio_s_pcie_pd>;
+			interrupts-extended = <&gic GIC_SPI 524 IRQ_TYPE_EDGE_RISING 0>,
+					      <&hsios_pulse_gia_4 14>,
+					      <&hsios_pulse_gia_3 17>;
+			interrupt-names = "msi", "cpl_timeout", "link_down";
+			iommu-map = <0x100 &inf_smmu 0x8000 0x1>;
+			pinctrl-names = "default", "idle";
+			pinctrl-0 = <&hsios_pcie1_clkreq_func &hsios_pcie1_perst>;
+			pinctrl-1 = <&hsios_pcie1_clkreq_idle &hsios_pcie1_perst>;
+			perstn-gpios = <&pinctrl_hsios 11 GPIO_ACTIVE_LOW>;
+			google,perst-delay-us = <18000>;
+			google,posted-rx-q-data-credits = <0x51>;
+			google,skip-link-equalization;
+			num-lanes = <1>;
+			max-link-speed = <3>;
 			dma-coherent;
 			status = "disabled";
 		};
@@ -1866,6 +2186,33 @@
 			reg-names = "gpu_control", "pvtc", "pvtc_pwroff", "dts", "rgx";
 			power-domains = <&sswrp_gpu_pd>;
 			status = "disabled";
+		};
+
+		spmi0: spmi@53f1000 {
+			compatible = "smartdv,spmi";
+			reg = <0x0 0x053f1000 0x0 0x300>;
+			clock-frequency = <19200000>;
+			master_id = <0>;
+			spmi_ver = <1>;
+			arb_retry_limit = <6>;
+			read_latancy = <0>;
+			arb_scl_delay = <0>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			max77779_pmic: pmic@f {
+				compatible = "maxim,max77779pmic-spmi";
+				reg = <0xf SPMI_USID>;
+			};
+
+			max77779_fg: fuel-gauge@6 {
+				compatible = "maxim,max77779fg-spmi";
+				reg = <0x6 SPMI_USID>;
+				max77779,pmic = <&max77779_pmic>;
+				shunt-resistor-micro-ohms = <2000>;
+				status = "disabled";
+			};
 		};
 	};
 

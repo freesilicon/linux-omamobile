@@ -6,9 +6,11 @@
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/spmi.h>
 #include <linux/workqueue.h>
 
 #define MAX77779_STATUS		0x00
@@ -30,8 +32,10 @@
 #define MAX77779_ABSENT		BIT(3)
 #define MAX77779_NOT_READY	GENMASK(1, 0)
 
-/* The PMIC function of the same chip, a second I2C address */
+/* The PMIC function of the same chip, a second I2C or SPMI address */
 #define MAX77779_PMIC_ADDR	0x66
+#define MAX77779_PMIC_ID	0x00
+#define MAX77779_PMIC_ID_VAL	0x79
 #define MAX77779_PMIC_FW_REV	0x62
 #define MAX77779_PMIC_FW_SUB_REV	0x63
 
@@ -293,23 +297,16 @@ static void max77779_cancel_poll(void *data)
  * second address on the same bus; read it without claiming that address, so
  * a PMIC driver can still bind there. Unknown firmware: no temperature.
  */
-static bool max77779_temp_valid(struct i2c_client *client)
+static bool max77779_fw_temp_valid(struct device *dev, u8 rev, u8 sub)
 {
-	union i2c_smbus_data rev, sub;
-
-	if (i2c_smbus_xfer(client->adapter, MAX77779_PMIC_ADDR, 0, I2C_SMBUS_READ,
-			   MAX77779_PMIC_FW_REV, I2C_SMBUS_BYTE_DATA, &rev) ||
-	    i2c_smbus_xfer(client->adapter, MAX77779_PMIC_ADDR, 0, I2C_SMBUS_READ,
-			   MAX77779_PMIC_FW_SUB_REV, I2C_SMBUS_BYTE_DATA, &sub))
-		return false;
-	dev_dbg(&client->dev, "Firmware %u.%u\n", rev.byte, sub.byte);
-	return rev.byte > 1 || (rev.byte == 1 && sub.byte >= 15);
+	dev_dbg(dev, "Firmware %u.%u\n", rev, sub);
+	return rev > 1 || (rev == 1 && sub >= 15);
 }
 
-static int max77779_probe(struct i2c_client *client)
+static int max77779_probe_common(struct device *dev, struct regmap *map,
+				 bool temp_valid)
 {
 	struct power_supply_config config = {};
-	struct device *dev = &client->dev;
 	struct max77779_battery *battery;
 	u32 raw;
 	int ret;
@@ -322,20 +319,19 @@ static int max77779_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "Sense resistor is required\n");
 	if (battery->rsense < 100 || battery->rsense > 100000)
 		return -EINVAL;
-	battery->map = devm_regmap_init_i2c(client, &max77779_regmap);
-	if (IS_ERR(battery->map))
-		return PTR_ERR(battery->map);
+	battery->map = map;
 	ret = regmap_read(battery->map, MAX77779_DEVNAME, &raw);
 	if (ret)
 		return ret;
-	if ((raw >> 8) != 0x51 && (raw >> 8) != 0x62 && (raw >> 8) != 0x63)
+	if ((raw >> 8) != 0x51 && (raw >> 8) != 0x52 &&
+	    (raw >> 8) != 0x62 && (raw >> 8) != 0x63)
 		return -ENODEV;
 	ret = max77779_ready(battery, &raw);
 	if (ret)
 		return dev_err_probe(dev, ret, "Firmware model is not ready\n");
 	if (raw & MAX77779_POR)
 		dev_warn(dev, "Power-on reset, no model reloaded: state of charge from the gauge's defaults\n");
-	battery->temp_valid = max77779_temp_valid(client);
+	battery->temp_valid = temp_valid;
 	config.drv_data = battery;
 	config.fwnode = dev_fwnode(dev);
 	battery->supply = devm_power_supply_register(dev, &max77779_supply, &config);
@@ -351,11 +347,34 @@ static int max77779_probe(struct i2c_client *client)
 	return 0;
 }
 
-static const struct of_device_id max77779_of_match[] = {
+#if IS_ENABLED(CONFIG_I2C)
+static bool max77779_i2c_temp_valid(struct i2c_client *client)
+{
+	union i2c_smbus_data rev, sub;
+
+	if (i2c_smbus_xfer(client->adapter, MAX77779_PMIC_ADDR, 0, I2C_SMBUS_READ,
+			   MAX77779_PMIC_FW_REV, I2C_SMBUS_BYTE_DATA, &rev) ||
+	    i2c_smbus_xfer(client->adapter, MAX77779_PMIC_ADDR, 0, I2C_SMBUS_READ,
+			   MAX77779_PMIC_FW_SUB_REV, I2C_SMBUS_BYTE_DATA, &sub))
+		return false;
+	return max77779_fw_temp_valid(&client->dev, rev.byte, sub.byte);
+}
+
+static int max77779_i2c_probe(struct i2c_client *client)
+{
+	struct regmap *map;
+
+	map = devm_regmap_init_i2c(client, &max77779_regmap);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+	return max77779_probe_common(&client->dev, map, max77779_i2c_temp_valid(client));
+}
+
+static const struct of_device_id max77779_i2c_of_match[] = {
 	{ .compatible = "maxim,max77779-fg" },
 	{}
 };
-MODULE_DEVICE_TABLE(of, max77779_of_match);
+MODULE_DEVICE_TABLE(of, max77779_i2c_of_match);
 
 static const struct i2c_device_id max77779_ids[] = {
 	{ "max77779-battery" },
@@ -363,15 +382,123 @@ static const struct i2c_device_id max77779_ids[] = {
 };
 MODULE_DEVICE_TABLE(i2c, max77779_ids);
 
-static struct i2c_driver max77779_driver = {
+static struct i2c_driver max77779_i2c_driver = {
 	.driver = {
 		.name = "max77779-battery",
-		.of_match_table = max77779_of_match,
+		.of_match_table = max77779_i2c_of_match,
 	},
-	.probe = max77779_probe,
+	.probe = max77779_i2c_probe,
 	.id_table = max77779_ids,
 };
-module_i2c_driver(max77779_driver);
+#endif
+
+#if IS_ENABLED(CONFIG_SPMI)
+static int max77779_spmi_reg_read(void *context, unsigned int reg,
+				  unsigned int *val)
+{
+	struct spmi_device *sdev = context;
+	__le16 raw;
+	int ret;
+
+	ret = spmi_ext_register_read(sdev, reg, (u8 *)&raw, sizeof(raw));
+	if (ret)
+		return ret;
+	*val = le16_to_cpu(raw);
+	return 0;
+}
+
+static int max77779_spmi_reg_write(void *context, unsigned int reg,
+				   unsigned int val)
+{
+	return -EROFS;
+}
+
+static const struct regmap_bus max77779_spmi_regmap_bus = {
+	.reg_read = max77779_spmi_reg_read,
+	.reg_write = max77779_spmi_reg_write,
+	.val_format_endian_default = REGMAP_ENDIAN_LITTLE,
+};
+
+static bool max77779_spmi_temp_valid(struct spmi_device *sdev)
+{
+	struct device_node *pmic_np;
+	struct spmi_device *pmic;
+	u8 id, rev, sub;
+	bool valid = false;
+
+	pmic_np = of_parse_phandle(sdev->dev.of_node, "max77779,pmic", 0);
+	if (!pmic_np)
+		return false;
+	pmic = spmi_find_device_by_of_node(pmic_np);
+	of_node_put(pmic_np);
+	if (!pmic)
+		return false;
+
+	if (!spmi_ext_register_read(pmic, MAX77779_PMIC_ID, &id, 1) &&
+	    id == MAX77779_PMIC_ID_VAL &&
+	    !spmi_ext_register_read(pmic, MAX77779_PMIC_FW_REV, &rev, 1) &&
+	    !spmi_ext_register_read(pmic, MAX77779_PMIC_FW_SUB_REV, &sub, 1))
+		valid = max77779_fw_temp_valid(&sdev->dev, rev, sub);
+
+	spmi_device_put(pmic);
+	return valid;
+}
+
+static int max77779_spmi_probe(struct spmi_device *sdev)
+{
+	struct regmap *map;
+
+	map = devm_regmap_init(&sdev->dev, &max77779_spmi_regmap_bus, sdev,
+			       &max77779_regmap);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+	return max77779_probe_common(&sdev->dev, map, max77779_spmi_temp_valid(sdev));
+}
+
+static const struct of_device_id max77779_spmi_of_match[] = {
+	{ .compatible = "maxim,max77779fg-spmi" },
+	{}
+};
+MODULE_DEVICE_TABLE(of, max77779_spmi_of_match);
+
+static struct spmi_driver max77779_spmi_driver = {
+	.driver = {
+		.name = "max77779-battery-spmi",
+		.of_match_table = max77779_spmi_of_match,
+	},
+	.probe = max77779_spmi_probe,
+};
+#endif
+
+static int __init max77779_battery_init(void)
+{
+	int ret = 0;
+
+	if (IS_ENABLED(CONFIG_I2C)) {
+		ret = i2c_add_driver(&max77779_i2c_driver);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_SPMI)) {
+		ret = spmi_driver_register(&max77779_spmi_driver);
+		if (ret) {
+			if (IS_ENABLED(CONFIG_I2C))
+				i2c_del_driver(&max77779_i2c_driver);
+			return ret;
+		}
+	}
+	return 0;
+}
+module_init(max77779_battery_init);
+
+static void __exit max77779_battery_exit(void)
+{
+	if (IS_ENABLED(CONFIG_SPMI))
+		spmi_driver_unregister(&max77779_spmi_driver);
+	if (IS_ENABLED(CONFIG_I2C))
+		i2c_del_driver(&max77779_i2c_driver);
+}
+module_exit(max77779_battery_exit);
 
 MODULE_DESCRIPTION("Read-only MAX77779 fuel gauge with a retained firmware model");
 MODULE_LICENSE("GPL");

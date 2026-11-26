@@ -82,6 +82,7 @@ BRCMF_FW_CLM_DEF(4389C1, "brcmfmac4389c1-pcie");
 BRCMF_FW_CLM_DEF(4383, "brcmfmac4383-pcie");
 /* BCM4398 rev 3, d0 (Pixel 8 Pro): the owner's firmware set */
 BRCMF_FW_CLM_DEF(4398D0, "brcmfmac4398d0-pcie");
+BRCMF_FW_CLM_DEF(4390, "brcmfmac4390-pcie");
 BRCMF_FW_CLM_DEF(54591, "brcmfmac54591-pcie");
 
 /* firmware config files */
@@ -125,6 +126,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
 	BRCMF_FW_ENTRY(BRCM_CC_4389_CHIP_ID, 0xFFFFFFFF, 4389C1),
 	BRCMF_FW_ENTRY(BRCM_CC_4383_CHIP_ID, 0xFFFFFFFF, 4383),
+	BRCMF_FW_ENTRY(BRCM_CC_4390_CHIP_ID, 0xFFFFFFFF, 4390),
 	BRCMF_FW_ENTRY(BRCM_CC_4398_CHIP_ID, 0xFFFFFFF8, 4398D0),
 };
 
@@ -861,6 +863,7 @@ brcmf_pcie_select_core(struct brcmf_pciedev_info *devinfo, u16 coreid)
 static bool brcmf_pcie_is_4389_family(struct brcmf_pciedev_info *devinfo)
 {
 	return devinfo->pdev->device == BRCM_PCIE_4389_DEVICE_ID ||
+	       devinfo->pdev->device == BRCM_PCIE_4390_DEVICE_ID ||
 	       devinfo->pdev->device == BRCM_PCIE_4398_DEVICE_ID;
 }
 
@@ -874,6 +877,7 @@ static u32 brcmf_pcie_srpwr_domains(struct brcmf_pciedev_info *devinfo)
 {
 	switch (devinfo->pdev->device) {
 	case BRCM_PCIE_4389_DEVICE_ID:
+	case BRCM_PCIE_4390_DEVICE_ID:
 		return BRCMF_PCIE_SRPWR_DMN_ALL;
 	case BRCM_PCIE_4398_DEVICE_ID:
 		/* and the scan MAC and SAQM domains (si_srpwr_domain_all_mask()) */
@@ -2400,7 +2404,8 @@ static void brcmf_pcie_db7_trap(struct brcmf_pciedev_info *devinfo)
 {
 	u32 flags2;
 
-	if (devinfo->pdev->device != BRCM_PCIE_4398_DEVICE_ID ||
+	if ((devinfo->pdev->device != BRCM_PCIE_4398_DEVICE_ID &&
+	     devinfo->pdev->device != BRCM_PCIE_4390_DEVICE_ID) ||
 	    !devinfo->shared.tcm_base_address)
 		return;
 
@@ -2496,7 +2501,8 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
 	 * dhdpcie_wait_readshared_area_addr(), "boot intr"). Interrupts are
 	 * not set up yet, so poll for it.
 	 */
-	if (devinfo->pdev->device == BRCM_PCIE_4398_DEVICE_ID) {
+	if (devinfo->pdev->device == BRCM_PCIE_4398_DEVICE_ID ||
+	    devinfo->pdev->device == BRCM_PCIE_4390_DEVICE_ID) {
 		u32 mbint = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET +
 			    devinfo->reginfo->mailboxint;
 		u32 intstatus = 0;
@@ -3714,6 +3720,7 @@ static const struct pci_device_id brcmf_pcie_devid_table[] = {
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4387_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4389_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4383_DEVICE_ID, WCC_SEED),
+	BRCMF_PCIE_DEVICE(BRCM_PCIE_4390_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4398_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43752_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(CY_PCIE_54591_DEVICE_ID, CYW),

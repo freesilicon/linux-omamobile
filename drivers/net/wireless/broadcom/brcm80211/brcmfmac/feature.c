@@ -169,6 +169,7 @@ static void brcmf_feat_wlc_version_overrides(struct brcmf_pub *drv)
 	 */
 	if ((drv->bus_if->chip == BRCM_CC_4389_CHIP_ID ||
 	     drv->bus_if->chip == BRCM_CC_4383_CHIP_ID ||
+	     drv->bus_if->chip == BRCM_CC_4390_CHIP_ID ||
 	     drv->bus_if->chip == BRCM_CC_4398_CHIP_ID) &&
 	    ((major == 14 && (minor == 2 || minor == 4)) ||
 	     (major == 16 && minor >= 1) || major >= 17))
@@ -380,8 +381,9 @@ void brcmf_feat_attach(struct brcmf_pub *drvr)
 
 	brcmf_fwvid_feat_attach(ifp);
 
-	/* Host-built 802.3 + LLC/SNAP TX headers: the BCM4389 and BCM4398 for now */
+	/* Host-built 802.3 + LLC/SNAP TX headers: BCM4389/4390/4398 for now */
 	if (drvr->bus_if->chip != BRCM_CC_4389_CHIP_ID &&
+	    drvr->bus_if->chip != BRCM_CC_4390_CHIP_ID &&
 	    drvr->bus_if->chip != BRCM_CC_4398_CHIP_ID)
 		drvr->feat_flags &= ~BIT(BRCMF_FEAT_HOST_SFHLLC);
 
@@ -393,6 +395,7 @@ void brcmf_feat_attach(struct brcmf_pub *drvr)
 	 * authentication. Leave the handshakes to the host.
 	 */
 	if (drvr->bus_if->chip == BRCM_CC_4383_CHIP_ID ||
+	    drvr->bus_if->chip == BRCM_CC_4390_CHIP_ID ||
 	    drvr->bus_if->chip == BRCM_CC_4398_CHIP_ID)
 		drvr->feat_flags &= ~(BIT(BRCMF_FEAT_FWSUP) | BIT(BRCMF_FEAT_SAE) |
 				      BIT(BRCMF_FEAT_FWAUTH));

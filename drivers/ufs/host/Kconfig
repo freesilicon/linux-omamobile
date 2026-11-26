@@ -168,3 +168,14 @@ config SCSI_UFS_AMD_VERSAL2
 
 	  Select this if you have UFS controller on AMD Versal Gen 2 SoC.
 	  If unsure, say N.
+
+config SCSI_UFS_GOOGLE
+	tristate "Google Tensor UFS host controller driver"
+	depends on SCSI_UFSHCD_PLATFORM && (ARCH_EXYNOS || ARM64 || COMPILE_TEST)
+	help
+	  This selects the Google Tensor (Laguna) UFS host controller
+	  platform driver.
+
+	  Select this if you have a UFS host controller on a Google Tensor
+	  SoC.
+	  If unsure, say N.

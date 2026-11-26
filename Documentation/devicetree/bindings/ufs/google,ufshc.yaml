@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/ufs/google,ufshc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor (Laguna) Universal Flash Storage (UFS) Controller
+
+maintainers:
+  - Bobby Bones <saariuscrypto@gmail.com>
+
+properties:
+  compatible:
+    const: google,ufshc
+
+  reg:
+    minItems: 2
+    maxItems: 6
+
+  reg-names:
+    minItems: 2
+    maxItems: 6
+
+  clocks:
+    minItems: 1
+    maxItems: 2
+
+  clock-names:
+    minItems: 1
+    items:
+      - const: ref_clk
+      - const: aux_clk
+
+  interrupts:
+    minItems: 1
+    maxItems: 17
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: phy_rst
+
+  reset-gpios:
+    maxItems: 1
+
+  power-gpios:
+    maxItems: 1
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
+
+  power-domain-names:
+    minItems: 1
+    items:
+      - const: ufs_prep_pd
+      - const: ufs_pd
+
+  vdd0p75-supply:
+    description: Phandle to 0.75V UFS PHY supply regulator.
+
+  vdd1p2-supply:
+    description: Phandle to 1.2V UFS PHY supply regulator.
+
+  gsa-device:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the GSA remote processor/crypto device node.
+
+  phy-cal-data:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Array of packed 16-bit M-PHY indirect APB address and value pairs
+      (val << 16 | addr).
+
+  google,enable-phy-calibration:
+    type: boolean
+    description: Apply board-specific M-PHY indirect APB calibration table.
+
+  google,skip-ufs-phy-init:
+    type: boolean
+    description: Skip M-PHY RMMI/SRAM/calibration initialization sequence.
+
+  google,skip-mcq-multi-intr:
+    type: boolean
+    description: Disable per-queue MCQ interrupt registration.
+
+  google,toggle-resetb-on-reset:
+    type: boolean
+    description: Toggle reset GPIO on UFS device reset callback.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - interrupts
+  - resets
+  - reset-names
+
+allOf:
+  - $ref: ufs-common.yaml
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/gpio/gpio.h>
+
+    ufs@3c400000 {
+        compatible = "google,ufshc";
+        reg = <0x0 0x3c400000 0x0 0x1000>,
+              <0x0 0x3c410000 0x0 0x504>;
+        reg-names = "ufs_hc", "ufs_top";
+        clocks = <&hsios_gpio_ref_tcx0_clk>, <&hsios_aux_clk>;
+        clock-names = "ref_clk", "aux_clk";
+        interrupts = <GIC_SPI 541 IRQ_TYPE_LEVEL_HIGH>;
+        resets = <&hsios_resets 3>;
+        reset-names = "phy_rst";
+        reset-gpios = <&pinctrl_hsios 0 GPIO_ACTIVE_HIGH>;
+        power-gpios = <&pinctrl_hsios 8 GPIO_ACTIVE_HIGH>;
+        google,enable-phy-calibration;
+        phy-cal-data = <0x2f13129 0x2f63329>;
+    };

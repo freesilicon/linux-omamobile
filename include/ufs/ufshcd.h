@@ -817,6 +817,11 @@ enum ufshcd_quirks {
 	 * allowed by M-PHY spec ver 6.0.
 	 */
 	UFSHCD_QUIRK_EXTENDED_TX_EQTR_ADAPT_LENGTH_L0L1L2L3	= 1 << 28,
+
+	/*
+	 * Set the Initiator ID (IID) field to 1 in UTP UPIU headers.
+	 */
+	UFSHCD_QUIRK_SET_IID_TO_ONE			= 1 << 29,
 };
 
 enum ufshcd_caps {
