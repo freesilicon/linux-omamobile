@@ -1342,6 +1342,30 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 		 pow_st, faults, hwr_flags, cr_poll_addr, cr_poll_mask,
 		 regs_active ? 1U : 0U, irq_os0, ev_stat, scratch14,
 		 spu_en, clk_ctrl0, mmu1, mmu2, mmu_meta);
+	if (regs_active) {
+		u64 cdm_cs_cr = pvr_cr_read64(pvr_dev, VOLCANIC_CR_CDM_CTRL_STREAM_BASE);
+		u32 cdm_csw = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_CONTEXT_STORE_STATUS);
+		u32 cdm_dir = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_DIRECT_STREAM);
+		u64 tpu_tag = pvr_cr_read64(pvr_dev, VOLCANIC_CR_TPU_TAG_CDM_CTRL);
+		u32 usrm0 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_0);
+		u32 usrm1 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_1);
+		u32 usrm2 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_CDM_USRM_2);
+		u32 spu_p0 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_POWER_0);
+		u32 spu_p1 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_POWER_1);
+		u32 spu_p2 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_POWER_2);
+		u32 spu_p3 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_POWER_3);
+		u64 usc_s0 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_0);
+		u64 usc_s1 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_1);
+		u64 usc_s2 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_USC_SLOTS_2);
+
+		drm_warn(drm_dev,
+			 "Laguna CDM/SPU [%s]: cs=%#llx csw=%#x dir=%#x tpu_tag=%#llx usrm=%#x/%#x/%#x spu_p=%#x/%#x/%#x/%#x\n",
+			 reason, cdm_cs_cr, cdm_csw, cdm_dir, tpu_tag,
+			 usrm0, usrm1, usrm2, spu_p0, spu_p1, spu_p2, spu_p3);
+		drm_warn(drm_dev,
+			 "Laguna USC slots [%s]: 0=%#018llx 1=%#018llx 2=%#018llx\n",
+			 reason, usc_s0, usc_s1, usc_s2);
+	}
 	if (mmu1 || mmu2)
 		pvr_laguna_log_mmu_fault(pvr_dev, reason, mmu1, mmu2);
 
@@ -1385,12 +1409,12 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 
 	if (laguna->fwif_hwrinfobuf) {
 		struct pvr_laguna_fwif_hwrinfobuf *hwr = laguna->fwif_hwrinfobuf;
+		u32 hwr_cnt = READ_ONCE(hwr->hwr_counter);
+		u32 wr_idx = READ_ONCE(hwr->write_index);
 
 		drm_warn(drm_dev,
-			 "Laguna HWR [%s]: wr_idx(gp=%u cdm=%u) lockup(gp=%u tdm=%u geom=%u 3d=%u cdm=%u) cdm_overrun=%u cdm_rej=%u\n",
-			 reason,
-			 READ_ONCE(hwr->write_index[PVR_LAGUNA_DM_GP]),
-			 READ_ONCE(hwr->write_index[PVR_LAGUNA_DM_CDM]),
+			 "Laguna HWR [%s]: cnt=%u wr_idx=%u lockup(gp=%u tdm=%u geom=%u 3d=%u cdm=%u) cdm_overrun=%u cdm_rej=%u\n",
+			 reason, hwr_cnt, wr_idx,
 			 READ_ONCE(hwr->dm_lockup_cnt[PVR_LAGUNA_DM_GP]),
 			 READ_ONCE(hwr->dm_lockup_cnt[PVR_LAGUNA_DM_TDM]),
 			 READ_ONCE(hwr->dm_lockup_cnt[PVR_LAGUNA_DM_GEOM]),
@@ -1398,6 +1422,24 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 			 READ_ONCE(hwr->dm_lockup_cnt[PVR_LAGUNA_DM_CDM]),
 			 READ_ONCE(hwr->dm_overrun_cnt[PVR_LAGUNA_DM_CDM]),
 			 READ_ONCE(hwr->dm_rejected_cnt[PVR_LAGUNA_DM_CDM]));
+
+		if (hwr_cnt > 0U) {
+			u32 max_idx = PVR_LAGUNA_HWRINFOBUF_MAX_ENTRIES - 1U;
+			u32 slot = (wr_idx == 8U && hwr_cnt > 8U) ?
+				   max_idx :
+				   (wr_idx ? min_t(u32, wr_idx - 1U, max_idx) : 0U);
+			const struct pvr_laguna_fwif_hwr_info *hi = &hwr->hwr_info[slot];
+
+			drm_warn(drm_dev,
+				 "Laguna HWR[%u] [%s]: num=%u dm=%u type=%u flags=%#x ev=%#x cr768=%#x cr648=%#x pid=%u frame=%u proc=%.16s\n",
+				 slot, reason, READ_ONCE(hi->hwr_number),
+				 READ_ONCE(hi->dm), READ_ONCE(hi->hwr_type),
+				 READ_ONCE(hi->recovery_flags),
+				 READ_ONCE(hi->cr_event_status),
+				 READ_ONCE(hi->cr_0768), READ_ONCE(hi->cr_0648),
+				 READ_ONCE(hi->pid), READ_ONCE(hi->frame_num),
+				 hi->proc_name);
+		}
 	}
 
 	if (laguna->fwif_tracebuf) {
@@ -1946,6 +1988,8 @@ int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
 	dst->frame_num = src->common.frame_num;
 	dst->regs.tpu_border_colour_table = src->regs.tpu_border_colour_table;
 	dst->regs.tpu_tag_cdm_ctrl = src->regs.tpu_tag_cdm_ctrl;
+	if (!dst->regs.tpu_tag_cdm_ctrl)
+		dst->regs.tpu_tag_cdm_ctrl = PVR_LAGUNA_TPU_TAG_CDM_CTRL_DEFAULT;
 	dst->regs.cdm_ctrl_stream_base = src->regs.cdm_ctrl_stream_base;
 	dst->regs.cdm_resume_pds1 = src->regs.cdm_resume_pds1;
 	dst->regs.cdm_context_state_base_addr =

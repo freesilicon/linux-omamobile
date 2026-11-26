@@ -99,6 +99,12 @@ static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
 #define PVR_LAGUNA_CDM_FLAG_DIRECT_STREAM	BIT(4)
 
 /*
+ * Default Volcanic CR 0x1878 (TPU_TAG_CDM_CTRL) value: General heap base
+ * plus 0x80 shifted right by 2 ((0x8000000000 + 0x80) >> 2).
+ */
+#define PVR_LAGUNA_TPU_TAG_CDM_CTRL_DEFAULT	0x2000000020ULL
+
+/*
  * DDK 25.3 Volcanic RGXFWIF_CDM_REGISTERS (56 bytes, loaded at CMDCDM + 0x08).
  * Matches the live Volcanic firmware register-load order:
  *   +0x00: CR 0x17a8 (TPU_BORDER_COLOUR_TABLE_CDM)
@@ -231,11 +237,13 @@ static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, wgp_checksum) == 0x58);
 #define PVR_LAGUNA_FWIF_HWPERF_CTL_SIZE		4096U
 #define PVR_LAGUNA_FWIF_TRACE_BUF_DWORDS	4096U
 
-/* DDK 25.3 HWRINFOBUF counter offsets (2464 bytes total, 9 DMs). */
+/* DDK 25.3 HWRINFOBUF layout (2464 bytes total: 16x144 B records + 9 DMs). */
+#define PVR_LAGUNA_HWRINFOBUF_MAX_ENTRIES	16U
+#define PVR_LAGUNA_HWRINFOBUF_COUNTER_OFF	0x900U
+#define PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF	0x904U
 #define PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF	0x910U
 #define PVR_LAGUNA_HWRINFOBUF_OVERRUN_OFF	0x934U
 #define PVR_LAGUNA_HWRINFOBUF_REJECTED_OFF	0x958U
-#define PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF	0x97cU
 
 struct pvr_laguna_fwif_connection_ctl {
 	u32 connection_fw_state;
@@ -449,22 +457,57 @@ struct pvr_laguna_fwif_tracebuf_space {
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_tracebuf_space) == 424);
 
+struct pvr_laguna_fwif_hwr_info {
+	u32 data[8];
+	u64 cr_timer;
+	u64 os_timer;
+	u32 frame_num;
+	u32 pid;
+	u32 active_hwr_cmd;
+	u32 hwr_number;
+	u32 cr_event_status;
+	u32 recovery_flags;
+	u32 hwr_type;
+	u32 dm;
+	u32 core_id;
+	u32 pad_54;
+	u64 cr_timer_start;
+	u32 reserved_60[6];
+	char proc_name[16];
+	u32 cr_0768;
+	u32 cr_0648;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_hwr_info) == 0x90);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, cr_event_status) == 0x40);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, recovery_flags) == 0x44);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, hwr_type) == 0x48);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, dm) == 0x4c);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, proc_name) == 0x78);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, cr_0768) == 0x88);
+static_assert(offsetof(struct pvr_laguna_fwif_hwr_info, cr_0648) == 0x8c);
+
 struct pvr_laguna_fwif_hwrinfobuf {
-	u8 hwr_info[PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF];
+	struct pvr_laguna_fwif_hwr_info hwr_info[PVR_LAGUNA_HWRINFOBUF_MAX_ENTRIES];
+	u32 hwr_counter;
+	u32 write_index;
+	u32 dd_req;
+	u32 reserved_90c;
 	u32 dm_lockup_cnt[PVR_LAGUNA_DM_MAX];
 	u32 dm_overrun_cnt[PVR_LAGUNA_DM_MAX];
 	u32 dm_rejected_cnt[PVR_LAGUNA_DM_MAX];
-	u32 write_index[PVR_LAGUNA_DM_MAX];
+	u32 reserved_97c[PVR_LAGUNA_DM_MAX];
 } __aligned(8);
 static_assert(sizeof(struct pvr_laguna_fwif_hwrinfobuf) == PVR_LAGUNA_FWIF_HWRINFOBUF_SIZE);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, hwr_counter) ==
+	      PVR_LAGUNA_HWRINFOBUF_COUNTER_OFF);
+static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, write_index) ==
+	      PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF);
 static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_lockup_cnt) ==
 	      PVR_LAGUNA_HWRINFOBUF_LOCKUP_OFF);
 static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_overrun_cnt) ==
 	      PVR_LAGUNA_HWRINFOBUF_OVERRUN_OFF);
 static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, dm_rejected_cnt) ==
 	      PVR_LAGUNA_HWRINFOBUF_REJECTED_OFF);
-static_assert(offsetof(struct pvr_laguna_fwif_hwrinfobuf, write_index) ==
-	      PVR_LAGUNA_HWRINFOBUF_WRITE_IDX_OFF);
 
 /* DDK 25.3 Volcanic RGXFWIF_FREELIST (72 bytes, verified against RGXCreateFreeList). */
 struct pvr_laguna_fwif_freelist {
