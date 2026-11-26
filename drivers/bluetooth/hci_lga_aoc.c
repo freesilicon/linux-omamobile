@@ -201,10 +201,15 @@ module_param(efw_uart_baud, uint, 0644);
 MODULE_PARM_DESC(efw_uart_baud,
 		 "Optional UART baud rate sent via EFW ConfigUART after SetPower (0=keep AoC default)");
 
-static int efw_uart_flow = -1;
-module_param(efw_uart_flow, int, 0644);
-MODULE_PARM_DESC(efw_uart_flow,
-		 "Optional EFW ConfigUART flow mode (-1=keep AoC default, 0/1=no flow, 2=HW RTS/CTS)");
+static int efw_uart_stop_bits = -1;
+module_param(efw_uart_stop_bits, int, 0644);
+MODULE_PARM_DESC(efw_uart_stop_bits,
+		 "Optional EFW ConfigUART stop_bits field (-1=keep AoC default 115200 8N1, 1=1 stop bit, 2=2 stop bits)");
+
+static bool efw_cts_probe;
+module_param(efw_cts_probe, bool, 0644);
+MODULE_PARM_DESC(efw_cts_probe,
+		 "On HCI Reset timeout, send >64B HCI_Reset burst to trigger AoC UART TX mismatch / MSR.CTS check (default: false)");
 
 static bool toggle_bt_power = true;
 module_param(toggle_bt_power, bool, 0644);
@@ -524,9 +529,9 @@ static int hci_lga_aoc_efw_send_fb_u8_2(struct hci_lga_aoc *bt, u8 union_type,
 					  NULL, 0, fb, sizeof(fb));
 }
 
-/* Canonical 44-byte FlatBuffer for ConfigUART (union_type=5: u32 baud, u8 flow) */
+/* Canonical 44-byte FlatBuffer for ConfigUART (union_type=5: u32 baud, u8 stop_bits) */
 static int hci_lga_aoc_efw_send_fb_uart(struct hci_lga_aoc *bt, u32 baud,
-					u8 flow)
+					u8 stop_bits)
 {
 	u8 fb[44] = {};
 
@@ -544,7 +549,7 @@ static int hci_lga_aoc_efw_send_fb_uart(struct hci_lga_aoc *bt, u32 baud,
 	put_unaligned_le16(8, fb + 30);
 	put_unaligned_le32(8, fb + 32);
 	put_unaligned_le32(baud, fb + 36);
-	fb[40] = flow;
+	fb[40] = stop_bits;
 
 	return hci_lga_aoc_efw_send_frame(bt, LGA_EFW_MSG_FLATBUFFER,
 					  LGA_EFW_FLAG_NORMAL,
@@ -663,6 +668,20 @@ static bool hci_lga_aoc_efw_decode_reply(const u8 *fb, u32 len,
 	return true;
 }
 
+static const char *hci_lga_aoc_efw_pkt_tag_str(u8 tag)
+{
+	switch (tag) {
+	case 0x1f:
+		return "AP->Ctrl";
+	case 0xef:
+		return "Ctrl->AoC";
+	case 0xfe:
+		return "UART->Ctrl";
+	default:
+		return "pkt";
+	}
+}
+
 static void hci_lga_aoc_efw_log_debug_dump(struct hci_lga_aoc *bt, u32 seq,
 					   const u8 *payload, size_t body_len)
 {
@@ -688,8 +707,9 @@ static void hci_lga_aoc_efw_log_debug_dump(struct hci_lga_aoc *bt, u32 seq,
 			if (off + 6U > body_len)
 				return;
 			dev_info(bt->aoc_dev,
-				 "EFW dbg t=%ums power_state=%u\n",
-				 ts_ms, payload[off + 5U]);
+				 "EFW dbg t=%ums power_state=%u (%s)\n",
+				 ts_ms, payload[off + 5U],
+				 payload[off + 5U] == 0 ? "ON" : "other");
 			off += 6U;
 			break;
 		case 0x01:
@@ -724,15 +744,28 @@ static void hci_lga_aoc_efw_log_debug_dump(struct hci_lga_aoc *bt, u32 seq,
 				 ts_ms, payload[off + 5U]);
 			off += 6U;
 			break;
-		default: {
-			size_t rem = body_len - off;
+		default:
+			if (tag >= 0x10 && off + 7U <= body_len) {
+				u16 pkt_len = get_unaligned_le16(payload + off + 5U);
+				size_t stored = min_t(size_t, pkt_len, 8U);
 
+				if (off + 7U + stored <= body_len) {
+					dev_info(bt->aoc_dev,
+						 "EFW dbg t=%ums %s(tag=%#02x len=%u): %*ph\n",
+						 ts_ms,
+						 hci_lga_aoc_efw_pkt_tag_str(tag),
+						 tag, pkt_len, (int)stored,
+						 payload + off + 7U);
+					off += 7U + stored;
+					break;
+				}
+			}
 			dev_info(bt->aoc_dev,
 				 "EFW dbg t=%ums tag=%#02x tail(%zuB): %*ph\n",
-				 ts_ms, tag, rem,
-				 (int)min_t(size_t, rem, 32U), payload + off);
+				 ts_ms, tag, body_len - off,
+				 (int)min_t(size_t, body_len - off, 32U),
+				 payload + off);
 			return;
-		}
 		}
 	}
 }
@@ -754,7 +787,7 @@ static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
 		if (hci_lga_aoc_efw_decode_reply(payload, payload_len,
 						 &utype, &state))
 			dev_info(bt->aoc_dev,
-				 "EFW reply seq=%u reply_to=%u len=%u fb_type=%u state=%u (%s): %*ph\n",
+				 "EFW reply seq=%u reply_to=%u len=%u fb_type=%u chre_offload_state=%u (%s): %*ph\n",
 				 seq, reply_seq, payload_len, utype, state,
 				 utype == 1 ? hci_lga_aoc_efw_state_str(state) : "n/a",
 				 (int)min_t(u32, payload_len, 32U), payload);
@@ -793,6 +826,15 @@ static void hci_lga_aoc_efw_handle_frame(struct hci_lga_aoc *bt,
 		    payload[3] == 0x14 && payload[4] == 0x5a)
 			hci_lga_aoc_efw_log_debug_dump(bt, seq, payload,
 						       body_len);
+		else if (msg_type == LGA_EFW_MSG_HCI_TX_OR_EVT &&
+			 body_len == 6U && payload[0] == 0xff &&
+			 payload[1] == 0x04 && payload[2] == 0x58 &&
+			 payload[3] == 0x05 && payload[4] == 0x00)
+			dev_info(bt->aoc_dev,
+				 "EFW hw_err seq=%u code=%#02x (%s)\n",
+				 seq, payload[5],
+				 payload[5] == 0xe2 ?
+				 "UART TX mismatch / CTS stall" : "other");
 		else
 			dev_info(bt->aoc_dev,
 				 "EFW rx msg_type=%u seq=%u len=%zu: %*ph\n",
@@ -1348,10 +1390,10 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 			goto err_stop_efw;
 		}
 
-		if (efw_pmic_ctrl && efw_power_cycle) {
+		if (efw_power_cycle) {
 			ret = hci_lga_aoc_efw_send_fb_u8_2(bt,
 							   LGA_EFW_FB_SET_POWER,
-							   0, 1);
+							   0, efw_pmic_ctrl ? 1 : 0);
 			if (ret) {
 				bt_dev_err(hdev,
 					   "EFW SetPower(off) cycle failed: %d",
@@ -1363,6 +1405,15 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 			msleep(30);
 		}
 
+		/*
+		 * When AP drives VBR_ON (efw_pmic_ctrl=0), latch BT_REG_ON
+		 * before SetPower(1, 0) muxes XAOC_UART0 and asserts
+		 * BT_DEV_WAKE, matching AoC's own SetPower(1, 1) ordering so
+		 * UART/wake pads stay idle across the BT_REG_ON rising edge.
+		 */
+		if (!efw_pmic_ctrl)
+			hci_lga_aoc_power_on(bt);
+
 		ret = hci_lga_aoc_efw_send_fb_u8_2(bt, LGA_EFW_FB_SET_POWER,
 						   1, efw_pmic_ctrl ? 1 : 0);
 		if (ret) {
@@ -1372,14 +1423,7 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 
 		lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
 				     msecs_to_jiffies(500));
-
-		/*
-		 * When AP drives VBR_ON (efw_pmic_ctrl=0), toggle after AoC
-		 * has muxed XAOC_UART0 and asserted BT_DEV_WAKE.
-		 */
-		if (!efw_pmic_ctrl)
-			hci_lga_aoc_power_on(bt);
-		else
+		if (efw_pmic_ctrl)
 			msleep(150);
 
 		if (efw_lpm_timeout >= 0) {
@@ -1395,16 +1439,16 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 					    lpm_en, lpm_to, ret);
 		}
 
-		if (efw_uart_baud || efw_uart_flow >= 0) {
+		if (efw_uart_baud || efw_uart_stop_bits >= 0) {
 			u32 baud = efw_uart_baud ?: 115200U;
-			u8 flow = efw_uart_flow >= 0 ?
-				  (u8)min(efw_uart_flow, 2) : 1U;
+			u8 stop_bits = efw_uart_stop_bits >= 0 ?
+				       (u8)min(efw_uart_stop_bits, 2) : 1U;
 
-			ret = hci_lga_aoc_efw_send_fb_uart(bt, baud, flow);
+			ret = hci_lga_aoc_efw_send_fb_uart(bt, baud, stop_bits);
 			if (ret)
 				bt_dev_warn(hdev,
-					    "EFW ConfigUART(%u, flow=%u) failed: %d",
-					    baud, flow, ret);
+					    "EFW ConfigUART(%u, stop_bits=%u) failed: %d",
+					    baud, stop_bits, ret);
 		}
 
 		ret = hci_lga_aoc_efw_send_fb_empty(bt, LGA_EFW_FB_QUERY_STATE,
@@ -1551,6 +1595,26 @@ static int hci_lga_aoc_setup(struct hci_dev *hdev)
 			   PTR_ERR(skb));
 		if (bt->mode == HCI_LGA_AOC_MODE_EFW && debug_rx &&
 		    bt->efw_connected && lga_aoc_is_online(bt->aoc_dev)) {
+			if (efw_cts_probe) {
+				static const u8 hci_rst[3] = { 0x03, 0x0c, 0x00 };
+				u8 prefix[2] = { 1U, HCI_COMMAND_PKT };
+				unsigned int i;
+
+				/*
+				 * Exceed the 64-byte DW-APB TX FIFO so AoC's
+				 * UART write helper hits its 2s timeout and
+				 * emits vendor error 0xe2 if MSR.CTS == 0.
+				 */
+				for (i = 0; i < 18U; i++)
+					hci_lga_aoc_efw_send_frame(bt,
+								   LGA_EFW_MSG_HCI_TX_OR_EVT,
+								   LGA_EFW_FLAG_NORMAL,
+								   prefix, sizeof(prefix),
+								   hci_rst, sizeof(hci_rst));
+				lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
+						     msecs_to_jiffies(2500));
+				msleep(2200);
+			}
 			hci_lga_aoc_efw_send_fb_empty(bt, LGA_EFW_FB_DUMP_DEBUG,
 						      LGA_EFW_FLAG_NORMAL);
 			lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
