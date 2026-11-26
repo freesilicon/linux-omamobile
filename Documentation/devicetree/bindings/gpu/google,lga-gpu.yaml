@@ -59,8 +59,6 @@ properties:
       Request an identity (stage-1 bypass) IOMMU domain on gpu_smmu so the
       PowerVR MMUv4 handles GPU virtual-to-physical translation directly.
 
-  dma-coherent: true
-
   memory-region:
     maxItems: 1
     description:
@@ -97,6 +95,5 @@ examples:
         power-domains = <&sswrp_gpu_pd>;
         iommus = <&gpu_smmu 0>, <&gpu_smmu 1>;
         iommu-idmapped;
-        dma-coherent;
         memory-region = <&gpu_fw_rmem>;
     };
