@@ -112,6 +112,10 @@ properties:
     maxItems: 1
     description: Optional Bluetooth device-wakeup GPIO for AoC-routed Bluetooth
 
+  bt-wlan-reg-on-gpios:
+    maxItems: 1
+    description: Optional combo-chip WL_REG_ON GPIO for AoC-routed Bluetooth
+
   wakeup-source: true
 
 required:
