@@ -16,6 +16,7 @@ struct device;
 #define GSA_AOC_STATE_LOADED		1	/* loaded, in reset */
 #define GSA_AOC_STATE_RUNNING		2
 #define GSA_AOC_STATE_SUSPENDED		3
+#define GSA_AOC_STATE_ERROR		4	/* fault / failed start */
 
 /* enum gsa_aoc_cmd */
 #define GSA_AOC_GET_STATE		0

@@ -14,6 +14,7 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/pinctrl/machine.h>
@@ -25,6 +26,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/soc/google/lga-aoc.h>
 #include <linux/spinlock.h>
 
 #include "../core.h"
@@ -68,7 +70,11 @@ struct google_pinctrl {
 	bool rpm_ref_held;
 	bool wakeup_capable;
 	bool suspended;
+	bool aoc_ssr_active;
 };
+
+static DEFINE_MUTEX(google_aoc_ssr_lock);
+static struct google_pinctrl *google_aoc_pinctrl;
 
 static bool google_is_shared_reg(const struct google_pinctrl *gctl,
 				 unsigned int pad, unsigned int reg_off)
@@ -95,12 +101,20 @@ static void __iomem *google_pad_reg(const struct google_pinctrl *gctl,
 static u32 google_pad_read(const struct google_pinctrl *gctl,
 			   unsigned int pad, unsigned int reg_off)
 {
+	if (READ_ONCE(gctl->aoc_ssr_active) &&
+	    !google_is_shared_reg(gctl, pad, reg_off))
+		return 0;
+
 	return readl(google_pad_reg(gctl, pad, reg_off));
 }
 
 static void google_pad_write(const struct google_pinctrl *gctl,
 			     unsigned int pad, unsigned int reg_off, u32 val)
 {
+	if (READ_ONCE(gctl->aoc_ssr_active) &&
+	    !google_is_shared_reg(gctl, pad, reg_off))
+		return;
+
 	writel(val, google_pad_reg(gctl, pad, reg_off));
 }
 
@@ -911,10 +925,72 @@ static void google_pinctrl_detach_pds(void *data)
 		dev_pm_domain_detach(gctl->csr_access_pd, true);
 
 	if (gctl->pad_function_pd) {
-		pm_runtime_put_sync(gctl->pad_function_pd);
+		if (!READ_ONCE(gctl->aoc_ssr_active))
+			pm_runtime_put_sync(gctl->pad_function_pd);
 		dev_pm_domain_detach(gctl->pad_function_pd, true);
 	}
 }
+
+static void google_pinctrl_unregister_aoc_ssr(void *data)
+{
+	struct google_pinctrl *gctl = data;
+
+	mutex_lock(&google_aoc_ssr_lock);
+	if (google_aoc_pinctrl == gctl)
+		google_aoc_pinctrl = NULL;
+	mutex_unlock(&google_aoc_ssr_lock);
+}
+
+int google_pinctrl_aoc_ssr_request(bool active)
+{
+	struct google_pinctrl *gctl;
+	unsigned long flags;
+	int ret = 0;
+
+	mutex_lock(&google_aoc_ssr_lock);
+	gctl = google_aoc_pinctrl;
+	if (!gctl || !gctl->pad_function_pd) {
+		mutex_unlock(&google_aoc_ssr_lock);
+		return 0;
+	}
+
+	if (active) {
+		if (!gctl->aoc_ssr_active) {
+			raw_spin_lock_irqsave(&gctl->lock, flags);
+			WRITE_ONCE(gctl->aoc_ssr_active, true);
+			raw_spin_unlock_irqrestore(&gctl->lock, flags);
+
+			ret = pm_runtime_put_sync(gctl->pad_function_pd);
+			if (ret < 0) {
+				dev_warn(gctl->dev,
+					 "failed to release AoC pad_function_pd for SSR: %d\n",
+					 ret);
+				raw_spin_lock_irqsave(&gctl->lock, flags);
+				WRITE_ONCE(gctl->aoc_ssr_active, false);
+				raw_spin_unlock_irqrestore(&gctl->lock, flags);
+			} else {
+				ret = 0;
+			}
+		}
+	} else {
+		if (gctl->aoc_ssr_active) {
+			ret = pm_runtime_resume_and_get(gctl->pad_function_pd);
+			if (ret < 0) {
+				dev_warn(gctl->dev,
+					 "failed to restore AoC pad_function_pd after SSR: %d\n",
+					 ret);
+			} else {
+				raw_spin_lock_irqsave(&gctl->lock, flags);
+				WRITE_ONCE(gctl->aoc_ssr_active, false);
+				raw_spin_unlock_irqrestore(&gctl->lock, flags);
+				ret = 0;
+			}
+		}
+	}
+	mutex_unlock(&google_aoc_ssr_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(google_pinctrl_aoc_ssr_request);
 
 static int google_pinctrl_attach_pds(struct google_pinctrl *gctl)
 {
@@ -1187,6 +1263,19 @@ int google_pinctrl_probe(struct platform_device *pdev,
 		pm_runtime_put_autosuspend(dev);
 	}
 
+	if (gctl->pad_function_pd &&
+	    of_device_is_compatible(dev->of_node, "google,lga-aoc-pinctrl")) {
+		mutex_lock(&google_aoc_ssr_lock);
+		google_aoc_pinctrl = gctl;
+		mutex_unlock(&google_aoc_ssr_lock);
+
+		ret = devm_add_action_or_reset(dev,
+					       google_pinctrl_unregister_aoc_ssr,
+					       gctl);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(google_pinctrl_probe);
@@ -1212,7 +1301,7 @@ static int google_pinctrl_suspend_noirq(struct device *dev)
 	gctl->suspended = true;
 	google_wake_irq_mask_update(gctl, false);
 
-	if (gctl->pad_function_pd)
+	if (gctl->pad_function_pd && !READ_ONCE(gctl->aoc_ssr_active))
 		pm_runtime_put_sync(gctl->pad_function_pd);
 
 	return pm_runtime_force_suspend(dev);
@@ -1227,7 +1316,7 @@ static int google_pinctrl_resume_noirq(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (gctl->pad_function_pd)
+	if (gctl->pad_function_pd && !READ_ONCE(gctl->aoc_ssr_active))
 		pm_runtime_resume_and_get(gctl->pad_function_pd);
 
 	google_wake_irq_mask_update(gctl, true);

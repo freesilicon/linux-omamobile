@@ -73,4 +73,13 @@ ssize_t lga_aoc_ipc_read_timeout(struct device *dev, u32 service_idx,
 				 void *buf, size_t max_len,
 				 unsigned long timeout);
 
+#if IS_REACHABLE(CONFIG_PINCTRL_GOOGLE)
+int google_pinctrl_aoc_ssr_request(bool active);
+#else
+static inline int google_pinctrl_aoc_ssr_request(bool active)
+{
+	return 0;
+}
+#endif
+
 #endif /* __LINUX_SOC_GOOGLE_LGA_AOC_H */

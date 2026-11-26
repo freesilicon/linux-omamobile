@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -74,6 +75,7 @@
 #define LGA_AOC_MAX_IOMMU_MAPS		33U
 #define LGA_AOC_START_TIMEOUT_MS	10000U
 #define LGA_AOC_START_POLL_MS		50U
+#define LGA_AOC_PD_OFF_TIMEOUT_MS	5000U
 #define LGA_AOC_DEFAULT_FW		"aoc.bin"
 #define LGA_AOC_DEFAULT_COREDUMP_MBOX	19U
 #define LGA_AOC_DEFAULT_BOARD_ID	0x20202U
@@ -230,6 +232,9 @@ struct lga_aoc {
 	struct device *dev;
 	struct device *gsa;
 	struct device *pd_devs[2];
+	struct notifier_block sswrp_pd_nb;
+	struct completion sswrp_off_done;
+	bool sswrp_pd_nb_added;
 	bool sswrp_pd_on;
 	bool core_pd_on;
 
@@ -317,6 +322,8 @@ static const char *lga_aoc_gsa_state_str(int state)
 		return "running";
 	case GSA_AOC_STATE_SUSPENDED:
 		return "suspended";
+	case GSA_AOC_STATE_ERROR:
+		return "error";
 	default:
 		return "unknown";
 	}
@@ -942,6 +949,69 @@ static u32 lga_aoc_read_cb_magic(const struct lga_aoc_control_block *cb)
 	return le32_to_cpu(READ_ONCE(cb->magic));
 }
 
+static int lga_aoc_sswrp_pd_notify(struct notifier_block *nb,
+				   unsigned long action, void *data)
+{
+	struct lga_aoc *aoc = container_of(nb, struct lga_aoc, sswrp_pd_nb);
+
+	if (action == GENPD_NOTIFY_OFF)
+		complete(&aoc->sswrp_off_done);
+
+	return NOTIFY_OK;
+}
+
+static int lga_aoc_power_cycle_sswrp(struct lga_aoc *aoc)
+{
+	int pinctrl_ret, ret;
+
+	if (!aoc->pd_devs[0] || !aoc->sswrp_pd_on)
+		return 0;
+
+	/* Ensure subdomain vote is dropped before cycling sswrp_aoc_pd */
+	lga_aoc_core_pd_set(aoc, false);
+
+	pinctrl_ret = google_pinctrl_aoc_ssr_request(true);
+	if (pinctrl_ret)
+		dev_warn(aoc->dev,
+			 "failed to pause AoC pinctrl for SSWRP reset: %d\n",
+			 pinctrl_ret);
+
+	reinit_completion(&aoc->sswrp_off_done);
+	ret = pm_runtime_put_sync(aoc->pd_devs[0]);
+	if (ret < 0) {
+		dev_err(aoc->dev, "failed to drop sswrp_aoc_pd: %d\n", ret);
+		if (!pinctrl_ret)
+			google_pinctrl_aoc_ssr_request(false);
+		return ret;
+	}
+	aoc->sswrp_pd_on = false;
+
+	if (aoc->sswrp_pd_nb_added) {
+		if (!wait_for_completion_timeout(&aoc->sswrp_off_done,
+						 msecs_to_jiffies(LGA_AOC_PD_OFF_TIMEOUT_MS)))
+			dev_warn(aoc->dev,
+				 "timed out waiting for sswrp_aoc_pd power-off\n");
+		else
+			dev_info(aoc->dev,
+				 "sswrp_aoc_pd powered off for AoC reset\n");
+	}
+
+	ret = pm_runtime_resume_and_get(aoc->pd_devs[0]);
+	if (ret < 0)
+		dev_err(aoc->dev, "failed to re-enable sswrp_aoc_pd: %d\n", ret);
+	else
+		aoc->sswrp_pd_on = true;
+
+	if (!pinctrl_ret)
+		google_pinctrl_aoc_ssr_request(false);
+
+	if (aoc->sswrp_pd_on && aoc->lcpm &&
+	    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
+		writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+
+	return ret < 0 ? ret : 0;
+}
+
 static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 {
 	const struct lga_aoc_control_block *cb;
@@ -961,12 +1031,15 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 		return ret;
 
 	ret = lga_aoc_set_supplies(aoc, true);
-	if (ret)
+	if (ret) {
+		lga_aoc_core_pd_set(aoc, false);
 		return ret;
+	}
 
 	ret = gsa_aoc_start(aoc->gsa);
 	if (ret) {
 		lga_aoc_set_supplies(aoc, false);
+		lga_aoc_core_pd_set(aoc, false);
 		return ret;
 	}
 
@@ -981,6 +1054,8 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 			dev_err(aoc->dev,
 				"timed out waiting for AoC control block (magic %#x)\n",
 				magic);
+			lga_aoc_set_supplies(aoc, false);
+			lga_aoc_core_pd_set(aoc, false);
 			return -ETIMEDOUT;
 		}
 		wait_event_timeout(aoc->ipc_wq,
@@ -989,8 +1064,11 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 	}
 
 	ret = lga_aoc_discover_services(aoc);
-	if (ret)
+	if (ret) {
+		lga_aoc_set_supplies(aoc, false);
+		lga_aoc_core_pd_set(aoc, false);
 		return ret;
+	}
 
 	/* Release boot vote on aoc_core_pd once AoC reports online */
 	lga_aoc_core_pd_set(aoc, false);
@@ -998,13 +1076,26 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 	return 0;
 }
 
-static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online)
+static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
+			       bool reset_sswrp)
 {
-	int ret;
+	int ret, pd_ret = 0;
 
 	*was_online = aoc->online;
 	aoc->online = false;
 	wake_up_all(&aoc->ipc_wq);
+
+	if (aoc->dram && aoc->ipc_offset &&
+	    aoc->ipc_offset + sizeof(struct lga_aoc_control_block) <= aoc->dram_size) {
+		struct lga_aoc_control_block *cb =
+			(struct lga_aoc_control_block *)(aoc->dram + aoc->ipc_offset);
+
+		WRITE_ONCE(cb->magic, 0);
+		dma_wmb();
+	}
+
+	/* Hold aoc_core_pd awake while GSA performs AoC shutdown/unload */
+	lga_aoc_core_pd_set(aoc, true);
 
 	ret = gsa_aoc_stop(aoc->gsa);
 	lga_aoc_set_supplies(aoc, false);
@@ -1014,10 +1105,13 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online)
 	kfree(aoc->services);
 	aoc->services = NULL;
 	aoc->num_services = 0;
-	if (!ret)
+	if (!ret) {
 		aoc->loaded = false;
+		if (reset_sswrp)
+			pd_ret = lga_aoc_power_cycle_sswrp(aoc);
+	}
 
-	return ret;
+	return ret ?: pd_ret;
 }
 
 int lga_aoc_find_service(struct device *dev, const char *name,
@@ -1567,7 +1661,7 @@ static ssize_t lga_aoc_stop_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 
 	mutex_lock(&aoc->lock);
-	ret = lga_aoc_stop_locked(aoc, &was_online);
+	ret = lga_aoc_stop_locked(aoc, &was_online, true);
 	mutex_unlock(&aoc->lock);
 
 	if (was_online)
@@ -1734,6 +1828,11 @@ static void lga_aoc_detach_pds(void *data)
 		aoc->sswrp_pd_on = false;
 	}
 
+	if (aoc->sswrp_pd_nb_added && !IS_ERR_OR_NULL(aoc->pd_devs[0])) {
+		dev_pm_genpd_remove_notifier(aoc->pd_devs[0]);
+		aoc->sswrp_pd_nb_added = false;
+	}
+
 	for (i = ARRAY_SIZE(aoc->pd_devs) - 1; i >= 0; i--) {
 		if (!IS_ERR_OR_NULL(aoc->pd_devs[i])) {
 			dev_pm_domain_detach(aoc->pd_devs[i], true);
@@ -1746,6 +1845,9 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 {
 	static const char * const pd_names[] = { "sswrp_aoc_pd", "aoc_core_pd" };
 	int i, ret;
+
+	init_completion(&aoc->sswrp_off_done);
+	aoc->sswrp_pd_nb.notifier_call = lga_aoc_sswrp_pd_notify;
 
 	if (of_count_phandle_with_args(aoc->dev->of_node, "power-domains",
 				       "#power-domain-cells") < 2)
@@ -1763,6 +1865,15 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 	}
 
 	if (aoc->pd_devs[0]) {
+		ret = dev_pm_genpd_add_notifier(aoc->pd_devs[0],
+						&aoc->sswrp_pd_nb);
+		if (ret)
+			dev_warn(aoc->dev,
+				 "failed to register sswrp_aoc_pd notifier: %d\n",
+				 ret);
+		else
+			aoc->sswrp_pd_nb_added = true;
+
 		ret = pm_runtime_resume_and_get(aoc->pd_devs[0]);
 		if (ret) {
 			dev_err(aoc->dev, "failed to power on sswrp_aoc_pd: %d\n",
@@ -1962,7 +2073,7 @@ static void lga_aoc_remove(struct platform_device *pdev)
 
 	mutex_lock(&aoc->lock);
 	if (aoc->loaded || aoc->online)
-		lga_aoc_stop_locked(aoc, &was_online);
+		lga_aoc_stop_locked(aoc, &was_online, false);
 	else
 		lga_aoc_set_supplies(aoc, false);
 	mutex_unlock(&aoc->lock);

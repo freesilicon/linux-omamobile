@@ -709,13 +709,22 @@ static int gsa_tz_hwmgr_cmd(struct gsa *gsa, struct gsa_tz *tz,
 	ret = gsa_tz_xchg(tz, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0)
 		return ret;
-	if (ret != sizeof(rsp) || rsp.hdr_cmd != (req.hdr_cmd | HWMGR_CMD_RESP)) {
-		dev_err(gsa->dev, "TZ: bad reply (len %d, cmd 0x%08x)\n",
+	if (ret < (int)(sizeof(rsp.hdr_cmd) + sizeof(rsp.err))) {
+		dev_err(gsa->dev, "TZ: short reply (len %d)\n", ret);
+		return -EIO;
+	}
+	if (rsp.hdr_cmd != (req.hdr_cmd | HWMGR_CMD_RESP)) {
+		dev_err(gsa->dev, "TZ: bad reply cmd (len %d, cmd 0x%08x)\n",
 			ret, rsp.hdr_cmd);
 		return -EIO;
 	}
 	if (rsp.err) {
 		dev_err(gsa->dev, "TZ: %s cmd %u: err %u\n", name, cmd, rsp.err);
+		return -EIO;
+	}
+	if (ret != sizeof(rsp)) {
+		dev_err(gsa->dev, "TZ: bad reply len (%d, expected %zu)\n",
+			ret, sizeof(rsp));
 		return -EIO;
 	}
 	return rsp.state;
@@ -906,7 +915,15 @@ int gsa_aoc_stop(struct device *dev)
 			return ret;
 	}
 
-	return gsa_unload_aoc_fw_image(dev);
+	ret = gsa_unload_aoc_fw_image(dev);
+	if (ret && state != GSA_AOC_STATE_LOADED &&
+	    state != GSA_AOC_STATE_RUNNING &&
+	    state != GSA_AOC_STATE_SUSPENDED) {
+		if (gsa_send_aoc_cmd(dev, GSA_AOC_SHUTDOWN) >= 0)
+			ret = gsa_unload_aoc_fw_image(dev);
+	}
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(gsa_aoc_stop);
 
@@ -1003,7 +1020,7 @@ DEFINE_SHOW_ATTRIBUTE(gsa_sjtag_status);
 static const char *gsa_aoc_state_name(int state)
 {
 	static const char * const names[] = {
-		"inactive", "loaded", "running", "suspended"
+		"inactive", "loaded", "running", "suspended", "error"
 	};
 
 	return state >= 0 && state < ARRAY_SIZE(names) ? names[state] : "?";
