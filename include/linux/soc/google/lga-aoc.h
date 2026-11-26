@@ -61,6 +61,9 @@ int lga_aoc_ring_doorbell(struct device *dev, unsigned int mbox_idx);
 
 bool lga_aoc_ipc_can_read(struct device *dev, u32 service_idx);
 bool lga_aoc_ipc_can_write(struct device *dev, u32 service_idx);
+bool lga_aoc_ipc_tx_pending(struct device *dev, u32 service_idx);
+int lga_aoc_ipc_flush_tx(struct device *dev, u32 service_idx,
+			 unsigned long timeout);
 
 ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 			  const void *buf, size_t len);

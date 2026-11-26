@@ -58,8 +58,10 @@
 #define LGA_AOC_PQ_SUBHDR_OFF		0x4630U
 #define LGA_AOC_IMG_CFG_SIZE		256U
 
-/* LCPM scratch register cleared during Laguna probe */
+/* LCPM scratch/status registers */
+#define LGA_AOC_LCPM_RESET_OFF		0x400U
 #define LGA_AOC_LCPM_INIT_OFF		0x480U
+#define LGA_AOC_LOG_DRAIN_MAX		256U
 
 /* Four heaps reserved at the top of the AoC carve-out (total 0x434000) */
 #define LGA_AOC_AUX_HEAP_SIZE		SZ_128K
@@ -437,9 +439,12 @@ static int lga_aoc_core_pd_set(struct lga_aoc *aoc, bool enable)
 		dev_warn(aoc->dev, "failed to release aoc_core_pd: %d\n", ret);
 	aoc->core_pd_on = false;
 
-	if (ret >= 0 && aoc->core_pd_nb_added)
-		wait_for_completion_timeout(&aoc->core_off_done,
-					    msecs_to_jiffies(LGA_AOC_PD_OFF_TIMEOUT_MS));
+	if (ret >= 0 && aoc->core_pd_nb_added) {
+		if (!wait_for_completion_timeout(&aoc->core_off_done,
+						 msecs_to_jiffies(LGA_AOC_PD_OFF_TIMEOUT_MS)))
+			dev_warn(aoc->dev,
+				 "timed out waiting for aoc_core_pd power-off\n");
+	}
 
 	return 0;
 }
@@ -1077,9 +1082,17 @@ static int lga_aoc_power_cycle_sswrp(struct lga_aoc *aoc)
 	if (!pinctrl_ret)
 		google_pinctrl_aoc_ssr_request(false);
 
-	if (aoc->sswrp_pd_on && aoc->lcpm &&
-	    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
-		writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+	if (aoc->sswrp_pd_on) {
+		int dev_pm_ret;
+
+		if (aoc->lcpm &&
+		    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
+			writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+
+		dev_pm_ret = pm_runtime_resume_and_get(aoc->dev);
+		if (dev_pm_ret >= 0)
+			pm_runtime_put(aoc->dev);
+	}
 
 	return ret < 0 ? ret : 0;
 }
@@ -1125,11 +1138,18 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 		if (time_after(jiffies, deadline)) {
 			int gsa_state = gsa_send_aoc_cmd(aoc->gsa,
 							 GSA_AOC_GET_STATE);
+			u32 lcpm_rst = 0, lcpm_init = 0;
+
+			if (aoc->lcpm &&
+			    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32)) {
+				lcpm_rst = readl(aoc->lcpm + LGA_AOC_LCPM_RESET_OFF);
+				lcpm_init = readl(aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+			}
 
 			dev_err(aoc->dev,
-				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d)\n",
+				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d lcpm %#x/%#x)\n",
 				magic, le32_to_cpu(READ_ONCE(cb->status)),
-				gsa_state);
+				gsa_state, lcpm_rst, lcpm_init);
 			lga_aoc_set_supplies(aoc, false);
 			lga_aoc_core_pd_set(aoc, false);
 			return -ETIMEDOUT;
@@ -1171,10 +1191,12 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
 	}
 
 	/*
-	 * Drop aoc_core_pd vote (waiting for GENPD_NOTIFY_OFF) before asking
-	 * GSA to shut down and unload AoC, matching the stock offline sequence.
+	 * Hold aoc_core_pd awake across GSA SHUTDOWN + UNLOAD to match Laguna's
+	 * offline hardware contract, then release mailboxes and drop
+	 * aoc_core_pd (waiting for GENPD_NOTIFY_OFF) before cycling
+	 * sswrp_aoc_pd.
 	 */
-	lga_aoc_core_pd_set(aoc, false);
+	lga_aoc_core_pd_set(aoc, true);
 
 	ret = gsa_aoc_stop(aoc->gsa);
 	lga_aoc_set_supplies(aoc, false);
@@ -1186,13 +1208,18 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
 		aoc->loaded = false;
 		if (reset_sswrp) {
 			/*
-			 * Free all AoC mailbox channels before cycling
-			 * sswrp_aoc_pd so goog-mba-ctrl re-programs IRQ masks
-			 * and auto-ack on the subsequent load.
+			 * Free all AoC mailbox channels and drop aoc_core_pd
+			 * before cycling sswrp_aoc_pd so goog-mba-ctrl
+			 * re-programs IRQ masks and auto-ack on the next load.
 			 */
 			lga_aoc_release_mboxes(aoc);
+			lga_aoc_core_pd_set(aoc, false);
 			pd_ret = lga_aoc_power_cycle_sswrp(aoc);
+		} else {
+			lga_aoc_core_pd_set(aoc, false);
 		}
+	} else {
+		lga_aoc_core_pd_set(aoc, false);
 	}
 
 	return ret ?: pd_ret;
@@ -1357,6 +1384,66 @@ bool lga_aoc_ipc_can_write(struct device *dev, u32 service_idx)
 	return lga_aoc_ipc_can_write_len(dev, service_idx, 1U);
 }
 EXPORT_SYMBOL_GPL(lga_aoc_ipc_can_write);
+
+bool lga_aoc_ipc_tx_pending(struct device *dev, u32 service_idx)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	struct lga_aoc_ipc_service_hdr *hdr;
+	struct lga_aoc_ipc_region *reg;
+	bool pending = false;
+
+	if (!aoc)
+		return false;
+
+	mutex_lock(&aoc->lock);
+	hdr = lga_aoc_service_hdr(aoc, service_idx);
+	if (hdr && aoc->services[service_idx].type != LGA_AOC_SVC_BUFFER) {
+		reg = &hdr->regions[LGA_AOC_DIR_DOWN];
+		dma_rmb();
+		pending = le32_to_cpu(READ_ONCE(reg->tx)) !=
+			  le32_to_cpu(READ_ONCE(reg->rx));
+	}
+	mutex_unlock(&aoc->lock);
+	return pending;
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_tx_pending);
+
+int lga_aoc_ipc_flush_tx(struct device *dev, u32 service_idx,
+			 unsigned long timeout)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	unsigned long deadline;
+
+	if (!aoc)
+		return -EINVAL;
+	if (!lga_aoc_is_online(dev))
+		return -ENODEV;
+	if (!lga_aoc_ipc_tx_pending(dev, service_idx))
+		return 0;
+	if (!timeout)
+		return -ETIMEDOUT;
+
+	deadline = jiffies + timeout;
+	for (;;) {
+		long rem = deadline - jiffies;
+		long slice;
+
+		if (rem <= 0)
+			return lga_aoc_ipc_tx_pending(dev, service_idx) ?
+			       -ETIMEDOUT : 0;
+
+		slice = min_t(long, rem, msecs_to_jiffies(20));
+		wait_event_timeout(aoc->ipc_wq,
+				   !lga_aoc_is_online(dev) ||
+				   !lga_aoc_ipc_tx_pending(dev, service_idx),
+				   slice);
+		if (!lga_aoc_is_online(dev))
+			return -ENODEV;
+		if (!lga_aoc_ipc_tx_pending(dev, service_idx))
+			return 0;
+	}
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_flush_tx);
 
 ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 			  const void *buf, size_t len)
@@ -1874,6 +1961,69 @@ static const struct file_operations lga_aoc_mbox_fops = {
 	.release = single_release,
 };
 
+static int lga_aoc_log_show(struct seq_file *s, void *unused)
+{
+	struct lga_aoc *aoc = s->private;
+	struct lga_aoc_service_info svc;
+	u8 *buf;
+	size_t max_len;
+	unsigned int count = 0;
+	int ret;
+
+	ret = lga_aoc_find_service(aoc->dev, "logging", &svc);
+	if (ret) {
+		seq_printf(s, "logging service unavailable (%d)\n", ret);
+		return 0;
+	}
+
+	if (svc.type != LGA_AOC_SVC_QUEUE || svc.up_size <= 8U) {
+		seq_printf(s, "unsupported logging service layout (type=%u up=%u)\n",
+			   svc.type, svc.up_size);
+		return 0;
+	}
+
+	max_len = min_t(size_t, svc.up_size - 8U, 512U);
+	buf = kmalloc(max_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	while (count < LGA_AOC_LOG_DRAIN_MAX) {
+		ssize_t n, i;
+		bool all_ascii = true;
+
+		n = lga_aoc_ipc_read(aoc->dev, svc.index, buf, max_len);
+		if (n <= 0)
+			break;
+
+		for (i = 0; i < n; i++) {
+			u8 c = buf[i];
+
+			if (c == '\0' || c == '\n' || c == '\r' || c == '\t')
+				continue;
+			if (c < 0x20 || c > 0x7e) {
+				all_ascii = false;
+				break;
+			}
+		}
+
+		if (all_ascii) {
+			seq_printf(s, "[%03u %zdB] %.*s\n",
+				   count, n, (int)n, buf);
+		} else {
+			seq_printf(s, "[%03u %zdB] %*ph\n",
+				   count, n, (int)min_t(ssize_t, n, 64), buf);
+		}
+		count++;
+	}
+
+	if (!count)
+		seq_puts(s, "(empty)\n");
+
+	kfree(buf);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(lga_aoc_log);
+
 static void lga_aoc_read_soc_info(struct lga_aoc *aoc)
 {
 	struct device_node *soc_np, *child;
@@ -2113,6 +2263,7 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	debugfs_create_file("ipc_ring", 0400, aoc->debugfs, aoc,
 			    &lga_aoc_ipc_ring_fops);
 	debugfs_create_file("mbox", 0600, aoc->debugfs, aoc, &lga_aoc_mbox_fops);
+	debugfs_create_file("log", 0400, aoc->debugfs, aoc, &lga_aoc_log_fops);
 
 	dev_info(dev,
 		 "Laguna AoC ready (cfg=%s board=%#x/%#x soc=%u/%#x carveout=%pa+%#zx mboxes=%u)\n",
