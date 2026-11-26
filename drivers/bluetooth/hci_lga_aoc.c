@@ -58,6 +58,11 @@
 #define LGA_EFW_RX_STREAM_SIZE		8192U
 #define LGA_EFW_CTL_TIMEOUT_MS		2000U
 #define LGA_EFW_RX_POLL_MS		100U
+#define LGA_EFW_INIT_BAUD		115200U
+#define LGA_EFW_OPER_BAUD_DEFAULT	3000000U
+
+#define LGA_BCM_OP_UPDATE_BAUDRATE	0xfc18
+#define LGA_BCM_OP_WRITE_UART_CLOCK	0xfc45
 
 #define LGA_EFW_FLAG_NORMAL		0U
 #define LGA_EFW_FLAG_EXPECT_REPLY	1U
@@ -138,12 +143,14 @@ struct hci_lga_aoc {
 	struct gpio_desc *bt_ble_dbo_gpio;
 	struct gpio_desc *bt_dev_wake_gpio;
 	struct gpio_desc *bt_wlan_reg_on_gpio;
+	bool wlan_reg_on_owned;
 
 	u32 channel_id;
 	u32 efw_tx_seq;
 	u32 efw_aoc_hdr_size;
 	u32 efw_tx_ring_size;
 	u32 efw_rx_ring_size;
+	u32 efw_cur_baud;
 	bool efw_connected;
 
 	size_t tx_max_msg;
@@ -197,10 +204,10 @@ module_param(efw_lpm_timeout, int, 0644);
 MODULE_PARM_DESC(efw_lpm_timeout,
 		 "Optional EFW SetLpm (-1=keep AoC default, 0=disable LPM, 1..255=enable LPM timeout sec)");
 
-static unsigned int efw_uart_baud;
+static unsigned int efw_uart_baud = LGA_EFW_OPER_BAUD_DEFAULT;
 module_param(efw_uart_baud, uint, 0644);
 MODULE_PARM_DESC(efw_uart_baud,
-		 "Optional UART baud rate sent via EFW ConfigUART after SetPower (0=keep AoC default)");
+		 "Operational UART baud rate negotiated via Broadcom 0xfc18 + EFW ConfigUART (default: 3000000; 0 or 115200 keeps init baud)");
 
 static int efw_uart_stop_bits = -1;
 module_param(efw_uart_stop_bits, int, 0644);
@@ -217,15 +224,15 @@ module_param(toggle_bt_power, bool, 0644);
 MODULE_PARM_DESC(toggle_bt_power,
 		 "Assert optional bt-ble-dbo/bt-shutdown GPIOs on hci open/close");
 
-static bool assert_wlan_reg_on;
+static bool assert_wlan_reg_on = true;
 module_param(assert_wlan_reg_on, bool, 0644);
 MODULE_PARM_DESC(assert_wlan_reg_on,
-		 "Assert optional bt-wlan-reg-on (AP2WLAN_REG_ON_1V2) before BT power-on for combo-chip testing (default: false)");
+		 "Assert optional bt-wlan-reg-on (AP2WLAN_REG_ON_1V2) nonexclusively before BT power-on (default: true)");
 
-static bool run_btbcm_setup;
+static bool run_btbcm_setup = true;
 module_param(run_btbcm_setup, bool, 0644);
 MODULE_PARM_DESC(run_btbcm_setup,
-		 "Run btbcm_setup_patchram() during HCI setup (default: false)");
+		 "Run Broadcom btbcm patchram and finalize sequence during HCI setup (default: true)");
 
 static bool debug_rx;
 module_param(debug_rx, bool, 0644);
@@ -1208,24 +1215,42 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 		return;
 
 	/*
-	 * Optional combo-chip diagnostic: assert AP2WLAN_REG_ON_1V2
-	 * (bt-wlan-reg-on) and allow 200 ms PMU/oscillator startup before
-	 * BT_REG_ON / SetPower(1) to discriminate BCM4390 shared WL_REG_ON
-	 * power dependency. Disabled by default.
+	 * BCM4390/5 on Laguna requires AP2WLAN_REG_ON_1V2 (bt-wlan-reg-on)
+	 * asserted for the combo PMU/BT core to exit reset. Request it
+	 * nonexclusively with GPIOD_ASIS so an active Wi-Fi session holding
+	 * the line HIGH is never glitched, and only lower the line on close
+	 * if this driver raised it.
 	 */
 	if (assert_wlan_reg_on && !bt->bt_wlan_reg_on_gpio) {
 		gp = gpiod_get_optional(bt->aoc_dev, "bt-wlan-reg-on",
-					GPIOD_OUT_HIGH);
+					GPIOD_ASIS | GPIOD_FLAGS_BIT_NONEXCLUSIVE);
 		if (IS_ERR(gp)) {
 			dev_info(bt->aoc_dev,
 				 "bt-wlan-reg-on GPIO unavailable (%ld), continuing without WL_REG_ON\n",
 				 PTR_ERR(gp));
 		} else if (gp) {
 			bt->bt_wlan_reg_on_gpio = gp;
-			msleep(200);
-			dev_info(bt->aoc_dev,
-				 "bt-wlan-reg-on asserted (val=%d)\n",
-				 gpiod_get_value_cansleep(gp));
+			if (gpiod_get_direction(gp) == 0 &&
+			    gpiod_get_value_cansleep(gp) > 0) {
+				bt->wlan_reg_on_owned = false;
+				dev_info(bt->aoc_dev,
+					 "bt-wlan-reg-on already high (shared), preserving state\n");
+			} else {
+				int err = gpiod_direction_output(gp, 1);
+
+				if (err) {
+					dev_warn(bt->aoc_dev,
+						 "bt-wlan-reg-on output high failed (%d)\n",
+						 err);
+					bt->wlan_reg_on_owned = false;
+				} else {
+					bt->wlan_reg_on_owned = true;
+					msleep(200);
+					dev_info(bt->aoc_dev,
+						 "bt-wlan-reg-on asserted (val=%d)\n",
+						 gpiod_get_value_cansleep(gp));
+				}
+			}
 		}
 	}
 
@@ -1313,9 +1338,11 @@ static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
 		bt->bt_ble_dbo_gpio = NULL;
 	}
 	if (bt->bt_wlan_reg_on_gpio) {
-		gpiod_set_value_cansleep(bt->bt_wlan_reg_on_gpio, 0);
+		if (bt->wlan_reg_on_owned)
+			gpiod_set_value_cansleep(bt->bt_wlan_reg_on_gpio, 0);
 		gpiod_put(bt->bt_wlan_reg_on_gpio);
 		bt->bt_wlan_reg_on_gpio = NULL;
+		bt->wlan_reg_on_owned = false;
 	}
 }
 
@@ -1472,16 +1499,17 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 					    lpm_en, lpm_to, ret);
 		}
 
-		if (efw_uart_baud || efw_uart_stop_bits >= 0) {
-			u32 baud = efw_uart_baud ?: 115200U;
-			u8 stop_bits = efw_uart_stop_bits >= 0 ?
-				       (u8)min(efw_uart_stop_bits, 2) : 1U;
+		bt->efw_cur_baud = LGA_EFW_INIT_BAUD;
+		if (efw_uart_stop_bits >= 0) {
+			u8 stop_bits = (u8)min(efw_uart_stop_bits, 2);
 
-			ret = hci_lga_aoc_efw_send_fb_uart(bt, baud, stop_bits);
+			ret = hci_lga_aoc_efw_send_fb_uart(bt,
+							   LGA_EFW_INIT_BAUD,
+							   stop_bits);
 			if (ret)
 				bt_dev_warn(hdev,
 					    "EFW ConfigUART(%u, stop_bits=%u) failed: %d",
-					    baud, stop_bits, ret);
+					    LGA_EFW_INIT_BAUD, stop_bits, ret);
 		}
 
 		ret = hci_lga_aoc_efw_send_fb_empty(bt, LGA_EFW_FB_QUERY_STATE,
@@ -1616,9 +1644,103 @@ static int hci_lga_aoc_send(struct hci_dev *hdev, struct sk_buff *skb)
 	return 0;
 }
 
+static int hci_lga_aoc_efw_set_host_baudrate(struct hci_lga_aoc *bt, u32 speed)
+{
+	u8 stop_bits = efw_uart_stop_bits >= 0 ?
+		       (u8)min(efw_uart_stop_bits, 2) : 1U;
+	int ret;
+
+	if (bt->mode != HCI_LGA_AOC_MODE_EFW)
+		return 0;
+
+	ret = hci_lga_aoc_efw_send_fb_uart(bt, speed, stop_bits);
+	if (ret) {
+		bt_dev_err(bt->hdev, "EFW ConfigUART(%u, stop_bits=%u) failed: %d",
+			   speed, stop_bits, ret);
+		return ret;
+	}
+
+	ret = lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
+				   msecs_to_jiffies(500));
+	if (ret && ret != -ENODEV)
+		bt_dev_warn(bt->hdev, "EFW TX flush after ConfigUART(%u): %d",
+			    speed, ret);
+
+	msleep(20);
+	bt->efw_cur_baud = speed;
+	return 0;
+}
+
+static int hci_lga_aoc_set_baudrate(struct hci_dev *hdev, unsigned int speed)
+{
+	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
+	struct bcm_update_uart_baud_rate param;
+	struct sk_buff *skb;
+	int err;
+
+	if (bt->mode != HCI_LGA_AOC_MODE_EFW || !speed)
+		return 0;
+
+	if (speed > 3000000U) {
+		struct bcm_write_uart_clock_setting clock = {
+			.type = BCM_UART_CLOCK_48MHZ,
+		};
+
+		skb = __hci_cmd_sync(hdev, LGA_BCM_OP_WRITE_UART_CLOCK,
+				     sizeof(clock), &clock, HCI_INIT_TIMEOUT);
+		if (IS_ERR(skb)) {
+			err = PTR_ERR(skb);
+			bt_dev_err(hdev,
+				   "BCM: failed to write UART clock (%d)", err);
+			return err;
+		}
+		kfree_skb(skb);
+	}
+
+	param.zero = cpu_to_le16(0);
+	param.baud_rate = cpu_to_le32(speed);
+
+	skb = __hci_cmd_sync(hdev, LGA_BCM_OP_UPDATE_BAUDRATE,
+			     sizeof(param), &param, HCI_INIT_TIMEOUT);
+	if (PTR_ERR_OR_ZERO(skb) == -ETIMEDOUT) {
+		bt_dev_warn(hdev,
+			    "BCM: baud rate change to %u timed out, retrying after reset",
+			    speed);
+		skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL,
+				     HCI_INIT_TIMEOUT);
+		if (!IS_ERR(skb)) {
+			kfree_skb(skb);
+			msleep(100);
+			skb = __hci_cmd_sync(hdev, LGA_BCM_OP_UPDATE_BAUDRATE,
+					     sizeof(param), &param,
+					     HCI_INIT_TIMEOUT);
+		}
+	}
+	if (IS_ERR(skb)) {
+		err = PTR_ERR(skb);
+		bt_dev_err(hdev,
+			   "BCM: failed to write update baudrate %u (%d)",
+			   speed, err);
+		return err;
+	}
+	kfree_skb(skb);
+
+	lga_aoc_ipc_flush_tx(bt->aoc_dev, bt->tx_svc.index,
+			     msecs_to_jiffies(500));
+	msleep(20);
+
+	err = hci_lga_aoc_efw_set_host_baudrate(bt, speed);
+	if (err)
+		return err;
+
+	bt_dev_info(hdev, "EFW UART baudrate switched to %u", speed);
+	return 0;
+}
+
 static int hci_lga_aoc_setup(struct hci_dev *hdev)
 {
 	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
+	bool fw_load_done = false;
 	struct sk_buff *skb;
 	int ret;
 
@@ -1658,11 +1780,59 @@ static int hci_lga_aoc_setup(struct hci_dev *hdev)
 	}
 	kfree_skb(skb);
 
-	if (run_btbcm_setup) {
-		ret = btbcm_setup_patchram(hdev);
-		if (ret && ret != -ENOENT)
-			return ret;
+	/*
+	 * Step up to operational baudrate (default 3 Mbaud) before patchram
+	 * download so ~820 KB BCM.hcd streams in ~3 s instead of >75 s.
+	 */
+	if (bt->mode == HCI_LGA_AOC_MODE_EFW && efw_uart_baud &&
+	    efw_uart_baud != LGA_EFW_INIT_BAUD) {
+		ret = hci_lga_aoc_set_baudrate(hdev, efw_uart_baud);
+		if (ret)
+			bt_dev_warn(hdev,
+				    "pre-patchram baudrate %u failed (%d), continuing at %u",
+				    efw_uart_baud, ret, bt->efw_cur_baud);
 	}
+
+	if (!run_btbcm_setup)
+		return 0;
+
+	/*
+	 * btbcm_initialize() queries root DT compatible[0] ("google,lga-mustang"
+	 * or "google,lga-rango") and requests brcm/BCM.<board>.hcd with fallback
+	 * to brcm/BCM.hcd. Missing firmware (-ENOENT) is non-fatal (returns 0
+	 * with fw_load_done=false).
+	 */
+	ret = btbcm_initialize(hdev, &fw_load_done, false);
+	if (ret)
+		return ret;
+
+	/*
+	 * Launch RAM (0xfc4e) resets BCM4390's UART back to 115200 baud.
+	 * Resynchronize AoC XAOC_UART0 to 115200, then step the newly loaded
+	 * RAM firmware back up to efw_uart_baud before btbcm_finalize().
+	 */
+	if (fw_load_done && bt->mode == HCI_LGA_AOC_MODE_EFW) {
+		if (bt->efw_cur_baud != LGA_EFW_INIT_BAUD) {
+			ret = hci_lga_aoc_efw_set_host_baudrate(bt,
+								LGA_EFW_INIT_BAUD);
+			if (ret)
+				return ret;
+		}
+		if (efw_uart_baud && efw_uart_baud != LGA_EFW_INIT_BAUD) {
+			ret = hci_lga_aoc_set_baudrate(hdev, efw_uart_baud);
+			if (ret)
+				bt_dev_warn(hdev,
+					    "post-patchram baudrate %u failed (%d), continuing at %u",
+					    efw_uart_baud, ret, bt->efw_cur_baud);
+		}
+	}
+
+	ret = btbcm_finalize(hdev, &fw_load_done, false);
+	if (ret)
+		return ret;
+
+	if (hci_test_quirk(hdev, HCI_QUIRK_INVALID_BDADDR))
+		hci_set_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
 
 	return 0;
 }
@@ -1866,7 +2036,6 @@ static int hci_lga_aoc_attach_locked(void)
 	hdev->setup = hci_lga_aoc_setup;
 	hdev->set_bdaddr = btbcm_set_bdaddr;
 	hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
-	hci_set_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
 
 	ret = hci_register_dev(hdev);
 	if (ret < 0) {
