@@ -201,6 +201,18 @@
 	status = "okay";
 };
 
+&ldo_14m_reg {
+	google,monitor-only;
+};
+
+&ldo_24m_reg {
+	google,monitor-only;
+};
+
+&ldo_26m_reg {
+	google,monitor-only;
+};
+
 &ldo_10s_reg {
 	google,monitor-only;
 };

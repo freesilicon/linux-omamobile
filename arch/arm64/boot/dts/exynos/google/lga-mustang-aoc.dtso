@@ -16,6 +16,10 @@
 	status = "okay";
 };
 
+&pinctrl_hsios {
+	status = "okay";
+};
+
 &aoc_mba_syscon {
 	status = "okay";
 };
@@ -108,5 +112,6 @@
 	bt-shutdown-gpios = <&da9188_vgpio 0x13 GPIO_ACTIVE_HIGH>;
 	bt-ble-dbo-gpios = <&da9188_vgpio 0x14 GPIO_ACTIVE_HIGH>;
 	bt-device-wakeup-gpios = <&pinctrl_aoc 0xd GPIO_ACTIVE_HIGH>;
+	bt-wlan-reg-on-gpios = <&pinctrl_hsios 0xd GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
