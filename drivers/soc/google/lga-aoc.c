@@ -4,9 +4,10 @@
  * Google Tensor G5 (Laguna).
  *
  * Implements step-by-step AoC firmware validation, GSA authentication over
- * google,mba-ctrl v2.0, Trusty hwmgr.aoc lifecycle control, 20-channel
- * google,mba-ctrl v2.0 doorbell messaging, and shared-carveout IPC service
- * discovery and ring/queue transport scaffolding.
+ * google,mba-ctrl v2.0, Trusty hwmgr.aoc lifecycle control, optional SMMUv3
+ * window mapping from the signed image header, 20-channel google,mba-ctrl
+ * v2.0 doorbell messaging, and shared-carveout IPC service discovery and
+ * queue/ring transport for downstream consumers (e.g. hci_lga_aoc).
  *
  * No firmware is loaded automatically at probe unless autoload=1 is passed.
  */
@@ -19,10 +20,12 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
-#include <linux/iopoll.h>
+#include <linux/iommu.h>
+#include <linux/jiffies.h>
 #include <linux/mailbox_client.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
@@ -43,31 +46,46 @@
 #define LGA_AOC_SUPERBIN_MAGIC		0xaabbccddU
 #define LGA_AOC_DRAM_IOVA_BASE		0x98000000U
 
-#define LGA_AOC_HDR_FMT_RDO		1U
 #define LGA_AOC_HDR_FMT_PQ		2U
-#define LGA_AOC_HDR_LEGACY_SIZE		GSA_AOC_HEADER_SIZE
+#define LGA_AOC_HDR_STD_SIZE		GSA_AOC_HEADER_SIZE
 #define LGA_AOC_HDR_PQ_SIZE		GSA_AOC_PQ_HEADER_SIZE
 
-/* Offsets of sub-header magic within RDO and PQ signed containers */
-#define LGA_AOC_RDO_SUBHDR_OFF		0x864U
+/* Offsets within signed firmware containers */
+#define LGA_AOC_LEGACY_V1_CFG_OFF	0x560U
+#define LGA_AOC_LEGACY_V2_CFG_OFF	0x580U
+#define LGA_AOC_NEW_CFG_OFF		0x9f0U
 #define LGA_AOC_PQ_SUBHDR_OFF		0x4630U
+#define LGA_AOC_IMG_CFG_SIZE		256U
 
-/* Heaps reserved at the top of the AoC carve-out */
+/* LCPM scratch register cleared during Laguna probe */
+#define LGA_AOC_LCPM_INIT_OFF		0x480U
+
+/* Four heaps reserved at the top of the AoC carve-out (total 0x434000) */
+#define LGA_AOC_AUX_HEAP_SIZE		SZ_128K
 #define LGA_AOC_SENSOR_HEAP_SIZE	SZ_4M
 #define LGA_AOC_PLAYBACK_HEAP_SIZE	SZ_16K
 #define LGA_AOC_CAPTURE_HEAP_SIZE	SZ_64K
+#define LGA_AOC_TOTAL_HEAPS_SIZE	(LGA_AOC_AUX_HEAP_SIZE + \
+					 LGA_AOC_SENSOR_HEAP_SIZE + \
+					 LGA_AOC_PLAYBACK_HEAP_SIZE + \
+					 LGA_AOC_CAPTURE_HEAP_SIZE)
 
 #define LGA_AOC_MAX_SERVICES		256U
-#define LGA_AOC_START_TIMEOUT_US	(5U * USEC_PER_SEC)
-#define LGA_AOC_START_POLL_US		20000U
+#define LGA_AOC_MAX_IOMMU_MAPS		33U
+#define LGA_AOC_START_TIMEOUT_MS	10000U
+#define LGA_AOC_START_POLL_MS		50U
 #define LGA_AOC_DEFAULT_FW		"aoc.bin"
 #define LGA_AOC_DEFAULT_COREDUMP_MBOX	19U
+#define LGA_AOC_DEFAULT_BOARD_ID	0x20202U
+#define LGA_AOC_DEFAULT_BOARD_REV	0x10000U
+#define LGA_AOC_DEFAULT_PRODUCT_ID	5U		/* Laguna B0 */
+#define LGA_AOC_DEFAULT_CHIP_REV	0x10U		/* major=1, minor=0 */
 
 /* Service header flag bitfields */
 #define LGA_AOC_SVC_TYPE_MASK		GENMASK(18, 16)
 #define LGA_AOC_SVC_IRQ_MASK		GENMASK(23, 19)
 
-/* Boot parameter TLV keys expected by AoC firmware */
+/* Boot parameter TLV keys expected by Laguna AoC firmware (24 entries) */
 enum lga_aoc_param_key {
 	LGA_AOC_PARAM_BOARD_ID			= 0x1001,
 	LGA_AOC_PARAM_BOARD_REV			= 0x1002,
@@ -83,8 +101,16 @@ enum lga_aoc_param_key {
 	LGA_AOC_PARAM_PLAYBACK_HEAP_SIZE	= 0x100d,
 	LGA_AOC_PARAM_CAPTURE_HEAP_ADDR		= 0x100e,
 	LGA_AOC_PARAM_CAPTURE_HEAP_SIZE		= 0x100f,
+	LGA_AOC_PARAM_FORCE_SPKR_US		= 0x1010,
 	LGA_AOC_PARAM_RAND_SEED			= 0x1011,
+	LGA_AOC_PARAM_CHIP_REV			= 0x1012,
+	LGA_AOC_PARAM_CHIP_TYPE			= 0x1013,
 	LGA_AOC_PARAM_GNSS_TYPE			= 0x1014,
+	LGA_AOC_PARAM_VOLTE_RELEASE_MIF		= 0x1015,
+	LGA_AOC_PARAM_CHIP_PRODUCT_ID		= 0x1016,
+	LGA_AOC_PARAM_WIFI_CHIP			= 0x1017,
+	LGA_AOC_PARAM_AUX_HEAP_ADDR		= 0x101b,
+	LGA_AOC_PARAM_AUX_HEAP_SIZE		= 0x101c,
 };
 
 struct lga_aoc_legacy_hdr_v1 {
@@ -113,6 +139,17 @@ struct lga_aoc_legacy_hdr_v2 {
 	u8 chip_id[32];
 	u8 auth_config[256];
 	u8 image_config[256];
+} __packed;
+
+struct lga_aoc_image_config {
+	__le32 version;
+	__le32 fw_start;
+	__le32 fw_size;
+	__le32 privilege_level;
+	__le16 bl_offset;
+	__le16 bl_size;
+	__le16 iommu_offset;
+	__le16 iommu_size;
 } __packed;
 
 struct lga_aoc_superbin_hdr {
@@ -167,6 +204,11 @@ struct lga_aoc_ipc_msg_hdr {
 	__le16 r3;
 } __packed;
 
+struct lga_aoc_iommu_map {
+	unsigned long iova;
+	size_t size;
+};
+
 struct lga_aoc_mbox_slot {
 	struct lga_aoc *aoc;
 	struct mbox_client client;
@@ -188,7 +230,11 @@ struct lga_aoc {
 	struct device *dev;
 	struct device *gsa;
 	struct device *pd_devs[2];
-	struct device_link *pd_links[2];
+	bool sswrp_pd_on;
+	bool core_pd_on;
+
+	void __iomem *lcpm;
+	resource_size_t lcpm_size;
 
 	phys_addr_t dram_base;
 	size_t dram_size;
@@ -197,6 +243,9 @@ struct lga_aoc {
 	void *auth_hdr_virt;
 	dma_addr_t auth_hdr_dma;
 	size_t auth_hdr_alloc_size;
+
+	struct lga_aoc_iommu_map iommu_maps[LGA_AOC_MAX_IOMMU_MAPS];
+	unsigned int num_iommu_maps;
 
 	struct regulator *supplies[LGA_AOC_NUM_SUPPLIES];
 	bool supplies_enabled;
@@ -208,11 +257,16 @@ struct lga_aoc {
 	u32 board_id;
 	u32 board_rev;
 	u32 gnss_type;
+	u32 wifi_chip;
+	u32 force_vnom;
+	u32 chip_product_id;
+	u32 chip_rev;
 	const char *board_cfg;
 	const char *fw_name;
 
 	u32 ipc_offset;
 	size_t hdr_size;
+	size_t img_cfg_off;
 	char fw_version[73];
 
 	struct lga_aoc_service_info *services;
@@ -228,6 +282,10 @@ struct lga_aoc {
 	struct dentry *debugfs;
 };
 
+static DEFINE_MUTEX(lga_aoc_dev_lock);
+static struct lga_aoc *lga_aoc_active_dev;
+static BLOCKING_NOTIFIER_HEAD(lga_aoc_notifiers);
+
 static bool autoload;
 module_param(autoload, bool, 0444);
 MODULE_PARM_DESC(autoload, "Load and start AoC firmware automatically at probe");
@@ -236,6 +294,11 @@ static bool allow_coredump_ping;
 module_param(allow_coredump_ping, bool, 0644);
 MODULE_PARM_DESC(allow_coredump_ping,
 		 "Allow sending debugfs doorbell pings on the coredump mailbox");
+
+static bool configure_iommu = true;
+module_param(configure_iommu, bool, 0644);
+MODULE_PARM_DESC(configure_iommu,
+		 "Map AoC firmware IOMMU windows into a non-identity SMMU domain");
 
 static const char * const lga_aoc_supply_names[LGA_AOC_NUM_SUPPLIES] = {
 	[LGA_AOC_SUPPLY_1V8] = "sensor-1v8",
@@ -273,6 +336,49 @@ static const char *lga_aoc_svc_type_str(u32 type)
 	}
 }
 
+struct device *lga_aoc_get_device(void)
+{
+	struct device *dev = NULL;
+
+	mutex_lock(&lga_aoc_dev_lock);
+	if (lga_aoc_active_dev)
+		dev = get_device(lga_aoc_active_dev->dev);
+	mutex_unlock(&lga_aoc_dev_lock);
+	return dev;
+}
+EXPORT_SYMBOL_GPL(lga_aoc_get_device);
+
+bool lga_aoc_is_online(struct device *dev)
+{
+	struct lga_aoc *aoc;
+	bool online;
+
+	if (!dev)
+		return false;
+
+	aoc = dev_get_drvdata(dev);
+	if (!aoc)
+		return false;
+
+	mutex_lock(&aoc->lock);
+	online = aoc->online;
+	mutex_unlock(&aoc->lock);
+	return online;
+}
+EXPORT_SYMBOL_GPL(lga_aoc_is_online);
+
+int lga_aoc_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&lga_aoc_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(lga_aoc_register_notifier);
+
+int lga_aoc_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&lga_aoc_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(lga_aoc_unregister_notifier);
+
 static void lga_aoc_mbox_rx_cb(struct mbox_client *cl, void *mssg)
 {
 	struct lga_aoc_mbox_slot *slot =
@@ -288,6 +394,36 @@ static void lga_aoc_mbox_rx_cb(struct mbox_client *cl, void *mssg)
 			 slot->index);
 
 	wake_up_all(&aoc->ipc_wq);
+}
+
+static int lga_aoc_core_pd_set(struct lga_aoc *aoc, bool enable)
+{
+	int ret;
+
+	if (!aoc->pd_devs[1])
+		return 0;
+
+	if (enable) {
+		if (aoc->core_pd_on)
+			return 0;
+		ret = pm_runtime_resume_and_get(aoc->pd_devs[1]);
+		if (ret) {
+			dev_err(aoc->dev, "failed to power on aoc_core_pd: %d\n",
+				ret);
+			return ret;
+		}
+		aoc->core_pd_on = true;
+		return 0;
+	}
+
+	if (!aoc->core_pd_on)
+		return 0;
+
+	ret = pm_runtime_put_sync(aoc->pd_devs[1]);
+	if (ret < 0)
+		dev_warn(aoc->dev, "failed to release aoc_core_pd: %d\n", ret);
+	aoc->core_pd_on = false;
+	return 0;
 }
 
 static int lga_aoc_set_supplies(struct lga_aoc *aoc, bool enable)
@@ -325,46 +461,181 @@ static int lga_aoc_set_supplies(struct lga_aoc *aoc, bool enable)
 	return 0;
 }
 
-static int lga_aoc_detect_header(const struct firmware *fw, size_t *hdr_size)
+static void lga_aoc_unmap_iommu(struct lga_aoc *aoc)
+{
+	struct iommu_domain *domain;
+	unsigned int i;
+
+	if (!aoc->num_iommu_maps)
+		return;
+
+	domain = iommu_get_domain_for_dev(aoc->dev);
+	if (domain && domain->type != IOMMU_DOMAIN_IDENTITY) {
+		for (i = 0; i < aoc->num_iommu_maps; i++)
+			iommu_unmap(domain, aoc->iommu_maps[i].iova,
+				    aoc->iommu_maps[i].size);
+	}
+	aoc->num_iommu_maps = 0;
+}
+
+static int lga_aoc_map_one_window(struct lga_aoc *aoc,
+				  struct iommu_domain *domain,
+				  unsigned long iova, phys_addr_t paddr,
+				  size_t size)
+{
+	int ret;
+
+	if (!size || !PAGE_ALIGNED(iova) || !PAGE_ALIGNED(paddr) ||
+	    !PAGE_ALIGNED(size))
+		return -EINVAL;
+
+	if (iommu_iova_to_phys(domain, iova))
+		return 0;
+
+	if (aoc->num_iommu_maps >= LGA_AOC_MAX_IOMMU_MAPS)
+		return -ENOSPC;
+
+	ret = iommu_map(domain, iova, paddr, size, IOMMU_READ | IOMMU_WRITE,
+			GFP_KERNEL);
+	if (ret) {
+		dev_err(aoc->dev,
+			"iommu_map(iova=%#lx pa=%pa size=%#zx) failed: %d\n",
+			iova, &paddr, size, ret);
+		return ret;
+	}
+
+	aoc->iommu_maps[aoc->num_iommu_maps].iova = iova;
+	aoc->iommu_maps[aoc->num_iommu_maps].size = size;
+	aoc->num_iommu_maps++;
+	return 0;
+}
+
+static int lga_aoc_configure_iommu(struct lga_aoc *aoc,
+				   const struct firmware *fw)
+{
+	struct iommu_domain *domain;
+	const struct lga_aoc_image_config *cfg;
+	const __le64 *entries;
+	u16 tbl_off, tbl_size;
+	unsigned int i, count;
+	bool dram_mapped = false;
+	int ret;
+
+	if (!configure_iommu)
+		return 0;
+
+	domain = iommu_get_domain_for_dev(aoc->dev);
+	if (!domain || domain->type == IOMMU_DOMAIN_IDENTITY)
+		return 0;
+
+	lga_aoc_unmap_iommu(aoc);
+
+	if (aoc->img_cfg_off &&
+	    aoc->img_cfg_off + LGA_AOC_IMG_CFG_SIZE <= aoc->hdr_size) {
+		cfg = (const struct lga_aoc_image_config *)
+			(fw->data + aoc->img_cfg_off);
+		tbl_off = le16_to_cpu(cfg->iommu_offset);
+		tbl_size = le16_to_cpu(cfg->iommu_size);
+
+		if (tbl_size >= sizeof(u64) &&
+		    tbl_off < LGA_AOC_IMG_CFG_SIZE &&
+		    (u32)tbl_off + tbl_size <= LGA_AOC_IMG_CFG_SIZE &&
+		    (tbl_size % sizeof(u64)) == 0) {
+			entries = (const __le64 *)((const u8 *)cfg + tbl_off);
+			count = tbl_size / sizeof(u64);
+
+			for (i = 0; i < count; i++) {
+				u64 raw = le64_to_cpu(entries[i]);
+				unsigned long iova = (u32)(raw << 12);
+				phys_addr_t paddr =
+					(phys_addr_t)((raw >> 8) &
+						      0xffffff000ULL);
+				size_t sz = (size_t)((raw >> 32) &
+						     0xfffff000ULL);
+
+				if (!sz)
+					continue;
+				if (iova <= LGA_AOC_DRAM_IOVA_BASE &&
+				    iova + sz >= LGA_AOC_DRAM_IOVA_BASE +
+						 aoc->dram_size)
+					dram_mapped = true;
+
+				ret = lga_aoc_map_one_window(aoc, domain, iova,
+							     paddr, sz);
+				if (ret)
+					goto err_unmap;
+			}
+		}
+	}
+
+	if (!dram_mapped) {
+		ret = lga_aoc_map_one_window(aoc, domain,
+					     LGA_AOC_DRAM_IOVA_BASE,
+					     aoc->dram_base, aoc->dram_size);
+		if (ret)
+			goto err_unmap;
+	}
+
+	dev_info(aoc->dev, "configured %u SMMU window(s) for AoC\n",
+		 aoc->num_iommu_maps);
+	return 0;
+
+err_unmap:
+	lga_aoc_unmap_iommu(aoc);
+	return ret;
+}
+
+static int lga_aoc_detect_header(const struct firmware *fw, size_t *hdr_size,
+				 size_t *img_cfg_off)
 {
 	const struct lga_aoc_legacy_hdr_v1 *h1;
 	const struct lga_aoc_legacy_hdr_v2 *h2;
-	u32 fmt, magic;
+	u32 fmt, magic, sb_magic;
 
-	if (!fw || !fw->data || fw->size < LGA_AOC_HDR_LEGACY_SIZE)
+	if (!fw || !fw->data || fw->size < LGA_AOC_HDR_STD_SIZE)
 		return -EINVAL;
 
-	fmt = le32_to_cpup((const __le32 *)fw->data);
-	if (fmt == LGA_AOC_HDR_FMT_RDO &&
-	    fw->size >= LGA_AOC_HDR_LEGACY_SIZE + sizeof(struct lga_aoc_superbin_hdr)) {
-		magic = le32_to_cpup((const __le32 *)(fw->data + LGA_AOC_RDO_SUBHDR_OFF));
-		if (magic == LGA_AOC_AUTH_MAGIC) {
-			*hdr_size = LGA_AOC_HDR_LEGACY_SIZE;
-			return 0;
-		}
-	}
-
-	if (fmt == LGA_AOC_HDR_FMT_PQ &&
-	    fw->size >= LGA_AOC_HDR_PQ_SIZE + sizeof(struct lga_aoc_superbin_hdr)) {
-		magic = le32_to_cpup((const __le32 *)(fw->data + LGA_AOC_PQ_SUBHDR_OFF));
-		if (magic == LGA_AOC_AUTH_MAGIC) {
-			*hdr_size = LGA_AOC_HDR_PQ_SIZE;
-			return 0;
-		}
-	}
-
+	/* Legacy v1/v2 signed 4 KiB header ("AOC" magic at +0x400) */
 	h1 = (const struct lga_aoc_legacy_hdr_v1 *)fw->data;
 	if (le32_to_cpu(h1->magic) == LGA_AOC_AUTH_MAGIC &&
 	    le32_to_cpu(h1->generation) == 1) {
-		*hdr_size = LGA_AOC_HDR_LEGACY_SIZE;
+		*hdr_size = LGA_AOC_HDR_STD_SIZE;
+		*img_cfg_off = LGA_AOC_LEGACY_V1_CFG_OFF;
 		return 0;
 	}
 
 	h2 = (const struct lga_aoc_legacy_hdr_v2 *)fw->data;
 	if (le32_to_cpu(h2->magic) == LGA_AOC_AUTH_MAGIC &&
 	    le32_to_cpu(h2->generation) == 2) {
-		*hdr_size = LGA_AOC_HDR_LEGACY_SIZE;
+		*hdr_size = LGA_AOC_HDR_STD_SIZE;
+		*img_cfg_off = LGA_AOC_LEGACY_V2_CFG_OFF;
 		return 0;
+	}
+
+	fmt = le32_to_cpup((const __le32 *)fw->data);
+
+	/* Laguna signed 4 KiB header (non-zero header version, superbin at +0x1000) */
+	if (fmt != 0 &&
+	    fw->size >= LGA_AOC_HDR_STD_SIZE + sizeof(struct lga_aoc_superbin_hdr)) {
+		sb_magic = le32_to_cpup((const __le32 *)(fw->data +
+							 LGA_AOC_HDR_STD_SIZE));
+		if (sb_magic == LGA_AOC_SUPERBIN_MAGIC) {
+			*hdr_size = LGA_AOC_HDR_STD_SIZE;
+			*img_cfg_off = LGA_AOC_NEW_CFG_OFF;
+			return 0;
+		}
+	}
+
+	/* Post-quantum 20 KiB signed header ("AOC" at +0x4630, superbin at +0x5000) */
+	if (fmt == LGA_AOC_HDR_FMT_PQ &&
+	    fw->size >= LGA_AOC_HDR_PQ_SIZE + sizeof(struct lga_aoc_superbin_hdr)) {
+		magic = le32_to_cpup((const __le32 *)(fw->data +
+						      LGA_AOC_PQ_SUBHDR_OFF));
+		if (magic == LGA_AOC_AUTH_MAGIC) {
+			*hdr_size = LGA_AOC_HDR_PQ_SIZE;
+			*img_cfg_off = 0;
+			return 0;
+		}
 	}
 
 	return -EINVAL;
@@ -373,11 +644,11 @@ static int lga_aoc_detect_header(const struct firmware *fw, size_t *hdr_size)
 static int lga_aoc_parse_fw(struct lga_aoc *aoc, const struct firmware *fw)
 {
 	const struct lga_aoc_superbin_hdr *sb;
-	size_t hdr_size = 0, body_size, heaps_size;
-	u32 ipc_off;
+	size_t hdr_size = 0, img_cfg_off = 0, body_size;
+	u32 ipc_off, bl_off, bl_size, uuid_off, uuid_size;
 	int ret;
 
-	ret = lga_aoc_detect_header(fw, &hdr_size);
+	ret = lga_aoc_detect_header(fw, &hdr_size, &img_cfg_off);
 	if (ret) {
 		dev_err(aoc->dev, "unrecognized AoC signed header\n");
 		return ret;
@@ -387,10 +658,8 @@ static int lga_aoc_parse_fw(struct lga_aoc *aoc, const struct firmware *fw)
 		return -EINVAL;
 
 	body_size = fw->size - hdr_size;
-	heaps_size = LGA_AOC_SENSOR_HEAP_SIZE + LGA_AOC_PLAYBACK_HEAP_SIZE +
-		     LGA_AOC_CAPTURE_HEAP_SIZE;
-
-	if (body_size >= aoc->dram_size || body_size + heaps_size > aoc->dram_size) {
+	if (body_size >= aoc->dram_size ||
+	    body_size + LGA_AOC_TOTAL_HEAPS_SIZE > aoc->dram_size) {
 		dev_err(aoc->dev, "AoC body %#zx exceeds carve-out %#zx\n",
 			body_size, aoc->dram_size);
 		return -ERANGE;
@@ -403,21 +672,39 @@ static int lga_aoc_parse_fw(struct lga_aoc *aoc, const struct firmware *fw)
 		return -EINVAL;
 	}
 
+	uuid_off = le32_to_cpu(sb->uuid_table_offset);
+	uuid_size = le32_to_cpu(sb->uuid_table_size);
+	if ((u64)uuid_off + uuid_size >= body_size) {
+		dev_err(aoc->dev, "invalid AoC UUID table (%#x+%#x >= %#zx)\n",
+			uuid_off, uuid_size, body_size);
+		return -EINVAL;
+	}
+
+	bl_off = le32_to_cpu(sb->bootloader_offset);
+	bl_size = le32_to_cpu(sb->bootloader_size);
+	if ((u64)bl_off + bl_size >= body_size) {
+		dev_err(aoc->dev, "invalid AoC bootloader (%#x+%#x >= %#zx)\n",
+			bl_off, bl_size, body_size);
+		return -EINVAL;
+	}
+
 	ipc_off = le32_to_cpu(sb->image_size);
-	if (ipc_off < body_size || ipc_off + SZ_64K > aoc->dram_size - heaps_size) {
+	if (ipc_off < body_size ||
+	    ipc_off + SZ_64K > aoc->dram_size - LGA_AOC_TOTAL_HEAPS_SIZE) {
 		dev_err(aoc->dev, "invalid AoC IPC offset %#x (body %#zx)\n",
 			ipc_off, body_size);
 		return -EINVAL;
 	}
 
 	aoc->hdr_size = hdr_size;
+	aoc->img_cfg_off = img_cfg_off;
 	aoc->ipc_offset = ipc_off;
 	snprintf(aoc->fw_version, sizeof(aoc->fw_version), "%.8s%.64s",
 		 sb->version_prefix, sb->version_string);
 
 	dev_info(aoc->dev,
-		 "parsed AoC image: hdr %#zx body %#zx ipc +%#x version '%s'\n",
-		 hdr_size, body_size, ipc_off, aoc->fw_version);
+		 "parsed AoC image: hdr %#zx cfg +%#zx body %#zx ipc +%#x version '%s'\n",
+		 hdr_size, img_cfg_off, body_size, ipc_off, aoc->fw_version);
 	return 0;
 }
 
@@ -428,20 +715,19 @@ static u32 lga_aoc_dram_to_iova(struct lga_aoc *aoc, phys_addr_t pa)
 
 static void lga_aoc_clear_heaps(struct lga_aoc *aoc)
 {
-	size_t total = LGA_AOC_SENSOR_HEAP_SIZE + LGA_AOC_PLAYBACK_HEAP_SIZE +
-		       LGA_AOC_CAPTURE_HEAP_SIZE;
-
-	if (aoc->dram_size <= total)
+	if (aoc->dram_size <= LGA_AOC_TOTAL_HEAPS_SIZE)
 		return;
 
-	memset(aoc->dram + aoc->dram_size - total, 0, total);
+	memset(aoc->dram + aoc->dram_size - LGA_AOC_TOTAL_HEAPS_SIZE, 0,
+	       LGA_AOC_TOTAL_HEAPS_SIZE);
 	dma_wmb();
 }
 
 static void lga_aoc_write_boot_params(struct lga_aoc *aoc)
 {
 	phys_addr_t top = aoc->dram_base + aoc->dram_size;
-	phys_addr_t sensor_pa = top - LGA_AOC_SENSOR_HEAP_SIZE;
+	phys_addr_t aux_pa = top - LGA_AOC_AUX_HEAP_SIZE;
+	phys_addr_t sensor_pa = aux_pa - LGA_AOC_SENSOR_HEAP_SIZE;
 	phys_addr_t playback_pa = sensor_pa - LGA_AOC_PLAYBACK_HEAP_SIZE;
 	phys_addr_t capture_pa = playback_pa - LGA_AOC_CAPTURE_HEAP_SIZE;
 	const u32 kv[][2] = {
@@ -459,11 +745,20 @@ static void lga_aoc_write_boot_params(struct lga_aoc *aoc)
 		{ LGA_AOC_PARAM_CAPTURE_HEAP_ADDR,
 		  lga_aoc_dram_to_iova(aoc, capture_pa) },
 		{ LGA_AOC_PARAM_CAPTURE_HEAP_SIZE, LGA_AOC_CAPTURE_HEAP_SIZE },
-		{ LGA_AOC_PARAM_FORCE_VNOM, 0 },
+		{ LGA_AOC_PARAM_AUX_HEAP_ADDR,
+		  lga_aoc_dram_to_iova(aoc, aux_pa) },
+		{ LGA_AOC_PARAM_AUX_HEAP_SIZE, LGA_AOC_AUX_HEAP_SIZE },
+		{ LGA_AOC_PARAM_FORCE_VNOM, aoc->force_vnom },
 		{ LGA_AOC_PARAM_DISABLE_MM, 0 },
 		{ LGA_AOC_PARAM_ENABLE_UART, 0 },
+		{ LGA_AOC_PARAM_FORCE_SPKR_US, 0 },
 		{ LGA_AOC_PARAM_RAND_SEED, get_random_u32() },
+		{ LGA_AOC_PARAM_CHIP_REV, aoc->chip_rev },
+		{ LGA_AOC_PARAM_CHIP_TYPE, 0 },
 		{ LGA_AOC_PARAM_GNSS_TYPE, aoc->gnss_type },
+		{ LGA_AOC_PARAM_VOLTE_RELEASE_MIF, 0 },
+		{ LGA_AOC_PARAM_CHIP_PRODUCT_ID, aoc->chip_product_id },
+		{ LGA_AOC_PARAM_WIFI_CHIP, aoc->wifi_chip },
 	};
 	__le32 *p = (__le32 *)(aoc->dram + aoc->ipc_offset);
 	unsigned int i;
@@ -524,6 +819,7 @@ static int lga_aoc_discover_services(struct lga_aoc *aoc)
 		memcpy(list[i].name, hdr->name, LGA_AOC_SERVICE_NAME_LEN - 1);
 		list[i].name[LGA_AOC_SERVICE_NAME_LEN - 1] = '\0';
 		list[i].index = i;
+		list[i].flags = flags;
 		list[i].type = FIELD_GET(LGA_AOC_SVC_TYPE_MASK, flags);
 		list[i].mbox_index = FIELD_GET(LGA_AOC_SVC_IRQ_MASK, flags);
 		list[i].down_offset = le32_to_cpu(hdr->regions[LGA_AOC_DIR_DOWN].offset);
@@ -545,9 +841,11 @@ static int lga_aoc_discover_services(struct lga_aoc *aoc)
 	return 0;
 }
 
-static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name)
+static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
+			       bool allow_fallback)
 {
 	const struct firmware *fw;
+	const char *loaded_name = name;
 	size_t body_size;
 	int state, ret;
 
@@ -566,14 +864,31 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name)
 	}
 
 	ret = request_firmware(&fw, name, aoc->dev);
+	if (ret == -ENOENT && allow_fallback &&
+	    strcmp(name, LGA_AOC_DEFAULT_FW) != 0) {
+		dev_info(aoc->dev,
+			 "firmware '%s' not found, falling back to '%s'\n",
+			 name, LGA_AOC_DEFAULT_FW);
+		loaded_name = LGA_AOC_DEFAULT_FW;
+		ret = request_firmware(&fw, loaded_name, aoc->dev);
+	}
 	if (ret) {
-		dev_err(aoc->dev, "request_firmware(%s) failed: %d\n", name, ret);
+		dev_err(aoc->dev, "request_firmware(%s) failed: %d\n",
+			loaded_name, ret);
 		return ret;
 	}
 
 	ret = lga_aoc_parse_fw(aoc, fw);
 	if (ret)
 		goto out_rel;
+
+	ret = lga_aoc_core_pd_set(aoc, true);
+	if (ret)
+		goto out_rel;
+
+	ret = lga_aoc_configure_iommu(aoc, fw);
+	if (ret)
+		goto out_pd;
 
 	if (!aoc->auth_hdr_virt || aoc->auth_hdr_alloc_size < aoc->hdr_size) {
 		/*
@@ -585,7 +900,7 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name)
 							 GFP_KERNEL);
 		if (!aoc->auth_hdr_virt) {
 			ret = -ENOMEM;
-			goto out_rel;
+			goto out_iommu;
 		}
 		aoc->auth_hdr_alloc_size = aoc->hdr_size;
 	}
@@ -602,13 +917,20 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name)
 	ret = gsa_load_aoc_fw_image(aoc->gsa, aoc->auth_hdr_dma, aoc->dram_base);
 	if (ret) {
 		dev_err(aoc->dev, "GSA AoC image authentication failed: %d\n", ret);
-		goto out_rel;
+		goto out_iommu;
 	}
 
 	lga_aoc_write_boot_params(aoc);
 	aoc->loaded = true;
-	dev_info(aoc->dev, "AoC firmware '%s' authenticated and loaded\n", name);
+	dev_info(aoc->dev, "AoC firmware '%s' authenticated and loaded\n",
+		 loaded_name);
+	release_firmware(fw);
+	return 0;
 
+out_iommu:
+	lga_aoc_unmap_iommu(aoc);
+out_pd:
+	lga_aoc_core_pd_set(aoc, false);
 out_rel:
 	release_firmware(fw);
 	return ret;
@@ -616,19 +938,27 @@ out_rel:
 
 static u32 lga_aoc_read_cb_magic(const struct lga_aoc_control_block *cb)
 {
+	dma_rmb();
 	return le32_to_cpu(READ_ONCE(cb->magic));
 }
 
-static int lga_aoc_start_locked(struct lga_aoc *aoc)
+static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 {
 	const struct lga_aoc_control_block *cb;
+	unsigned long deadline;
 	u32 magic = 0;
 	int ret;
+
+	*became_online = false;
 
 	if (!aoc->loaded)
 		return -EINVAL;
 	if (aoc->online)
 		return 0;
+
+	ret = lga_aoc_core_pd_set(aoc, true);
+	if (ret)
+		return ret;
 
 	ret = lga_aoc_set_supplies(aoc, true);
 	if (ret)
@@ -641,31 +971,49 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc)
 	}
 
 	cb = (const struct lga_aoc_control_block *)(aoc->dram + aoc->ipc_offset);
-	ret = read_poll_timeout(lga_aoc_read_cb_magic, magic,
-				magic == LGA_AOC_CONTROL_MAGIC,
-				LGA_AOC_START_POLL_US, LGA_AOC_START_TIMEOUT_US,
-				false, cb);
-	if (ret) {
-		dev_err(aoc->dev,
-			"timed out waiting for AoC control block (magic %#x)\n",
-			magic);
-		return ret;
+	deadline = jiffies + msecs_to_jiffies(LGA_AOC_START_TIMEOUT_MS);
+
+	for (;;) {
+		magic = lga_aoc_read_cb_magic(cb);
+		if (magic == LGA_AOC_CONTROL_MAGIC)
+			break;
+		if (time_after(jiffies, deadline)) {
+			dev_err(aoc->dev,
+				"timed out waiting for AoC control block (magic %#x)\n",
+				magic);
+			return -ETIMEDOUT;
+		}
+		wait_event_timeout(aoc->ipc_wq,
+				   lga_aoc_read_cb_magic(cb) == LGA_AOC_CONTROL_MAGIC,
+				   msecs_to_jiffies(LGA_AOC_START_POLL_MS));
 	}
 
-	return lga_aoc_discover_services(aoc);
+	ret = lga_aoc_discover_services(aoc);
+	if (ret)
+		return ret;
+
+	/* Release boot vote on aoc_core_pd once AoC reports online */
+	lga_aoc_core_pd_set(aoc, false);
+	*became_online = true;
+	return 0;
 }
 
-static int lga_aoc_stop_locked(struct lga_aoc *aoc)
+static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online)
 {
 	int ret;
 
+	*was_online = aoc->online;
+	aoc->online = false;
+	wake_up_all(&aoc->ipc_wq);
+
 	ret = gsa_aoc_stop(aoc->gsa);
 	lga_aoc_set_supplies(aoc, false);
+	lga_aoc_core_pd_set(aoc, false);
+	lga_aoc_unmap_iommu(aoc);
 
 	kfree(aoc->services);
 	aoc->services = NULL;
 	aoc->num_services = 0;
-	aoc->online = false;
 	if (!ret)
 		aoc->loaded = false;
 
@@ -704,13 +1052,13 @@ EXPORT_SYMBOL_GPL(lga_aoc_find_service);
 int lga_aoc_ring_doorbell(struct device *dev, unsigned int mbox_idx)
 {
 	struct lga_aoc *aoc = dev_get_drvdata(dev);
-	u32 word = 1;
 	int ret;
 
 	if (!aoc || mbox_idx >= aoc->num_mboxes || !aoc->mboxes[mbox_idx].chan)
 		return -EINVAL;
 
-	ret = mbox_send_message(aoc->mboxes[mbox_idx].chan, &word);
+	/* Pure doorbell signal works for both payload-size=0 and 1 channels */
+	ret = mbox_send_message(aoc->mboxes[mbox_idx].chan, NULL);
 	if (ret < 0)
 		return ret;
 
@@ -740,6 +1088,87 @@ static bool lga_aoc_region_bounds_ok(struct lga_aoc *aoc, u32 offset,
 	return (u64)aoc->ipc_offset + offset + total <= aoc->dram_size;
 }
 
+static bool lga_aoc_can_read_locked(struct lga_aoc *aoc, u32 service_idx)
+{
+	struct lga_aoc_ipc_service_hdr *hdr;
+	struct lga_aoc_ipc_region *reg;
+	u32 slots, tx, rx;
+
+	hdr = lga_aoc_service_hdr(aoc, service_idx);
+	if (!hdr)
+		return false;
+
+	if (aoc->services[service_idx].type == LGA_AOC_SVC_BUFFER)
+		return false;
+
+	reg = &hdr->regions[LGA_AOC_DIR_UP];
+	slots = le32_to_cpu(READ_ONCE(reg->slots));
+	if (!slots)
+		return false;
+
+	tx = le32_to_cpu(READ_ONCE(reg->tx));
+	rx = le32_to_cpu(READ_ONCE(reg->rx));
+	return tx != rx;
+}
+
+static bool lga_aoc_can_write_locked(struct lga_aoc *aoc, u32 service_idx)
+{
+	struct lga_aoc_ipc_service_hdr *hdr;
+	struct lga_aoc_ipc_region *reg;
+	u32 type, slots, size, tx, rx;
+
+	hdr = lga_aoc_service_hdr(aoc, service_idx);
+	if (!hdr)
+		return false;
+
+	type = aoc->services[service_idx].type;
+	if (type == LGA_AOC_SVC_BUFFER)
+		return false;
+
+	reg = &hdr->regions[LGA_AOC_DIR_DOWN];
+	slots = le32_to_cpu(READ_ONCE(reg->slots));
+	size = le32_to_cpu(READ_ONCE(reg->size));
+	if (!slots || !size)
+		return false;
+
+	if (type == LGA_AOC_SVC_RING)
+		return true;
+
+	tx = le32_to_cpu(READ_ONCE(reg->tx));
+	rx = le32_to_cpu(READ_ONCE(reg->rx));
+	return (u32)(tx - rx) < slots;
+}
+
+bool lga_aoc_ipc_can_read(struct device *dev, u32 service_idx)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	bool ready;
+
+	if (!aoc)
+		return false;
+
+	mutex_lock(&aoc->lock);
+	ready = lga_aoc_can_read_locked(aoc, service_idx);
+	mutex_unlock(&aoc->lock);
+	return ready;
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_can_read);
+
+bool lga_aoc_ipc_can_write(struct device *dev, u32 service_idx)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	bool ready;
+
+	if (!aoc)
+		return false;
+
+	mutex_lock(&aoc->lock);
+	ready = lga_aoc_can_write_locked(aoc, service_idx);
+	mutex_unlock(&aoc->lock);
+	return ready;
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_can_write);
+
 ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 			  const void *buf, size_t len)
 {
@@ -747,7 +1176,7 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 	struct lga_aoc_ipc_service_hdr *hdr;
 	struct lga_aoc_ipc_region *reg;
 	struct lga_aoc_ipc_msg_hdr mhdr = {};
-	u32 offset, size, slots, tx, rx, wp, mbox_idx, type;
+	u32 offset, size, slots, tx, rx, wp, mbox_idx, type, flags;
 	void *slot_ptr;
 	int ret;
 
@@ -762,6 +1191,7 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 	}
 
 	type = aoc->services[service_idx].type;
+	flags = aoc->services[service_idx].flags;
 	mbox_idx = aoc->services[service_idx].mbox_index;
 	reg = &hdr->regions[LGA_AOC_DIR_DOWN];
 	offset = le32_to_cpu(reg->offset);
@@ -778,7 +1208,9 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 	wp = le32_to_cpu(READ_ONCE(reg->wp));
 
 	if (type == LGA_AOC_SVC_QUEUE) {
-		if (tx - rx >= slots) {
+		u32 slot_idx;
+
+		if ((u32)(tx - rx) >= slots) {
 			ret = -ENOSPC;
 			goto out;
 		}
@@ -787,16 +1219,17 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 			ret = -EMSGSIZE;
 			goto out;
 		}
-		wp %= slots;
-		slot_ptr = aoc->dram + aoc->ipc_offset + offset + (size_t)wp * size;
+		slot_idx = tx % slots;
+		slot_ptr = aoc->dram + aoc->ipc_offset + offset +
+			   (size_t)slot_idx * size;
 		mhdr.length = cpu_to_le16(len);
 		memcpy(slot_ptr, &mhdr, sizeof(mhdr));
 		memcpy(slot_ptr + sizeof(mhdr), buf, len);
 		dma_wmb();
-		WRITE_ONCE(reg->wp, cpu_to_le32((wp + 1U) % slots));
 		WRITE_ONCE(reg->tx, cpu_to_le32(tx + 1U));
+		WRITE_ONCE(reg->wp, cpu_to_le32((wp + 1U) % size));
 	} else if (type == LGA_AOC_SVC_RING) {
-		size_t avail = size - min_t(size_t, tx - rx, size);
+		size_t avail = size - min_t(size_t, (u32)(tx - rx), size);
 		size_t first;
 
 		if (len > avail) {
@@ -810,15 +1243,16 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 		if (len > first)
 			memcpy(slot_ptr, buf + first, len - first);
 		dma_wmb();
-		WRITE_ONCE(reg->wp, cpu_to_le32((wp + len) % size));
 		WRITE_ONCE(reg->tx, cpu_to_le32(tx + len));
+		WRITE_ONCE(reg->wp, cpu_to_le32((wp + len) % size));
 	} else {
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
 
 	dma_wmb();
-	if (mbox_idx < aoc->num_mboxes)
+	if ((type != LGA_AOC_SVC_RING || (flags & LGA_AOC_SVC_FLAG_RING_PUSH)) &&
+	    mbox_idx < aoc->num_mboxes)
 		lga_aoc_ring_doorbell(dev, mbox_idx);
 
 	ret = len;
@@ -827,6 +1261,48 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(lga_aoc_ipc_write);
+
+ssize_t lga_aoc_ipc_write_timeout(struct device *dev, u32 service_idx,
+				  const void *buf, size_t len,
+				  unsigned long timeout)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	unsigned long deadline;
+	ssize_t ret;
+
+	if (!aoc || !buf || !len)
+		return -EINVAL;
+
+	ret = lga_aoc_ipc_write(dev, service_idx, buf, len);
+	if (ret != -ENOSPC || !timeout)
+		return ret;
+
+	deadline = jiffies + timeout;
+	for (;;) {
+		long rem = deadline - jiffies;
+		long wret;
+
+		if (rem <= 0)
+			return -ETIMEDOUT;
+
+		wret = wait_event_interruptible_timeout(aoc->ipc_wq,
+							!lga_aoc_is_online(dev) ||
+							lga_aoc_ipc_can_write(dev,
+									      service_idx),
+							rem);
+		if (wret < 0)
+			return wret;
+		if (!lga_aoc_is_online(dev))
+			return -ENODEV;
+
+		ret = lga_aoc_ipc_write(dev, service_idx, buf, len);
+		if (ret != -ENOSPC)
+			return ret;
+		if (wret == 0)
+			return -ETIMEDOUT;
+	}
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_write_timeout);
 
 ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 			 void *buf, size_t max_len)
@@ -872,12 +1348,15 @@ ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 	}
 
 	if (type == LGA_AOC_SVC_QUEUE) {
+		u32 slot_idx;
+
 		if (size <= sizeof(mhdr)) {
 			ret = -EIO;
 			goto out;
 		}
-		rp %= slots;
-		slot_ptr = aoc->dram + aoc->ipc_offset + offset + (size_t)rp * size;
+		slot_idx = rx % slots;
+		slot_ptr = aoc->dram + aoc->ipc_offset + offset +
+			   (size_t)slot_idx * size;
 		memcpy(&mhdr, slot_ptr, sizeof(mhdr));
 		msg_len = le16_to_cpu(mhdr.length);
 		if (msg_len > size - sizeof(mhdr) || msg_len > max_len) {
@@ -886,14 +1365,24 @@ ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 		}
 		memcpy(buf, slot_ptr + sizeof(mhdr), msg_len);
 		dma_wmb();
-		WRITE_ONCE(reg->rp, cpu_to_le32((rp + 1U) % slots));
 		WRITE_ONCE(reg->rx, cpu_to_le32(rx + 1U));
+		WRITE_ONCE(reg->rp, cpu_to_le32((rp + 1U) % size));
 		ret = msg_len;
 	} else if (type == LGA_AOC_SVC_RING) {
-		size_t avail = min_t(size_t, tx - rx, size);
-		size_t to_read = min(avail, max_len);
-		size_t first;
+		u32 delta = tx - rx;
+		size_t avail, to_read, first;
 
+		if (delta > size) {
+			u32 skip = delta - size;
+
+			rx += skip;
+			rp = (rp + skip) % size;
+			WRITE_ONCE(reg->rx, cpu_to_le32(rx));
+			WRITE_ONCE(reg->rp, cpu_to_le32(rp));
+			delta = size;
+		}
+		avail = delta;
+		to_read = min(avail, max_len);
 		rp %= size;
 		slot_ptr = aoc->dram + aoc->ipc_offset + offset;
 		first = min_t(size_t, to_read, size - rp);
@@ -901,8 +1390,8 @@ ssize_t lga_aoc_ipc_read(struct device *dev, u32 service_idx,
 		if (to_read > first)
 			memcpy(buf + first, slot_ptr, to_read - first);
 		dma_wmb();
-		WRITE_ONCE(reg->rp, cpu_to_le32((rp + to_read) % size));
 		WRITE_ONCE(reg->rx, cpu_to_le32(rx + to_read));
+		WRITE_ONCE(reg->rp, cpu_to_le32((rp + to_read) % size));
 		ret = to_read;
 	} else {
 		ret = -EOPNOTSUPP;
@@ -912,6 +1401,48 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(lga_aoc_ipc_read);
+
+ssize_t lga_aoc_ipc_read_timeout(struct device *dev, u32 service_idx,
+				 void *buf, size_t max_len,
+				 unsigned long timeout)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	unsigned long deadline;
+	ssize_t ret;
+
+	if (!aoc || !buf || !max_len)
+		return -EINVAL;
+
+	ret = lga_aoc_ipc_read(dev, service_idx, buf, max_len);
+	if (ret != -EAGAIN || !timeout)
+		return ret;
+
+	deadline = jiffies + timeout;
+	for (;;) {
+		long rem = deadline - jiffies;
+		long wret;
+
+		if (rem <= 0)
+			return -ETIMEDOUT;
+
+		wret = wait_event_interruptible_timeout(aoc->ipc_wq,
+							!lga_aoc_is_online(dev) ||
+							lga_aoc_ipc_can_read(dev,
+									     service_idx),
+							rem);
+		if (wret < 0)
+			return wret;
+		if (!lga_aoc_is_online(dev))
+			return -ENODEV;
+
+		ret = lga_aoc_ipc_read(dev, service_idx, buf, max_len);
+		if (ret != -EAGAIN)
+			return ret;
+		if (wret == 0)
+			return -ETIMEDOUT;
+	}
+}
+EXPORT_SYMBOL_GPL(lga_aoc_ipc_read_timeout);
 
 /* debugfs bring-up interface */
 
@@ -925,14 +1456,19 @@ static int lga_aoc_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "board_cfg: %s\n", aoc->board_cfg ?: "unknown");
 	seq_printf(s, "board_id: %#x\n", aoc->board_id);
 	seq_printf(s, "board_rev: %#x\n", aoc->board_rev);
-	seq_printf(s, "gnss_type: %u\n", aoc->gnss_type);
+	seq_printf(s, "chip_product_id: %u chip_rev: %#x\n",
+		   aoc->chip_product_id, aoc->chip_rev);
+	seq_printf(s, "gnss_type: %u wifi_chip: %u force_vnom: %u\n",
+		   aoc->gnss_type, aoc->wifi_chip, aoc->force_vnom);
 	seq_printf(s, "firmware_name: %s\n", aoc->fw_name);
 	seq_printf(s, "carveout: %pa + %#zx\n", &aoc->dram_base, aoc->dram_size);
 	seq_printf(s, "mboxes: %u (coredump_idx=%u)\n",
 		   aoc->num_mboxes, aoc->coredump_mbox);
 	seq_printf(s, "gsa_aoc_state: %d (%s)\n",
 		   gsa_state, lga_aoc_gsa_state_str(gsa_state));
-	seq_printf(s, "supplies_enabled: %u\n", aoc->supplies_enabled);
+	seq_printf(s, "sswrp_pd_on: %u core_pd_on: %u supplies_enabled: %u iommu_maps: %u\n",
+		   aoc->sswrp_pd_on, aoc->core_pd_on, aoc->supplies_enabled,
+		   aoc->num_iommu_maps);
 	seq_printf(s, "loaded: %u online: %u services: %u\n",
 		   aoc->loaded, aoc->online, aoc->num_services);
 	if (aoc->loaded)
@@ -947,6 +1483,7 @@ static ssize_t lga_aoc_load_write(struct file *file, const char __user *ubuf,
 {
 	struct lga_aoc *aoc = file->private_data;
 	char name[96];
+	bool use_default;
 	const char *fw;
 	int ret;
 
@@ -957,10 +1494,11 @@ static ssize_t lga_aoc_load_write(struct file *file, const char __user *ubuf,
 	name[count] = '\0';
 	strim(name);
 
-	fw = (!strcmp(name, "1") || !*name) ? aoc->fw_name : name;
+	use_default = !strcmp(name, "1") || !*name;
+	fw = use_default ? aoc->fw_name : name;
 
 	mutex_lock(&aoc->lock);
-	ret = lga_aoc_load_locked(aoc, fw);
+	ret = lga_aoc_load_locked(aoc, fw, use_default);
 	mutex_unlock(&aoc->lock);
 	return ret ?: count;
 }
@@ -974,7 +1512,7 @@ static ssize_t lga_aoc_start_write(struct file *file, const char __user *ubuf,
 				   size_t count, loff_t *ppos)
 {
 	struct lga_aoc *aoc = file->private_data;
-	bool en;
+	bool en, became_online = false;
 	int ret;
 
 	ret = kstrtobool_from_user(ubuf, count, &en);
@@ -984,8 +1522,13 @@ static ssize_t lga_aoc_start_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 
 	mutex_lock(&aoc->lock);
-	ret = lga_aoc_start_locked(aoc);
+	ret = lga_aoc_start_locked(aoc, &became_online);
 	mutex_unlock(&aoc->lock);
+
+	if (became_online)
+		blocking_notifier_call_chain(&lga_aoc_notifiers,
+					     LGA_AOC_EVENT_ONLINE, aoc->dev);
+
 	return ret ?: count;
 }
 
@@ -998,7 +1541,7 @@ static ssize_t lga_aoc_stop_write(struct file *file, const char __user *ubuf,
 				  size_t count, loff_t *ppos)
 {
 	struct lga_aoc *aoc = file->private_data;
-	bool en;
+	bool en, was_online = false;
 	int ret;
 
 	ret = kstrtobool_from_user(ubuf, count, &en);
@@ -1008,8 +1551,13 @@ static ssize_t lga_aoc_stop_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 
 	mutex_lock(&aoc->lock);
-	ret = lga_aoc_stop_locked(aoc);
+	ret = lga_aoc_stop_locked(aoc, &was_online);
 	mutex_unlock(&aoc->lock);
+
+	if (was_online)
+		blocking_notifier_call_chain(&lga_aoc_notifiers,
+					     LGA_AOC_EVENT_OFFLINE, aoc->dev);
+
 	return ret ?: count;
 }
 
@@ -1035,11 +1583,11 @@ static int lga_aoc_services_show(struct seq_file *s, void *unused)
 	for (i = 0; i < aoc->num_services; i++) {
 		const struct lga_aoc_service_info *si = &aoc->services[i];
 
-		seq_printf(s, "  %3u %-32s %-6s mbox=%2u down=%ux%u@+%#x up=%ux%u@+%#x\n",
+		seq_printf(s, "  %3u %-32s %-6s flags=%#010x mbox=%2u down=%ux%u@+%#x up=%ux%u@+%#x\n",
 			   si->index, si->name, lga_aoc_svc_type_str(si->type),
-			   si->mbox_index, si->down_slots, si->down_size,
-			   si->down_offset, si->up_slots, si->up_size,
-			   si->up_offset);
+			   si->flags, si->mbox_index,
+			   si->down_slots, si->down_size, si->down_offset,
+			   si->up_slots, si->up_size, si->up_offset);
 	}
 	mutex_unlock(&aoc->lock);
 	return 0;
@@ -1132,23 +1680,56 @@ static const struct file_operations lga_aoc_mbox_fops = {
 	.release = single_release,
 };
 
+static void lga_aoc_read_soc_info(struct lga_aoc *aoc)
+{
+	struct device_node *soc_np, *child;
+	u32 prod_id, major, minor;
+
+	aoc->chip_product_id = LGA_AOC_DEFAULT_PRODUCT_ID;
+	aoc->chip_rev = LGA_AOC_DEFAULT_CHIP_REV;
+
+	soc_np = of_find_node_by_name(NULL, "soc_compatible");
+	if (!soc_np)
+		return;
+
+	child = of_get_next_child(soc_np, NULL);
+	if (child) {
+		if (!of_property_read_u32(child, "product_id", &prod_id))
+			aoc->chip_product_id = prod_id;
+		if (!of_property_read_u32(child, "major", &major) &&
+		    !of_property_read_u32(child, "minor", &minor))
+			aoc->chip_rev = ((major & 0xfU) << 4) | (minor & 0xfU);
+		of_node_put(child);
+	}
+	of_node_put(soc_np);
+}
+
 static void lga_aoc_detach_pds(void *data)
 {
 	struct lga_aoc *aoc = data;
 	int i;
 
+	if (aoc->core_pd_on && !IS_ERR_OR_NULL(aoc->pd_devs[1])) {
+		pm_runtime_put_sync(aoc->pd_devs[1]);
+		aoc->core_pd_on = false;
+	}
+	if (aoc->sswrp_pd_on && !IS_ERR_OR_NULL(aoc->pd_devs[0])) {
+		pm_runtime_put_sync(aoc->pd_devs[0]);
+		aoc->sswrp_pd_on = false;
+	}
+
 	for (i = ARRAY_SIZE(aoc->pd_devs) - 1; i >= 0; i--) {
-		if (aoc->pd_links[i])
-			device_link_del(aoc->pd_links[i]);
-		if (!IS_ERR_OR_NULL(aoc->pd_devs[i]))
+		if (!IS_ERR_OR_NULL(aoc->pd_devs[i])) {
 			dev_pm_domain_detach(aoc->pd_devs[i], true);
+			aoc->pd_devs[i] = NULL;
+		}
 	}
 }
 
 static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 {
 	static const char * const pd_names[] = { "sswrp_aoc_pd", "aoc_core_pd" };
-	int i;
+	int i, ret;
 
 	if (of_count_phandle_with_args(aoc->dev->of_node, "power-domains",
 				       "#power-domain-cells") < 2)
@@ -1156,7 +1737,6 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 
 	for (i = 0; i < ARRAY_SIZE(pd_names); i++) {
 		struct device *pd_dev;
-		struct device_link *link;
 
 		pd_dev = dev_pm_domain_attach_by_name(aoc->dev, pd_names[i]);
 		if (IS_ERR(pd_dev)) {
@@ -1164,16 +1744,17 @@ static int lga_aoc_attach_pds(struct lga_aoc *aoc)
 			return PTR_ERR(pd_dev);
 		}
 		aoc->pd_devs[i] = pd_dev;
-		if (pd_dev) {
-			link = device_link_add(aoc->dev, pd_dev,
-					       DL_FLAG_STATELESS |
-					       DL_FLAG_PM_RUNTIME);
-			if (!link) {
-				lga_aoc_detach_pds(aoc);
-				return -ENOMEM;
-			}
-			aoc->pd_links[i] = link;
+	}
+
+	if (aoc->pd_devs[0]) {
+		ret = pm_runtime_resume_and_get(aoc->pd_devs[0]);
+		if (ret) {
+			dev_err(aoc->dev, "failed to power on sswrp_aoc_pd: %d\n",
+				ret);
+			lga_aoc_detach_pds(aoc);
+			return ret;
 		}
+		aoc->sswrp_pd_on = true;
 	}
 
 	return devm_add_action_or_reset(aoc->dev, lga_aoc_detach_pds, aoc);
@@ -1201,7 +1782,7 @@ static int lga_aoc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
-	struct resource rmem;
+	struct resource rmem, *lcpm_res;
 	struct lga_aoc *aoc;
 	int n_mboxes, ret;
 	unsigned int i;
@@ -1237,6 +1818,20 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	ret = lga_aoc_attach_pds(aoc);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to attach AoC power domains\n");
+
+	lcpm_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "lcpm");
+	if (lcpm_res) {
+		aoc->lcpm = devm_ioremap_resource(dev, lcpm_res);
+		if (IS_ERR(aoc->lcpm)) {
+			dev_warn(dev, "optional lcpm map failed: %ld\n",
+				 PTR_ERR(aoc->lcpm));
+			aoc->lcpm = NULL;
+		} else {
+			aoc->lcpm_size = resource_size(lcpm_res);
+			if (aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
+				writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+		}
+	}
 
 	for (i = 0; i < LGA_AOC_NUM_SUPPLIES; i++) {
 		struct regulator *reg;
@@ -1281,16 +1876,26 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	}
 
 	aoc->coredump_mbox = LGA_AOC_DEFAULT_COREDUMP_MBOX;
+	aoc->board_id = LGA_AOC_DEFAULT_BOARD_ID;
+	aoc->board_rev = LGA_AOC_DEFAULT_BOARD_REV;
+	aoc->force_vnom = 1;
 	of_property_read_u32(np, "google,coredump-mbox", &aoc->coredump_mbox);
 	of_property_read_u32(np, "google,board-id", &aoc->board_id);
 	of_property_read_u32(np, "google,board-rev", &aoc->board_rev);
 	of_property_read_u32(np, "google,gnss-type", &aoc->gnss_type);
+	of_property_read_u32(np, "google,wifi-chip", &aoc->wifi_chip);
+	of_property_read_u32(np, "google,force-vnom", &aoc->force_vnom);
 	of_property_read_string(np, "google,board-cfg", &aoc->board_cfg);
 	if (of_property_read_string(np, "firmware-name", &aoc->fw_name))
 		aoc->fw_name = LGA_AOC_DEFAULT_FW;
+	lga_aoc_read_soc_info(aoc);
 
 	platform_set_drvdata(pdev, aoc);
 	pm_runtime_enable(dev);
+
+	mutex_lock(&lga_aoc_dev_lock);
+	lga_aoc_active_dev = aoc;
+	mutex_unlock(&lga_aoc_dev_lock);
 
 	aoc->debugfs = debugfs_create_dir("lga-aoc", NULL);
 	debugfs_create_file("info", 0400, aoc->debugfs, aoc, &lga_aoc_info_fops);
@@ -1304,18 +1909,24 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	debugfs_create_file("mbox", 0600, aoc->debugfs, aoc, &lga_aoc_mbox_fops);
 
 	dev_info(dev,
-		 "Laguna AoC ready (cfg=%s board=%#x/%#x carveout=%pa+%#zx mboxes=%u)\n",
+		 "Laguna AoC ready (cfg=%s board=%#x/%#x soc=%u/%#x carveout=%pa+%#zx mboxes=%u)\n",
 		 aoc->board_cfg ?: "?", aoc->board_id, aoc->board_rev,
+		 aoc->chip_product_id, aoc->chip_rev,
 		 &aoc->dram_base, aoc->dram_size, aoc->num_mboxes);
 
 	if (autoload) {
+		bool became_online = false;
+
 		mutex_lock(&aoc->lock);
-		ret = lga_aoc_load_locked(aoc, aoc->fw_name);
+		ret = lga_aoc_load_locked(aoc, aoc->fw_name, true);
 		if (!ret)
-			ret = lga_aoc_start_locked(aoc);
+			ret = lga_aoc_start_locked(aoc, &became_online);
 		mutex_unlock(&aoc->lock);
 		if (ret)
 			dev_warn(dev, "autoload failed: %d\n", ret);
+		else if (became_online)
+			blocking_notifier_call_chain(&lga_aoc_notifiers,
+						     LGA_AOC_EVENT_ONLINE, dev);
 	}
 
 	return 0;
@@ -1324,14 +1935,26 @@ static int lga_aoc_probe(struct platform_device *pdev)
 static void lga_aoc_remove(struct platform_device *pdev)
 {
 	struct lga_aoc *aoc = platform_get_drvdata(pdev);
+	bool was_online = false;
 
 	debugfs_remove_recursive(aoc->debugfs);
+
+	mutex_lock(&lga_aoc_dev_lock);
+	if (lga_aoc_active_dev == aoc)
+		lga_aoc_active_dev = NULL;
+	mutex_unlock(&lga_aoc_dev_lock);
+
 	mutex_lock(&aoc->lock);
 	if (aoc->loaded || aoc->online)
-		lga_aoc_stop_locked(aoc);
+		lga_aoc_stop_locked(aoc, &was_online);
 	else
 		lga_aoc_set_supplies(aoc, false);
 	mutex_unlock(&aoc->lock);
+
+	if (was_online)
+		blocking_notifier_call_chain(&lga_aoc_notifiers,
+					     LGA_AOC_EVENT_OFFLINE, aoc->dev);
+
 	pm_runtime_disable(&pdev->dev);
 }
 

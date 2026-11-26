@@ -88,9 +88,25 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: GNSS receiver type identifier passed to AoC firmware
 
+  google,wifi-chip:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Optional Wi-Fi chip identifier passed to AoC firmware
+
+  google,force-vnom:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Override default VNOM boot parameter passed to AoC firmware
+
   google,coredump-mbox:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Index in mboxes reserved for AoC coredump notifications
+
+  bt-shutdown-gpios:
+    maxItems: 1
+    description: Optional Bluetooth BT_REG_ON GPIO for AoC-routed Bluetooth
+
+  bt-ble-dbo-gpios:
+    maxItems: 1
+    description: Optional Bluetooth BLE DBO latch GPIO for AoC-routed Bluetooth
 
   wakeup-source: true
 

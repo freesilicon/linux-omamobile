@@ -10,6 +10,12 @@
 /dts-v1/;
 /plugin/;
 
+#include <dt-bindings/gpio/gpio.h>
+
+&da9188_vgpio {
+	status = "okay";
+};
+
 &aoc_mba_syscon {
 	status = "okay";
 };
@@ -99,5 +105,7 @@
 	google,board-cfg = "MT5";
 	google,board-id = <0x70503>;
 	google,board-rev = <0x10000>;
+	bt-shutdown-gpios = <&da9188_vgpio 0x13 GPIO_ACTIVE_HIGH>;
+	bt-ble-dbo-gpios = <&da9188_vgpio 0x14 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
