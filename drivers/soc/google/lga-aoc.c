@@ -58,10 +58,14 @@
 #define LGA_AOC_PQ_SUBHDR_OFF		0x4630U
 #define LGA_AOC_IMG_CFG_SIZE		256U
 
-/* LCPM scratch/status registers */
-#define LGA_AOC_LCPM_RESET_OFF		0x400U
+/* LCPM core control, boot sync, and bootloader PLL registers */
+#define LGA_AOC_LCPM_A32_CTRL_OFF	0x400U
+#define LGA_AOC_LCPM_F1_CTRL_OFF	0x420U
+#define LGA_AOC_LCPM_HF0_CTRL_OFF	0x440U
+#define LGA_AOC_LCPM_HF1_CTRL_OFF	0x460U
 #define LGA_AOC_LCPM_INIT_OFF		0x480U
-#define LGA_AOC_LOG_DRAIN_MAX		256U
+#define LGA_AOC_LCPM_BOOT_PLL_OFF	0xb000U
+#define LGA_AOC_LOG_SNAPSHOT_MAX	SZ_512K
 
 /* Four heaps reserved at the top of the AoC carve-out (total 0x434000) */
 #define LGA_AOC_AUX_HEAP_SIZE		SZ_128K
@@ -309,6 +313,16 @@ static bool configure_iommu = true;
 module_param(configure_iommu, bool, 0644);
 MODULE_PARM_DESC(configure_iommu,
 		 "Map AoC firmware IOMMU windows into a non-identity SMMU domain");
+
+static bool persist_iommu;
+module_param(persist_iommu, bool, 0644);
+MODULE_PARM_DESC(persist_iommu,
+		 "Keep AoC SMMU mappings across warm stop/reload instead of unmapping and remapping");
+
+static bool reset_sswrp_on_stop = true;
+module_param(reset_sswrp_on_stop, bool, 0644);
+MODULE_PARM_DESC(reset_sswrp_on_stop,
+		 "Power-cycle sswrp_aoc_pd after GSA unload on debugfs stop");
 
 static const char * const lga_aoc_supply_names[LGA_AOC_NUM_SUPPLIES] = {
 	[LGA_AOC_SUPPLY_1V8] = "sensor-1v8",
@@ -912,6 +926,43 @@ static int lga_aoc_discover_services(struct lga_aoc *aoc)
 	return 0;
 }
 
+struct lga_aoc_lcpm_snapshot {
+	bool has_core;
+	bool has_pll;
+	u32 a32;
+	u32 f1;
+	u32 hf0;
+	u32 hf1;
+	u32 init;
+	u32 pll_cfg;
+	u32 pll_req;
+	u32 pll_stat;
+};
+
+static void lga_aoc_read_lcpm(struct lga_aoc *aoc,
+			      struct lga_aoc_lcpm_snapshot *snap)
+{
+	memset(snap, 0, sizeof(*snap));
+	if (!aoc->lcpm || !aoc->sswrp_pd_on)
+		return;
+
+	if (aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32)) {
+		snap->has_core = true;
+		snap->a32 = readl(aoc->lcpm + LGA_AOC_LCPM_A32_CTRL_OFF);
+		snap->f1 = readl(aoc->lcpm + LGA_AOC_LCPM_F1_CTRL_OFF);
+		snap->hf0 = readl(aoc->lcpm + LGA_AOC_LCPM_HF0_CTRL_OFF);
+		snap->hf1 = readl(aoc->lcpm + LGA_AOC_LCPM_HF1_CTRL_OFF);
+		snap->init = readl(aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
+	}
+
+	if (aoc->lcpm_size >= LGA_AOC_LCPM_BOOT_PLL_OFF + 3U * sizeof(u32)) {
+		snap->has_pll = true;
+		snap->pll_cfg = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF);
+		snap->pll_req = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF + 4U);
+		snap->pll_stat = readl(aoc->lcpm + LGA_AOC_LCPM_BOOT_PLL_OFF + 8U);
+	}
+}
+
 static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 			       bool allow_fallback)
 {
@@ -956,6 +1007,14 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	ret = lga_aoc_core_pd_set(aoc, true);
 	if (ret)
 		goto out_rel;
+
+	/*
+	 * Clear LCPM boot-sync scratch only while both sswrp_aoc_pd and
+	 * aoc_core_pd are powered on so warm reloads match cold-boot state.
+	 */
+	if (aoc->lcpm && aoc->sswrp_pd_on &&
+	    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
+		writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
 
 	ret = lga_aoc_alloc_mboxes(aoc);
 	if (ret)
@@ -1003,6 +1062,8 @@ static int lga_aoc_load_locked(struct lga_aoc *aoc, const char *name,
 	return 0;
 
 out_pd:
+	if (!persist_iommu)
+		lga_aoc_unmap_iommu(aoc);
 	lga_aoc_core_pd_set(aoc, false);
 out_rel:
 	release_firmware(fw);
@@ -1082,17 +1143,8 @@ static int lga_aoc_power_cycle_sswrp(struct lga_aoc *aoc)
 	if (!pinctrl_ret)
 		google_pinctrl_aoc_ssr_request(false);
 
-	if (aoc->sswrp_pd_on) {
-		int dev_pm_ret;
-
-		if (aoc->lcpm &&
-		    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32))
-			writel(0, aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
-
-		dev_pm_ret = pm_runtime_resume_and_get(aoc->dev);
-		if (dev_pm_ret >= 0)
-			pm_runtime_put(aoc->dev);
-	}
+	if (aoc->sswrp_pd_on)
+		pm_runtime_resume(aoc->dev);
 
 	return ret < 0 ? ret : 0;
 }
@@ -1138,18 +1190,15 @@ static int lga_aoc_start_locked(struct lga_aoc *aoc, bool *became_online)
 		if (time_after(jiffies, deadline)) {
 			int gsa_state = gsa_send_aoc_cmd(aoc->gsa,
 							 GSA_AOC_GET_STATE);
-			u32 lcpm_rst = 0, lcpm_init = 0;
+			struct lga_aoc_lcpm_snapshot lcpm;
 
-			if (aoc->lcpm &&
-			    aoc->lcpm_size >= LGA_AOC_LCPM_INIT_OFF + sizeof(u32)) {
-				lcpm_rst = readl(aoc->lcpm + LGA_AOC_LCPM_RESET_OFF);
-				lcpm_init = readl(aoc->lcpm + LGA_AOC_LCPM_INIT_OFF);
-			}
-
+			lga_aoc_read_lcpm(aoc, &lcpm);
 			dev_err(aoc->dev,
-				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d lcpm %#x/%#x)\n",
+				"timed out waiting for AoC control block (magic %#x status %#x gsa_state %d lcpm a32=%#x f1=%#x hf0=%#x hf1=%#x init=%#x pll=%#x/%#x/%#x)\n",
 				magic, le32_to_cpu(READ_ONCE(cb->status)),
-				gsa_state, lcpm_rst, lcpm_init);
+				gsa_state, lcpm.a32, lcpm.f1, lcpm.hf0,
+				lcpm.hf1, lcpm.init, lcpm.pll_cfg,
+				lcpm.pll_req, lcpm.pll_stat);
 			lga_aoc_set_supplies(aoc, false);
 			lga_aoc_core_pd_set(aoc, false);
 			return -ETIMEDOUT;
@@ -1191,22 +1240,24 @@ static int lga_aoc_stop_locked(struct lga_aoc *aoc, bool *was_online,
 	}
 
 	/*
-	 * Hold aoc_core_pd awake across GSA SHUTDOWN + UNLOAD to match Laguna's
-	 * offline hardware contract, then release mailboxes and drop
-	 * aoc_core_pd (waiting for GENPD_NOTIFY_OFF) before cycling
-	 * sswrp_aoc_pd.
+	 * Disable external sensor supplies and hold aoc_core_pd awake across
+	 * GSA SHUTDOWN + UNLOAD to match Laguna's offline hardware contract,
+	 * then unmap SMMU windows (when !persist_iommu), release mailboxes, and
+	 * drop aoc_core_pd before cycling sswrp_aoc_pd.
 	 */
+	lga_aoc_set_supplies(aoc, false);
 	lga_aoc_core_pd_set(aoc, true);
 
 	ret = gsa_aoc_stop(aoc->gsa);
-	lga_aoc_set_supplies(aoc, false);
 
 	kfree(aoc->services);
 	aoc->services = NULL;
 	aoc->num_services = 0;
 	if (!ret) {
 		aoc->loaded = false;
-		if (reset_sswrp) {
+		if (!persist_iommu)
+			lga_aoc_unmap_iommu(aoc);
+		if (reset_sswrp && reset_sswrp_on_stop) {
 			/*
 			 * Free all AoC mailbox channels and drop aoc_core_pd
 			 * before cycling sswrp_aoc_pd so goog-mba-ctrl
@@ -1730,9 +1781,13 @@ EXPORT_SYMBOL_GPL(lga_aoc_ipc_read_timeout);
 static int lga_aoc_info_show(struct seq_file *s, void *unused)
 {
 	struct lga_aoc *aoc = s->private;
+	struct lga_aoc_lcpm_snapshot lcpm;
 	int gsa_state;
 
 	gsa_state = gsa_send_aoc_cmd(aoc->gsa, GSA_AOC_GET_STATE);
+	mutex_lock(&aoc->lock);
+	lga_aoc_read_lcpm(aoc, &lcpm);
+	mutex_unlock(&aoc->lock);
 
 	seq_printf(s, "board_cfg: %s\n", aoc->board_cfg ?: "unknown");
 	seq_printf(s, "board_id: %#x\n", aoc->board_id);
@@ -1750,6 +1805,14 @@ static int lga_aoc_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "sswrp_pd_on: %u core_pd_on: %u supplies_enabled: %u iommu_maps: %u\n",
 		   aoc->sswrp_pd_on, aoc->core_pd_on, aoc->supplies_enabled,
 		   aoc->num_iommu_maps);
+	if (lcpm.has_core) {
+		seq_printf(s, "lcpm: a32=%#x f1=%#x hf0=%#x hf1=%#x init=%#x",
+			   lcpm.a32, lcpm.f1, lcpm.hf0, lcpm.hf1, lcpm.init);
+		if (lcpm.has_pll)
+			seq_printf(s, " pll=%#x/%#x/%#x",
+				   lcpm.pll_cfg, lcpm.pll_req, lcpm.pll_stat);
+		seq_putc(s, '\n');
+	}
 	seq_printf(s, "loaded: %u online: %u services: %u\n",
 		   aoc->loaded, aoc->online, aoc->num_services);
 	if (aoc->loaded)
@@ -1961,65 +2024,173 @@ static const struct file_operations lga_aoc_mbox_fops = {
 	.release = single_release,
 };
 
+static void lga_aoc_log_emit_slot(struct seq_file *s, const char *prefix,
+				  unsigned int seq_idx, u32 slot_idx,
+				  const u8 *data, size_t len)
+{
+	char ascii[128];
+	size_t i, trim_len = len, alen = 0;
+	bool all_ascii = true;
+
+	while (trim_len && (data[trim_len - 1] == '\0' ||
+			    data[trim_len - 1] == '\n' ||
+			    data[trim_len - 1] == '\r'))
+		trim_len--;
+
+	for (i = 0; i < trim_len; i++) {
+		u8 c = data[i];
+
+		if (c == '\t' || (c >= 0x20 && c <= 0x7e))
+			continue;
+		all_ascii = false;
+		break;
+	}
+
+	if (all_ascii && trim_len) {
+		seq_printf(s, "[%s%03u slot=%03u %zuB] %.*s\n",
+			   prefix, seq_idx, slot_idx, len,
+			   (int)trim_len, data);
+		return;
+	}
+
+	for (i = 0; i < len && alen < sizeof(ascii) - 1; i++) {
+		u8 c = data[i];
+
+		ascii[alen++] = (c >= 0x20 && c <= 0x7e) ? (char)c : '.';
+	}
+	ascii[alen] = '\0';
+
+	seq_printf(s, "[%s%03u slot=%03u %zuB] %*ph | %s\n",
+		   prefix, seq_idx, slot_idx, len,
+		   (int)min_t(size_t, len, 48U), data, ascii);
+}
+
 static int lga_aoc_log_show(struct seq_file *s, void *unused)
 {
 	struct lga_aoc *aoc = s->private;
-	struct lga_aoc_service_info svc;
-	u8 *buf;
-	size_t max_len;
-	unsigned int count = 0;
-	int ret;
+	const struct lga_aoc_ipc_service_hdr *hdr;
+	const struct lga_aoc_ipc_region *reg;
+	u32 svc_idx = 0, offset, size, slots, tx, rx, wp, rp;
+	u32 start_slot, walk_slots, i, emitted = 0;
+	size_t total_bytes;
+	bool found = false;
+	u8 *snap;
 
-	ret = lga_aoc_find_service(aoc->dev, "logging", &svc);
-	if (ret) {
-		seq_printf(s, "logging service unavailable (%d)\n", ret);
+	mutex_lock(&aoc->lock);
+	if (!aoc->online) {
+		mutex_unlock(&aoc->lock);
+		seq_puts(s, "logging service unavailable (-19)\n");
 		return 0;
 	}
 
-	if (svc.type != LGA_AOC_SVC_QUEUE || svc.up_size <= 8U) {
-		seq_printf(s, "unsupported logging service layout (type=%u up=%u)\n",
-			   svc.type, svc.up_size);
-		return 0;
-	}
-
-	max_len = min_t(size_t, svc.up_size - 8U, 512U);
-	buf = kmalloc(max_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	while (count < LGA_AOC_LOG_DRAIN_MAX) {
-		ssize_t n, i;
-		bool all_ascii = true;
-
-		n = lga_aoc_ipc_read(aoc->dev, svc.index, buf, max_len);
-		if (n <= 0)
+	for (i = 0; i < aoc->num_services; i++) {
+		if (!strcmp(aoc->services[i].name, "logging")) {
+			svc_idx = i;
+			found = true;
 			break;
-
-		for (i = 0; i < n; i++) {
-			u8 c = buf[i];
-
-			if (c == '\0' || c == '\n' || c == '\r' || c == '\t')
-				continue;
-			if (c < 0x20 || c > 0x7e) {
-				all_ascii = false;
-				break;
-			}
 		}
-
-		if (all_ascii) {
-			seq_printf(s, "[%03u %zdB] %.*s\n",
-				   count, n, (int)n, buf);
-		} else {
-			seq_printf(s, "[%03u %zdB] %*ph\n",
-				   count, n, (int)min_t(ssize_t, n, 64), buf);
-		}
-		count++;
+	}
+	if (!found) {
+		mutex_unlock(&aoc->lock);
+		seq_puts(s, "logging service unavailable (-2)\n");
+		return 0;
 	}
 
-	if (!count)
+	hdr = lga_aoc_service_hdr(aoc, svc_idx);
+	if (!hdr || aoc->services[svc_idx].type != LGA_AOC_SVC_QUEUE) {
+		u32 type = aoc->services[svc_idx].type;
+		u32 up_sz = aoc->services[svc_idx].up_size;
+
+		mutex_unlock(&aoc->lock);
+		seq_printf(s, "unsupported logging service layout (type=%u up=%u)\n",
+			   type, up_sz);
+		return 0;
+	}
+
+	reg = &hdr->regions[LGA_AOC_DIR_UP];
+	offset = le32_to_cpu(reg->offset);
+	size = le32_to_cpu(reg->size);
+	slots = le32_to_cpu(reg->slots);
+
+	if (!lga_aoc_region_bounds_ok(aoc, offset, size, slots) ||
+	    size <= sizeof(struct lga_aoc_ipc_msg_hdr) ||
+	    (u64)slots * size > LGA_AOC_LOG_SNAPSHOT_MAX) {
+		mutex_unlock(&aoc->lock);
+		seq_printf(s, "unsupported logging service layout (slots=%u size=%u)\n",
+			   slots, size);
+		return 0;
+	}
+
+	/*
+	 * Snapshot AoC's circular overwrite logging queue non-destructively
+	 * without mutating rx/rp: AoC advances rx together with tx so standard
+	 * queue reads see tx == rx and return -EAGAIN.
+	 */
+	tx = le32_to_cpu(READ_ONCE(reg->tx));
+	rx = le32_to_cpu(READ_ONCE(reg->rx));
+	wp = le32_to_cpu(READ_ONCE(reg->wp));
+	rp = le32_to_cpu(READ_ONCE(reg->rp));
+	dma_rmb();
+
+	total_bytes = (size_t)slots * size;
+	snap = kvmalloc(total_bytes, GFP_KERNEL);
+	if (!snap) {
+		mutex_unlock(&aoc->lock);
+		return -ENOMEM;
+	}
+
+	memcpy(snap, aoc->dram + aoc->ipc_offset + offset, total_bytes);
+	mutex_unlock(&aoc->lock);
+
+	seq_printf(s, "# logging up: tx=%u rx=%u wp=%u rp=%u slots=%u size=%u\n",
+		   tx, rx, wp, rp, slots, size);
+
+	if (!tx) {
+		seq_puts(s, "(empty)\n");
+		kvfree(snap);
+		return 0;
+	}
+
+	walk_slots = min(tx, slots);
+	start_slot = tx < slots ? 0U : (wp % slots);
+
+	for (i = 0; i < walk_slots; i++) {
+		u32 slot_idx = (start_slot + i) % slots;
+		const u8 *slot = snap + (size_t)slot_idx * size;
+		struct lga_aoc_ipc_msg_hdr mhdr;
+		size_t msg_len;
+
+		memcpy(&mhdr, slot, sizeof(mhdr));
+		msg_len = le16_to_cpu(mhdr.length);
+		if (!msg_len || msg_len > size - sizeof(mhdr))
+			continue;
+
+		lga_aoc_log_emit_slot(s, "", emitted, slot_idx,
+				      slot + sizeof(mhdr), msg_len);
+		emitted++;
+	}
+
+	if (!emitted) {
+		for (i = 0; i < walk_slots; i++) {
+			u32 slot_idx = (start_slot + i) % slots;
+			const u8 *slot = snap + (size_t)slot_idx * size;
+			size_t raw_len = size;
+
+			while (raw_len && !slot[raw_len - 1])
+				raw_len--;
+			if (!raw_len)
+				continue;
+
+			lga_aoc_log_emit_slot(s, "raw ", emitted, slot_idx,
+					      slot, raw_len);
+			emitted++;
+		}
+	}
+
+	if (!emitted)
 		seq_puts(s, "(empty)\n");
 
-	kfree(buf);
+	kvfree(snap);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(lga_aoc_log);
@@ -2247,6 +2418,7 @@ static int lga_aoc_probe(struct platform_device *pdev)
 	lga_aoc_read_soc_info(aoc);
 
 	platform_set_drvdata(pdev, aoc);
+	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 
 	mutex_lock(&lga_aoc_dev_lock);
