@@ -118,6 +118,9 @@ struct google_lga_pcie {
 	struct gpio_desc *perstn_gpio;
 	struct mutex link_lock; /* serializes RC poweron/poweroff/speed transitions */
 	spinlock_t state_lock; /* guards powered_on, is_link_up, recovery_flags */
+	raw_spinlock_t cfg_lock; /* serializes on-demand config access with powerdown */
+	struct pci_ops *orig_root_ops;
+	struct pci_ops *orig_child_ops;
 	struct pci_saved_state *saved_state;
 	google_pcie_callback_func cb_func;
 	void *cb_priv;
@@ -141,6 +144,7 @@ struct google_lga_pcie {
 	bool auto_gate_enabled;
 	bool clocks_enabled;
 	bool powered_on;
+	bool cfg_powered;
 	bool is_link_up;
 	bool msi_irqs_enabled;
 	bool cpl_irq_enabled;
@@ -458,6 +462,10 @@ static int google_lga_pcie_power_up_hw(struct google_lga_pcie *lga)
 	lga->powered_on = true;
 	spin_unlock_irqrestore(&lga->state_lock, flags);
 
+	raw_spin_lock_irqsave(&lga->cfg_lock, flags);
+	WRITE_ONCE(lga->cfg_powered, true);
+	raw_spin_unlock_irqrestore(&lga->cfg_lock, flags);
+
 	google_lga_pcie_configure_dbi(lga);
 	return 0;
 
@@ -469,10 +477,114 @@ err_disable_clks:
 	return ret;
 }
 
+static struct google_lga_pcie *google_lga_pcie_from_bus(struct pci_bus *bus)
+{
+	struct dw_pcie_rp *pp = bus->sysdata;
+
+	return to_google_lga_pcie(to_dw_pcie_from_pp(pp));
+}
+
+static struct pci_ops *google_lga_pcie_orig_ops(struct google_lga_pcie *lga,
+						struct pci_bus *bus)
+{
+	return pci_is_root_bus(bus) ? lga->orig_root_ops : lga->orig_child_ops;
+}
+
+static void __iomem *google_lga_pcie_pci_map_bus(struct pci_bus *bus,
+						 unsigned int devfn, int where)
+{
+	struct google_lga_pcie *lga = google_lga_pcie_from_bus(bus);
+	struct pci_ops *orig_ops = google_lga_pcie_orig_ops(lga, bus);
+
+	if (!READ_ONCE(lga->cfg_powered) || !orig_ops || !orig_ops->map_bus)
+		return NULL;
+
+	return orig_ops->map_bus(bus, devfn, where);
+}
+
+static int google_lga_pcie_pci_cfg_access(struct pci_bus *bus,
+					  unsigned int devfn, int where,
+					  int size, u32 *val, bool write)
+{
+	struct google_lga_pcie *lga = google_lga_pcie_from_bus(bus);
+	struct pci_ops *orig_ops = google_lga_pcie_orig_ops(lga, bus);
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&lga->cfg_lock, flags);
+	if (!lga->cfg_powered || !orig_ops ||
+	    (write ? !orig_ops->write : !orig_ops->read)) {
+		raw_spin_unlock_irqrestore(&lga->cfg_lock, flags);
+		if (!write)
+			*val = ~0U;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+	ret = write ? orig_ops->write(bus, devfn, where, size, *val) :
+		      orig_ops->read(bus, devfn, where, size, val);
+	raw_spin_unlock_irqrestore(&lga->cfg_lock, flags);
+
+	return ret;
+}
+
+static int google_lga_pcie_pci_cfg_read(struct pci_bus *bus, unsigned int devfn,
+					int where, int size, u32 *val)
+{
+	return google_lga_pcie_pci_cfg_access(bus, devfn, where, size, val,
+						false);
+}
+
+static int google_lga_pcie_pci_cfg_write(struct pci_bus *bus,
+					 unsigned int devfn, int where,
+					 int size, u32 val)
+{
+	return google_lga_pcie_pci_cfg_access(bus, devfn, where, size, &val,
+						true);
+}
+
+static struct pci_ops google_lga_pcie_pci_ops = {
+	.map_bus = google_lga_pcie_pci_map_bus,
+	.read = google_lga_pcie_pci_cfg_read,
+	.write = google_lga_pcie_pci_cfg_write,
+};
+
+static void google_lga_pcie_override_child_bus_ops(struct pci_bus *bus)
+{
+	struct pci_bus *child;
+
+	list_for_each_entry(child, &bus->children, node) {
+		pci_bus_set_ops(child, &google_lga_pcie_pci_ops);
+		google_lga_pcie_override_child_bus_ops(child);
+	}
+}
+
+static int google_lga_pcie_setup_rc(struct google_lga_pcie *lga)
+{
+	struct dw_pcie_rp *pp = &lga->pci.pp;
+	int ret;
+
+	if (!lga->orig_child_ops)
+		return dw_pcie_setup_rc(pp);
+
+	/*
+	 * dw_pcie_setup_rc() skips dw_pcie_iatu_setup() unless child_ops is
+	 * dw_child_pcie_ops; temporarily expose orig_child_ops under
+	 * pci_rescan_remove_lock so ATU windows are programmed on power-on.
+	 */
+	pp->bridge->child_ops = lga->orig_child_ops;
+	ret = dw_pcie_setup_rc(pp);
+	pp->bridge->child_ops = &google_lga_pcie_pci_ops;
+
+	return ret;
+}
+
 static void google_lga_pcie_power_down_hw(struct google_lga_pcie *lga)
 {
 	struct device *dev = lga->pci.dev;
 	unsigned long flags;
+
+	raw_spin_lock_irqsave(&lga->cfg_lock, flags);
+	WRITE_ONCE(lga->cfg_powered, false);
+	raw_spin_unlock_irqrestore(&lga->cfg_lock, flags);
 
 	spin_lock_irqsave(&lga->state_lock, flags);
 	lga->powered_on = false;
@@ -613,6 +725,12 @@ static int google_lga_pcie_host_init(struct dw_pcie_rp *pp)
 	if (ret)
 		goto err_pwrctrl_off;
 
+	if (lga->on_demand && !pp->ecam_enabled) {
+		lga->orig_root_ops = pp->bridge->ops;
+		lga->orig_child_ops = pp->bridge->child_ops;
+		pp->bridge->ops = &google_lga_pcie_pci_ops;
+	}
+
 	return 0;
 
 err_pwrctrl_off:
@@ -632,6 +750,13 @@ static void google_lga_pcie_host_post_init(struct dw_pcie_rp *pp)
 	struct google_lga_pcie *lga = to_google_lga_pcie(pci);
 
 	if (lga->on_demand) {
+		if (!pp->ecam_enabled && lga->orig_child_ops) {
+			pci_lock_rescan_remove();
+			pp->bridge->child_ops = &google_lga_pcie_pci_ops;
+			if (pp->bridge->bus)
+				google_lga_pcie_override_child_bus_ops(pp->bridge->bus);
+			pci_unlock_rescan_remove();
+		}
 		lga->msi_irqs_enabled = true;
 		return;
 	}
@@ -800,7 +925,7 @@ int google_pcie_rc_poweron(int num)
 	dev = lga->pci.dev;
 	pci = &lga->pci;
 
-	rescan = !READ_ONCE(lga->enumeration_done);
+	rescan = !READ_ONCE(lga->enumeration_done) || lga->orig_child_ops;
 	if (rescan)
 		pci_lock_rescan_remove();
 
@@ -836,7 +961,9 @@ int google_pcie_rc_poweron(int num)
 	}
 
 	pci->max_link_speed = lga->target_link_speed ?: lga->max_link_speed;
-	dw_pcie_setup_rc(&pci->pp);
+	ret = google_lga_pcie_setup_rc(lga);
+	if (ret)
+		goto hw_down;
 	google_lga_pcie_configure_dbi(lga);
 	google_lga_pcie_set_msi_irqs(lga, true);
 
@@ -1380,6 +1507,7 @@ static int google_lga_pcie_probe(struct platform_device *pdev)
 	lga->pci.pp.ops = &google_lga_pcie_host_ops;
 	mutex_init(&lga->link_lock);
 	spin_lock_init(&lga->state_lock);
+	raw_spin_lock_init(&lga->cfg_lock);
 	INIT_LIST_HEAD(&lga->node);
 	platform_set_drvdata(pdev, lga);
 
