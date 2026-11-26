@@ -1208,8 +1208,8 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 	u32 k_woff = 0, k_roff = 0, fw_woff = 0, fw_roff = 0;
 	u32 exec = 0, irq_cnt = 0, pow_st = 0, faults = 0, hwr_flags = 0;
 	u32 cr_poll_addr = 0, cr_poll_mask = 0;
-	u32 irq_os0 = 0, ev_stat = 0, scratch14 = 0;
-	u64 mmu1 = 0, mmu2 = 0, mmu_meta = 0;
+	u32 irq_os0 = 0, ev_stat = 0, scratch14 = 0, spu_en = 0;
+	u64 mmu1 = 0, mmu2 = 0, mmu_meta = 0, clk_ctrl0 = 0;
 	bool regs_active;
 
 	if (!laguna)
@@ -1242,17 +1242,19 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 		irq_os0 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_STATUS);
 		ev_stat = pvr_cr_read32(pvr_dev, VOLCANIC_CR_EVENT_STATUS);
 		scratch14 = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SCRATCH14);
+		spu_en = pvr_cr_read32(pvr_dev, VOLCANIC_CR_SPU_ENABLE);
+		clk_ctrl0 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_CLK_CTRL0);
 		mmu1 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS1);
 		mmu2 = pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS2);
 		mmu_meta = pvr_cr_read64(pvr_dev, VOLCANIC_CR_MMU_FAULT_STATUS_META);
 	}
 
 	drm_warn(drm_dev,
-		 "Laguna FW state [%s]: kccb=%u/%u fwccb=%u/%u exec=%u irq_cnt=%u pow=%u faults=%u hwr=%#x poll=%#x/%#x regs=%u irq=%#x ev=%#x s14=%u mmu=%#llx/%#llx/%#llx\n",
+		 "Laguna FW state [%s]: kccb=%u/%u fwccb=%u/%u exec=%u irq_cnt=%u pow=%u faults=%u hwr=%#x poll=%#x/%#x regs=%u irq=%#x ev=%#x s14=%u spu=%#x clk0=%#llx mmu=%#llx/%#llx/%#llx\n",
 		 reason, k_woff, k_roff, fw_woff, fw_roff, exec, irq_cnt,
 		 pow_st, faults, hwr_flags, cr_poll_addr, cr_poll_mask,
 		 regs_active ? 1U : 0U, irq_os0, ev_stat, scratch14,
-		 mmu1, mmu2, mmu_meta);
+		 spu_en, clk_ctrl0, mmu1, mmu2, mmu_meta);
 
 	if (faults && laguna->fwif_sysdata) {
 		u32 count = min_t(u32, faults, 4U);
@@ -1439,8 +1441,11 @@ static int pvr_laguna_translate_kccb_cmd(const struct rogue_fwif_kccb_cmd *in,
 				     PVR_LAGUNA_MMUCACHE_FLAGS_PD |
 				     PVR_LAGUNA_MMUCACHE_FLAGS_PC;
 		}
-		if (in_flags & ROGUE_FWIF_MMUCACHEDATA_FLAGS_INTERRUPT)
-			out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_INTERRUPT;
+		/*
+		 * Always request a host IRQ on MMU cache flushes so waiters in
+		 * pvr_mmu_flush_exec() and bind IRQ health checks wake promptly.
+		 */
+		out_flags |= PVR_LAGUNA_MMUCACHE_FLAGS_INTERRUPT;
 
 		out->cmd_type = PVR_LAGUNA_KCCB_CMD_MMUCACHE;
 		out->data.mmucache.cache_flags = out_flags;
@@ -1897,7 +1902,7 @@ static void pvr_laguna_runtime_cfg_init(void *cpu_ptr, void *priv)
 	struct pvr_laguna_fwif_runtime_cfg *cfg = cpu_ptr;
 	struct pvr_device *pvr_dev = priv;
 
-	cfg->active_pm_latency_ms = 0;
+	cfg->active_pm_latency_ms = PVR_LAGUNA_ACTIVE_PM_LATENCY_MS;
 	cfg->active_pm_latency_persistant = 1;
 	cfg->core_clock_speed = (u32)pvr_laguna_get_core_clk_rate(pvr_dev);
 	cfg->soc_clock_speed = PVR_LAGUNA_GTC_FREQ_HZ;
@@ -1990,7 +1995,7 @@ static void pvr_laguna_sysinit_init(void *cpu_ptr, void *priv)
 	sysinit->initial_core_clock_speed =
 		(u32)pvr_laguna_get_core_clk_rate(pvr_dev);
 	sysinit->initial_soc_clock_speed = PVR_LAGUNA_GTC_FREQ_HZ;
-	sysinit->initial_active_pm_latency_ms = 0;
+	sysinit->initial_active_pm_latency_ms = PVR_LAGUNA_ACTIVE_PM_LATENCY_MS;
 	sysinit->firmware_started = 0;
 	sysinit->marker_val = 1;
 	if (laguna->fw_coremem_data_alloc_size) {
@@ -2005,10 +2010,10 @@ static void pvr_laguna_sysinit_init(void *cpu_ptr, void *priv)
 	strscpy((char *)sysinit->bvnc_km_feature_flags,
 		PVR_LAGUNA_BVNC_STRING, 24);
 	{
-		u16 gpu_cores = 1;
+		u32 hwperf_flags = PVR_LAGUNA_HWPERF_BVNC_FEATURE_FLAGS;
 
-		memcpy(&sysinit->bvnc_km_feature_flags[0x1e], &gpu_cores,
-		       sizeof(gpu_cores));
+		memcpy(&sysinit->bvnc_km_feature_flags[0x18], &hwperf_flags,
+		       sizeof(hwperf_flags));
 	}
 }
 
@@ -2118,8 +2123,9 @@ static void pvr_laguna_fwif_destroy_structures(struct pvr_device *pvr_dev)
 		laguna->fwif_align_checks_obj = NULL;
 	}
 	if (laguna->fwif_mmucache_sync_obj) {
-		pvr_fw_object_destroy(laguna->fwif_mmucache_sync_obj);
+		pvr_fw_object_unmap_and_destroy(laguna->fwif_mmucache_sync_obj);
 		laguna->fwif_mmucache_sync_obj = NULL;
+		laguna->mmucache_sync = NULL;
 	}
 	if (laguna->fwif_power_sync_obj) {
 		pvr_fw_object_unmap_and_destroy(laguna->fwif_power_sync_obj);
@@ -2143,11 +2149,16 @@ static int pvr_laguna_fwif_create_structures(struct pvr_device *pvr_dev)
 		goto err_destroy;
 	}
 
-	err = pvr_fw_object_create(pvr_dev, sizeof(u32),
-				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED, NULL, NULL,
-				   &laguna->fwif_mmucache_sync_obj);
-	if (err)
+	laguna->mmucache_sync =
+		pvr_fw_object_create_and_map(pvr_dev, sizeof(u32),
+					     PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+					     NULL, NULL,
+					     &laguna->fwif_mmucache_sync_obj);
+	if (IS_ERR(laguna->mmucache_sync)) {
+		err = PTR_ERR(laguna->mmucache_sync);
+		laguna->mmucache_sync = NULL;
 		goto err_destroy;
+	}
 
 	err = pvr_fw_object_create(pvr_dev, PVR_LAGUNA_FAULT_PAGE_SIZE,
 				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
@@ -2372,10 +2383,13 @@ static void pvr_laguna_fw_health_check_poll(struct pvr_device *pvr_dev)
 		.cmd_type = ROGUE_FWIF_KCCB_CMD_HEALTH_CHECK,
 	};
 	ktime_t deadline;
+	u32 before_exec;
 	u32 slot = 0;
-	u32 rtn = 0;
+	u32 exec = 0;
+	bool done = false;
 	int err;
 
+	before_exec = READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed);
 	err = pvr_kccb_send_cmd_powered(pvr_dev, &cmd, &slot);
 	if (err) {
 		drm_warn(drm_dev, "Volcanic FW health check send failed (%d)\n",
@@ -2383,22 +2397,31 @@ static void pvr_laguna_fw_health_check_poll(struct pvr_device *pvr_dev)
 		return;
 	}
 
+	/*
+	 * DDK 25.3 KCCB_CMD_HEALTH_CHECK advances read_offset and increments
+	 * osdata->kccb_cmds_executed without writing kccb_rtn[slot] or raising
+	 * a host IRQ.
+	 */
 	deadline = ktime_add_us(ktime_get(), PVR_LAGUNA_FW_HEALTH_TIMEOUT_US);
 	while (ktime_before(ktime_get(), deadline)) {
-		rtn = READ_ONCE(laguna->kccb_rtn[slot]);
-		if (rtn & PVR_LAGUNA_KCCB_RTN_CMD_EXECUTED)
+		exec = READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed);
+		if (exec != before_exec &&
+		    READ_ONCE(laguna->kccb_ctl->read_offset) ==
+		    READ_ONCE(laguna->kccb_ctl->write_offset)) {
+			done = true;
 			break;
+		}
 		usleep_range(200, 500);
 	}
 
 	if (!pvr_dev->irq && pvr_laguna_irq_pending(pvr_dev))
 		pvr_laguna_irq_clear(pvr_dev);
 
-	if (rtn & PVR_LAGUNA_KCCB_RTN_CMD_EXECUTED) {
+	if (done) {
 		drm_info(drm_dev,
-			 "Volcanic FW KCCB HEALTH_CHECK passed (slot=%u, rtn=%#x, executed=%u)\n",
-			 slot, rtn,
-			 READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed));
+			 "Volcanic FW KCCB HEALTH_CHECK passed (slot=%u, woff=%u, roff=%u, executed=%u)\n",
+			 slot, READ_ONCE(laguna->kccb_ctl->write_offset),
+			 READ_ONCE(laguna->kccb_ctl->read_offset), exec);
 	} else {
 		drm_warn(drm_dev,
 			 "Volcanic FW KCCB HEALTH_CHECK timed out (slot=%u, woff=%u, roff=%u, executed=%u)\n",
@@ -2414,14 +2437,34 @@ void pvr_laguna_fw_health_check_irq(struct pvr_device *pvr_dev)
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct pvr_laguna_data *laguna = pvr_dev->laguna;
 	struct rogue_fwif_kccb_cmd cmd = {
-		.cmd_type = ROGUE_FWIF_KCCB_CMD_HEALTH_CHECK,
+		.cmd_type = ROGUE_FWIF_KCCB_CMD_MMUCACHE,
 	};
 	u32 slot = 0;
 	u32 rtn = 0;
+	u32 sync_target;
+	u32 sync_val = 0;
+	long ret;
 	int err;
 
-	if (!laguna || !READ_ONCE(laguna->fw_kccb_ready))
+	if (!laguna || !READ_ONCE(laguna->fw_kccb_ready) ||
+	    !laguna->fwif_mmucache_sync_obj || !laguna->mmucache_sync)
 		return;
+
+	sync_target = ++laguna->mmucache_sync_seq;
+	if (!sync_target)
+		sync_target = ++laguna->mmucache_sync_seq;
+
+	WRITE_ONCE(*laguna->mmucache_sync, 0);
+	wmb(); /* Ensure cleared MMUCACHE sync word reaches DRAM before KCCB. */
+
+	cmd.cmd_data.mmu_cache_data.cache_flags =
+		ROGUE_FWIF_MMUCACHEDATA_FLAGS_PT |
+		ROGUE_FWIF_MMUCACHEDATA_FLAGS_PD |
+		ROGUE_FWIF_MMUCACHEDATA_FLAGS_PC |
+		ROGUE_FWIF_MMUCACHEDATA_FLAGS_INTERRUPT;
+	pvr_fw_object_get_fw_addr(laguna->fwif_mmucache_sync_obj,
+				  &cmd.cmd_data.mmu_cache_data.mmu_cache_sync_fw_addr);
+	cmd.cmd_data.mmu_cache_data.mmu_cache_sync_update_value = sync_target;
 
 	err = pvr_kccb_send_cmd_powered(pvr_dev, &cmd, &slot);
 	if (err) {
@@ -2430,20 +2473,32 @@ void pvr_laguna_fw_health_check_irq(struct pvr_device *pvr_dev)
 		return;
 	}
 
-	err = pvr_kccb_wait_for_completion(pvr_dev, slot,
-					   msecs_to_jiffies(250), &rtn);
-	if (err) {
+	/*
+	 * Verify live GICv3 IRQ 162 delivery at bind: FW writes the sync word
+	 * (and/or kccb_rtn[slot]) and raises OS0 IRQ, whose threaded handler
+	 * wakes pvr_dev->kccb.rtn_q.
+	 */
+	ret = wait_event_timeout(pvr_dev->kccb.rtn_q,
+				 (READ_ONCE(laguna->kccb_rtn[slot]) &
+				  PVR_LAGUNA_KCCB_RTN_CMD_EXECUTED) ||
+				 READ_ONCE(*laguna->mmucache_sync) == sync_target,
+				 msecs_to_jiffies(250));
+	rtn = READ_ONCE(laguna->kccb_rtn[slot]);
+	sync_val = READ_ONCE(*laguna->mmucache_sync);
+	if (!ret) {
 		drm_warn(drm_dev,
-			 "Volcanic FW IRQ health check timed out (%d, slot=%u, rtn=%#x, irq=%#x)\n",
-			 err, slot, rtn,
+			 "Volcanic FW IRQ health check timed out (slot=%u, rtn=%#x, sync=%u/%u, irq=%#x)\n",
+			 slot, rtn, sync_val, sync_target,
 			 pvr_cr_read32(pvr_dev, VOLCANIC_CR_IRQ_OS0_EVENT_STATUS));
 		pvr_laguna_dump_fw_state(pvr_dev, "health-irq-timeout");
 		return;
 	}
 
 	drm_info(drm_dev,
-		 "Volcanic FW IRQ KCCB HEALTH_CHECK passed (slot=%u, rtn=%#x, executed=%u)\n",
-		 slot, rtn, READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed));
+		 "Volcanic FW IRQ KCCB MMUCACHE passed (slot=%u, rtn=%#x, sync=%u, executed=%u, irq_cnt=%u)\n",
+		 slot, rtn, sync_val,
+		 READ_ONCE(laguna->fwif_osdata->kccb_cmds_executed),
+		 READ_ONCE(laguna->fwif_osdata->interrupt_count));
 }
 
 int pvr_laguna_wait_pow_off(struct pvr_device *pvr_dev)

@@ -212,6 +212,8 @@ struct pvr_laguna_data {
 	struct pvr_laguna_fwif_ccb_ctl *fwccb_ctl;
 	struct pvr_laguna_fwif_fwccb_cmd *fwccb;
 	u32 *power_sync;
+	u32 *mmucache_sync;
+	u32 mmucache_sync_seq;
 
 	struct work_struct restart_work;
 	spinlock_t restart_lock; /* protects restart burst tracking */

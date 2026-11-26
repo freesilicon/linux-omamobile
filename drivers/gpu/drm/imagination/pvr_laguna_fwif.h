@@ -90,9 +90,24 @@ static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
 /* DDK 25.3 Client CCB control structure size (32 bytes, RGXCreateCCB). */
 #define PVR_LAGUNA_FWIF_CCCB_CTL_SIZE		32U
 
-/* DDK 25.3 default init config flags (HWR_EN | CTXSWITCH_PROFILE_MEDIUM). */
-#define PVR_LAGUNA_FWIF_INICFG_DEFAULT		(BIT(2) | (2U << 16))
+/*
+ * DDK 25.3 Volcanic init config flags for Laguna (BVNC 71.2.2448.1212):
+ *  - BIT(4):  POW_RASCALDUST (enable-firmware-managed-spu-power = 1)
+ *  - BIT(6):  FBCDC_V3_1_EN (system FBCDC v3.1+ enabled)
+ *  - BIT(10): pipelined datamasters init flag
+ *  - 2 << 16: CTXSWITCH_PROFILE_MEDIUM
+ * Note: BIT(2) (HWPERF_EN) stays clear while no HWPerf L1 buffer is allocated.
+ */
+#define PVR_LAGUNA_FWIF_INICFG_POW_RASCALDUST	BIT(4)
+#define PVR_LAGUNA_FWIF_INICFG_FBCDC_V3_1_EN	BIT(6)
+#define PVR_LAGUNA_FWIF_INICFG_PIPELINED_DM	BIT(10)
+#define PVR_LAGUNA_FWIF_INICFG_DEFAULT		(PVR_LAGUNA_FWIF_INICFG_POW_RASCALDUST | \
+						 PVR_LAGUNA_FWIF_INICFG_FBCDC_V3_1_EN | \
+						 PVR_LAGUNA_FWIF_INICFG_PIPELINED_DM | \
+						 (2U << 16))
 #define PVR_LAGUNA_FWIF_OS_INICFG_DEFAULT	0x1fU
+#define PVR_LAGUNA_ACTIVE_PM_LATENCY_MS		1U
+#define PVR_LAGUNA_HWPERF_BVNC_FEATURE_FLAGS	0x0003c701U
 
 /* DDK 25.3 OS-FW connection states in RGXFWIF_CONNECTION_CTL. */
 #define PVR_LAGUNA_FW_CONN_OS_OFFLINE		0U
