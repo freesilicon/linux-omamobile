@@ -235,6 +235,9 @@ pvr_compute_job_fw_cmd_init(struct pvr_job *job,
 	cmd = job->cmd;
 	cmd->common.frame_num = 0;
 	cmd->flags = convert_compute_flags(args->flags);
+	if (job->pvr_dev->laguna)
+		return pvr_laguna_translate_cmd_compute(job);
+
 	return 0;
 }
 

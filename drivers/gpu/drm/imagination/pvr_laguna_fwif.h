@@ -87,6 +87,63 @@ struct pvr_laguna_fwif_ccb_cmd_header {
 
 static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) == 16);
 
+/* DDK 25.3 Volcanic RGXFWIF_CMDCDM flags (at cmd_cdm + 0x40). */
+#define PVR_LAGUNA_CDM_FLAG_WGP_CHECKSUM	BIT(0)
+#define PVR_LAGUNA_CDM_FLAG_PREVENT_ALL_OVERLAP	BIT(1)
+#define PVR_LAGUNA_CDM_FLAG_USRM_RECONFIG	BIT(3)
+
+/*
+ * DDK 25.3 Volcanic RGXFWIF_CDM_REGISTERS (56 bytes, loaded at CMDCDM + 0x08).
+ * Matches the live Volcanic firmware register-load order:
+ *   +0x00: CR 0x17a8 (TPU_BORDER_COLOUR_TABLE_CDM)
+ *   +0x08: CR 0x1878 (TPU_TAG_CDM_CTRL)
+ *   +0x10: CR 0x04e8 (CDM_CTRL_STREAM_BASE)
+ *   +0x18: CR 0x0598 (CDM_CB_QUEUE)
+ *   +0x20: CDM_CONTEXT_LOAD_PDS1 (written via CR 0x04e0 on context load)
+ *   +0x28: CR 0x0498 (CDM_CONTEXT_STATE_BASE_ADDR)
+ *   +0x30: CR 0x04d0 (CDM_ITEM)
+ */
+struct pvr_laguna_fwif_cdm_regs {
+	u64 tpu_border_colour_table;
+	u64 tpu_tag_cdm_ctrl;
+	u64 cdm_ctrl_stream_base;
+	u64 cdm_cb_queue;
+	u32 cdm_resume_pds1;
+	u32 pad_24;
+	u64 cdm_context_state_base_addr;
+	u32 cdm_item;
+	u32 pad_34;
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_cdm_regs) == 56);
+static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_ctrl_stream_base) == 0x10);
+static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_resume_pds1) == 0x20);
+static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_context_state_base_addr) == 0x28);
+static_assert(offsetof(struct pvr_laguna_fwif_cdm_regs, cdm_item) == 0x30);
+
+/*
+ * DDK 25.3 Volcanic RGXFWIF_CMDCDM (120 bytes; 136 bytes / 0x88 with 16-byte
+ * cCCB command header as DMA-loaded by the Volcanic firmware CDM kick path).
+ */
+struct pvr_laguna_fwif_cmd_cdm {
+	u32 frame_num;
+	u32 pad_04;
+	struct pvr_laguna_fwif_cdm_regs regs;
+	u32 flags;
+	u32 num_shareds;
+	u32 max_num_temp_regions;
+	u32 usc_tasks_stride;
+	u64 reserved_50;
+	u32 wgp_checksum[8];
+} __aligned(8);
+static_assert(sizeof(struct pvr_laguna_fwif_cmd_cdm) == 120);
+static_assert(sizeof(struct pvr_laguna_fwif_ccb_cmd_header) +
+	      sizeof(struct pvr_laguna_fwif_cmd_cdm) == 136);
+static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, regs) == 0x08);
+static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, flags) == 0x40);
+static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, max_num_temp_regions) == 0x48);
+static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, usc_tasks_stride) == 0x4c);
+static_assert(offsetof(struct pvr_laguna_fwif_cmd_cdm, wgp_checksum) == 0x58);
+
 /* DDK 25.3 Client CCB control structure size (32 bytes, RGXCreateCCB). */
 #define PVR_LAGUNA_FWIF_CCCB_CTL_SIZE		32U
 

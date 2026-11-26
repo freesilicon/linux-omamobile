@@ -9,11 +9,13 @@
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_gem.h"
+#include "pvr_job.h"
 #include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_queue.h"
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_rogue_fwif.h"
+#include "pvr_rogue_fwif_client.h"
 #include "pvr_rogue_fwif_common.h"
 #include "pvr_rogue_heap_config.h"
 #include "pvr_vm.h"
@@ -25,6 +27,7 @@
 
 #include <linux/align.h>
 #include <linux/arm-smccc.h>
+#include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/cred.h>
@@ -1201,6 +1204,87 @@ void pvr_laguna_schedule_restart(struct pvr_device *pvr_dev)
 	queue_work(pvr_dev->sched_wq, &laguna->restart_work);
 }
 
+static const char *pvr_laguna_mmu_level_name(u32 level)
+{
+	switch (level) {
+	case 0:
+		return "PT";
+	case 1:
+		return "PD";
+	case 2:
+		return "PC";
+	case 3:
+		return "CatBase";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *pvr_laguna_mmu_req_name(u32 bank, u32 req_id, bool fbm,
+					   bool writeback)
+{
+	if (fbm)
+		return writeback ? "FBM-hdr" : "FBM";
+
+	if (bank == VOLCANIC_DXT_48_1536_JONES_BIF_ID) {
+		if (req_id == 0)
+			return "IPP";
+		if (req_id <= 14)
+			return "DCE";
+		if (req_id <= 19)
+			return "TDM";
+		if (req_id == 20)
+			return "PM";
+		if (req_id <= 31)
+			return "CDM";
+		if (req_id == 32)
+			return "FW";
+		if (req_id == 33)
+			return "FW_DMA";
+		if (req_id <= 49)
+			return "TE";
+		if (req_id <= 52)
+			return "RCE";
+		return "Jones";
+	}
+
+	if (bank < VOLCANIC_DXT_48_1536_JONES_BIF_ID)
+		return (bank & 1U) ? "SPU-BIFB" : "SPU-BIFA";
+
+	return writeback ? "WB" : "unknown";
+}
+
+static void pvr_laguna_log_mmu_fault(struct pvr_device *pvr_dev,
+				     const char *tag, u64 status1, u64 status2)
+{
+	struct pvr_laguna_data *laguna = pvr_dev->laguna;
+	u32 level, req_id, pc_ctx, ftype, bank;
+	bool valid, rnw, fbm, wb;
+	u64 va;
+
+	if (!status1 && !status2)
+		return;
+
+	valid = !!(status1 & VOLCANIC_CR_MMU_FAULT_STATUS1_FAULT_EN);
+	ftype = FIELD_GET(VOLCANIC_CR_MMU_FAULT_STATUS1_TYPE_MASK, status1);
+	rnw = !!(status1 & VOLCANIC_CR_MMU_FAULT_STATUS1_RNW_EN);
+	va = status1 & VOLCANIC_CR_MMU_FAULT_STATUS1_ADDRESS_MASK;
+	pc_ctx = FIELD_GET(VOLCANIC_CR_MMU_FAULT_STATUS1_CONTEXT_MASK, status1);
+	req_id = FIELD_GET(VOLCANIC_CR_MMU_FAULT_STATUS1_REQ_ID_MASK, status1);
+	level = FIELD_GET(VOLCANIC_CR_MMU_FAULT_STATUS1_LEVEL_MASK, status1);
+	bank = FIELD_GET(VOLCANIC_CR_MMU_FAULT_STATUS2_BIF_ID_MASK, status2);
+	wb = !!(status2 & VOLCANIC_CR_MMU_FAULT_STATUS2_WRITEBACK_EN);
+	fbm = !!(status2 & VOLCANIC_CR_MMU_FAULT_STATUS2_FBM_FAULT_EN);
+
+	drm_err(from_pvr_device(pvr_dev),
+		"Laguna MMU fault [%s]: valid=%u %s va=%#llx level=%s(%u) pc=%u bank=%u req=%s(%#x) type=%u last_cdm(cs=%#llx ctx=%#llx)\n",
+		tag, valid ? 1U : 0U, rnw ? "read" : "write", va,
+		pvr_laguna_mmu_level_name(level), level, pc_ctx, bank,
+		pvr_laguna_mmu_req_name(bank, req_id, fbm, wb), req_id, ftype,
+		laguna ? READ_ONCE(laguna->last_cdm_cs_base) : 0ULL,
+		laguna ? READ_ONCE(laguna->last_cdm_ctx_state_base) : 0ULL);
+}
+
 void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
@@ -1255,6 +1339,8 @@ void pvr_laguna_dump_fw_state(struct pvr_device *pvr_dev, const char *reason)
 		 pow_st, faults, hwr_flags, cr_poll_addr, cr_poll_mask,
 		 regs_active ? 1U : 0U, irq_os0, ev_stat, scratch14,
 		 spu_en, clk_ctrl0, mmu1, mmu2, mmu_meta);
+	if (mmu1 || mmu2)
+		pvr_laguna_log_mmu_fault(pvr_dev, reason, mmu1, mmu2);
 
 	if (faults && laguna->fwif_sysdata) {
 		u32 count = min_t(u32, faults, 4U);
@@ -1643,14 +1729,18 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev)
 			break;
 		case PVR_LAGUNA_FWCCB_CMD_CONTEXT_RESET:
 			drm_err(from_pvr_device(pvr_dev),
-				"Laguna FW context reset (ctx=%u, dm=%u, reason=%u, job_ref=%u, pc=%#llx, mmu=%#llx/%#llx)\n",
+				"Laguna FW context reset (ctx=%u, dm=%u, reason=%u, job_ref=%u, pc=%#llx, mmu=%#llx/%#llx, cdm_cs=%#llx)\n",
 				cmd.data.ctx_reset.server_common_context_id,
 				cmd.data.ctx_reset.dm,
 				cmd.data.ctx_reset.reset_reason,
 				cmd.data.ctx_reset.reset_job_ref,
 				cmd.data.ctx_reset.pc_address,
 				cmd.data.ctx_reset.mmu_status[0],
-				cmd.data.ctx_reset.mmu_status[1]);
+				cmd.data.ctx_reset.mmu_status[1],
+				READ_ONCE(laguna->last_cdm_cs_base));
+			pvr_laguna_log_mmu_fault(pvr_dev, "ctx-reset",
+						 cmd.data.ctx_reset.mmu_status[0],
+						 cmd.data.ctx_reset.mmu_status[1]);
 			pvr_laguna_dump_fw_state(pvr_dev, "ctx-reset");
 			break;
 		case PVR_LAGUNA_FWCCB_CMD_DEBUG_DUMP:
@@ -1749,6 +1839,45 @@ void pvr_laguna_copy_cdm_cswitch_regs(void *fw_ctx_map,
 	dst->cdm_resume_pds0 = src->cdmreg_cdm_resume_pds0;
 	dst->cdm_context_pds0_b = src->cdmreg_cdm_context_pds0_b;
 	dst->cdm_resume_pds0_b = src->cdmreg_cdm_resume_pds0_b;
+}
+
+int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
+{
+	struct pvr_laguna_data *laguna = job->pvr_dev->laguna;
+	const struct rogue_fwif_cmd_compute *src = job->cmd;
+	struct pvr_laguna_fwif_cmd_cdm *dst;
+
+	if (!laguna || !src || job->cmd_len < sizeof(*src))
+		return -EINVAL;
+
+	dst = kzalloc_obj(*dst, GFP_KERNEL);
+	if (!dst)
+		return -ENOMEM;
+
+	dst->frame_num = src->common.frame_num;
+	dst->regs.tpu_border_colour_table = src->regs.tpu_border_colour_table;
+	dst->regs.tpu_tag_cdm_ctrl = src->regs.tpu_tag_cdm_ctrl;
+	dst->regs.cdm_ctrl_stream_base = src->regs.cdm_ctrl_stream_base;
+	dst->regs.cdm_cb_queue = src->regs.cdm_cb_queue;
+	dst->regs.cdm_resume_pds1 = src->regs.cdm_resume_pds1;
+	dst->regs.cdm_context_state_base_addr =
+		src->regs.cdm_context_state_base_addr;
+	dst->regs.cdm_item = src->regs.cdm_item;
+
+	if (src->flags & ROGUE_COMPUTE_FLAG_PREVENT_ALL_OVERLAP)
+		dst->flags |= PVR_LAGUNA_CDM_FLAG_PREVENT_ALL_OVERLAP;
+
+	dst->max_num_temp_regions = src->num_temp_regions;
+
+	WRITE_ONCE(laguna->last_cdm_cs_base, dst->regs.cdm_ctrl_stream_base);
+	WRITE_ONCE(laguna->last_cdm_ctx_state_base,
+		   dst->regs.cdm_context_state_base_addr);
+
+	kfree(job->cmd);
+	job->cmd = dst;
+	job->cmd_len = sizeof(*dst);
+
+	return 0;
 }
 
 static int pvr_laguna_fw_defs_init(struct pvr_device *pvr_dev)

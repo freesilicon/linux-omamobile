@@ -27,6 +27,7 @@ struct clk;
 struct firmware;
 struct pvr_device;
 struct pvr_fw_object;
+struct pvr_job;
 struct pvr_power_sequence_ops;
 struct pvr_queue;
 struct rogue_fwif_cdm_registers_cswitch;
@@ -214,6 +215,8 @@ struct pvr_laguna_data {
 	u32 *power_sync;
 	u32 *mmucache_sync;
 	u32 mmucache_sync_seq;
+	u64 last_cdm_cs_base;
+	u64 last_cdm_ctx_state_base;
 
 	struct work_struct restart_work;
 	spinlock_t restart_lock; /* protects restart burst tracking */
@@ -257,5 +260,6 @@ void pvr_laguna_fwccb_process(struct pvr_device *pvr_dev);
 void pvr_laguna_init_fw_common_context(struct pvr_queue *queue, void *fw_ctx_map);
 void pvr_laguna_copy_cdm_cswitch_regs(void *fw_ctx_map,
 				      const struct rogue_fwif_cdm_registers_cswitch *src);
+int pvr_laguna_translate_cmd_compute(struct pvr_job *job);
 
 #endif /* PVR_LAGUNA_H */
