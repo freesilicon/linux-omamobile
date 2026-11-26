@@ -8,6 +8,7 @@
 #include "pvr_free_list.h"
 #include "pvr_fw.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 
 #include <drm/drm_managed.h>
@@ -188,6 +189,11 @@ void pvr_fwccb_process(struct pvr_device *pvr_dev)
 	struct rogue_fwif_ccb_ctl *ctrl = pvr_dev->fwccb.ctrl;
 	u32 read_offset;
 
+	if (pvr_dev->laguna) {
+		pvr_laguna_fwccb_process(pvr_dev);
+		return;
+	}
+
 	mutex_lock(&pvr_dev->fwccb.lock);
 
 	while ((read_offset = READ_ONCE(ctrl->read_offset)) != READ_ONCE(ctrl->write_offset)) {
@@ -237,11 +243,17 @@ pvr_kccb_used_slot_count_locked(struct pvr_device *pvr_dev)
 {
 	struct pvr_ccb *pvr_ccb = &pvr_dev->kccb.ccb;
 	struct rogue_fwif_ccb_ctl *ctrl = pvr_ccb->ctrl;
-	u32 wr_offset = READ_ONCE(ctrl->write_offset);
-	u32 rd_offset = READ_ONCE(ctrl->read_offset);
+	u32 wr_offset;
+	u32 rd_offset;
 	u32 used_count;
 
 	lockdep_assert_held(&pvr_ccb->lock);
+
+	if (pvr_dev->laguna)
+		return pvr_laguna_kccb_used_slot_count_locked(pvr_dev);
+
+	wr_offset = READ_ONCE(ctrl->write_offset);
+	rd_offset = READ_ONCE(ctrl->read_offset);
 
 	if (wr_offset >= rd_offset)
 		used_count = wr_offset - rd_offset;
@@ -268,6 +280,11 @@ pvr_kccb_send_cmd_reserved_powered(struct pvr_device *pvr_dev,
 	struct rogue_fwif_ccb_ctl *ctrl = pvr_ccb->ctrl;
 	u32 old_write_offset;
 	u32 new_write_offset;
+
+	if (pvr_dev->laguna) {
+		pvr_laguna_kccb_send_cmd_reserved_powered(pvr_dev, cmd, kccb_slot);
+		return;
+	}
 
 	WARN_ON(pvr_dev->lost);
 
@@ -374,6 +391,9 @@ pvr_kccb_send_cmd_powered(struct pvr_device *pvr_dev, struct rogue_fwif_kccb_cmd
 {
 	int err;
 
+	if (pvr_dev->laguna && !pvr_laguna_kccb_ready(pvr_dev))
+		return -ENODEV;
+
 	err = pvr_kccb_reserve_slot_sync(pvr_dev);
 	if (err)
 		return err;
@@ -446,6 +466,9 @@ pvr_kccb_is_idle(struct pvr_device *pvr_dev)
 {
 	struct rogue_fwif_ccb_ctl *ctrl = pvr_dev->kccb.ccb.ctrl;
 	bool idle;
+
+	if (pvr_dev->laguna)
+		return pvr_laguna_kccb_is_idle(pvr_dev);
 
 	mutex_lock(&pvr_dev->kccb.ccb.lock);
 

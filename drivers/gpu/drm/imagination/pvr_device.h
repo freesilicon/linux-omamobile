@@ -39,6 +39,9 @@ struct firmware;
 /* Forward declaration from <linux/pwrseq/consumer.h> */
 struct pwrseq_desc;
 
+/* Forward declaration from "pvr_laguna.h" */
+struct pvr_laguna_data;
+
 #define PVR_GPUID_STRING_MIN_LENGTH 7U
 #define PVR_GPUID_STRING_MAX_LENGTH 32U
 
@@ -68,6 +71,7 @@ struct pvr_fw_version {
  */
 struct pvr_device_data {
 	const struct pvr_power_sequence_ops *pwr_ops;
+	bool is_laguna;
 };
 
 /**
@@ -113,6 +117,9 @@ struct pvr_device {
 
 	/** @device_data: Pointer to platform-specific data. */
 	const struct pvr_device_data *device_data;
+
+	/** @laguna: Optional Tensor G5 Laguna platform state. */
+	struct pvr_laguna_data *laguna;
 
 	/** @regs_resource: Resource representing device control registers. */
 	struct resource *regs_resource;

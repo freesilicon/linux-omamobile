@@ -5,9 +5,11 @@
 #include "pvr_fw.h"
 #include "pvr_fw_meta.h"
 #include "pvr_fw_startstop.h"
+#include "pvr_laguna.h"
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_rogue_meta.h"
 #include "pvr_vm.h"
+#include "pvr_volcanic_defs.h"
 
 #include <linux/compiler.h>
 #include <linux/delay.h>
@@ -93,6 +95,35 @@ rogue_slc_init(struct pvr_device *pvr_dev)
 	return 0;
 }
 
+static void
+volcanic_mmu_cbase_init(struct pvr_device *pvr_dev)
+{
+	dma_addr_t pc_dma_addr;
+	u32 pc_pfn;
+
+	/* Acquire the address of the Kernel Page Catalogue (OSID 0 / FW). */
+	pc_dma_addr = pvr_vm_get_page_table_root_addr(pvr_dev->kernel_vm_ctx);
+	pc_pfn = (pc_dma_addr >> VOLCANIC_CR_MMU_CBASE_MAPPING_ADDR_ALIGNSHIFT) &
+		 VOLCANIC_CR_MMU_CBASE_MAPPING_ADDR_MASK;
+
+	/* Program MMUv4 catalogue base via CBASE_MAPPING instead of Rogue BIF. */
+	pvr_cr_write32(pvr_dev, VOLCANIC_CR_MMU_CBASE_MAPPING_CONTEXT,
+		       MMU_CONTEXT_MAPPING_FWPRIV);
+	pvr_cr_write32(pvr_dev, VOLCANIC_CR_MMU_CBASE_MAPPING, pc_pfn);
+}
+
+static void
+volcanic_spu_enable_init(struct pvr_device *pvr_dev)
+{
+	u64 num_spus = 1;
+	u32 spu_mask;
+
+	PVR_FEATURE_VALUE(pvr_dev, num_spus, &num_spus);
+	spu_mask = (u32)GENMASK(min_t(u64, num_spus, 32) - 1, 0);
+
+	pvr_cr_write32(pvr_dev, VOLCANIC_CR_SPU_ENABLE, spu_mask);
+}
+
 /**
  * pvr_fw_start() - Start FW processor and boot firmware
  * @pvr_dev: Target PowerVR device.
@@ -108,6 +139,9 @@ pvr_fw_start(struct pvr_device *pvr_dev)
 	u64 soft_reset_mask;
 	int err;
 
+	if (pvr_dev->laguna)
+		return pvr_laguna_fw_start(pvr_dev);
+
 	if (PVR_HAS_FEATURE(pvr_dev, pbe2_in_xe))
 		soft_reset_mask = ROGUE_CR_SOFT_RESET__PBE2_XE__MASKFULL;
 	else
@@ -122,8 +156,15 @@ pvr_fw_start(struct pvr_device *pvr_dev)
 		(void)pvr_cr_read32(pvr_dev, ROGUE_CR_SYS_BUS_SECURE); /* Fence write */
 	}
 
-	if (pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_RISCV)
-		pvr_cr_write32(pvr_dev, ROGUE_CR_FWCORE_BOOT, 0);
+	if (pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_RISCV) {
+		u32 boot_reg = pvr_dev->features.is_volcanic ?
+			VOLCANIC_CR_FWCORE_BOOT : ROGUE_CR_FWCORE_BOOT;
+
+		pvr_cr_write32(pvr_dev, boot_reg, 0);
+	}
+
+	if (pvr_dev->features.is_volcanic)
+		volcanic_spu_enable_init(pvr_dev);
 
 	/* Set Rogue in soft-reset. */
 	pvr_cr_write64(pvr_dev, ROGUE_CR_SOFT_RESET, soft_reset_mask);
@@ -161,12 +202,16 @@ pvr_fw_start(struct pvr_device *pvr_dev)
 	/* Initialise Firmware wrapper. */
 	pvr_dev->fw_dev.defs->wrapper_init(pvr_dev);
 
-	/* We must init the AXI-ACE interface before first BIF transaction. */
-	rogue_axi_ace_list_init(pvr_dev);
+	if (pvr_dev->features.is_volcanic) {
+		volcanic_mmu_cbase_init(pvr_dev);
+	} else {
+		/* We must init the AXI-ACE interface before first BIF transaction. */
+		rogue_axi_ace_list_init(pvr_dev);
 
-	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
-		/* Initialise BIF. */
-		rogue_bif_init(pvr_dev);
+		if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
+			/* Initialise BIF. */
+			rogue_bif_init(pvr_dev);
+		}
 	}
 
 	/* Need to wait for at least 16 cycles before taking the FW processor out of reset ... */
@@ -179,8 +224,11 @@ pvr_fw_start(struct pvr_device *pvr_dev)
 	udelay(3);
 
 	if (pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_RISCV) {
+		u32 boot_reg = pvr_dev->features.is_volcanic ?
+			VOLCANIC_CR_FWCORE_BOOT : ROGUE_CR_FWCORE_BOOT;
+
 		/* Boot the FW. */
-		pvr_cr_write32(pvr_dev, ROGUE_CR_FWCORE_BOOT, 1);
+		pvr_cr_write32(pvr_dev, boot_reg, 1);
 		udelay(3);
 	}
 
@@ -214,6 +262,27 @@ pvr_fw_stop(struct pvr_device *pvr_dev)
 	bool meta_fw = pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_META;
 	u32 reg_value;
 	int err;
+
+	if (pvr_dev->laguna)
+		return pvr_laguna_fw_stop(pvr_dev);
+
+	if (pvr_dev->features.is_volcanic) {
+		/*
+		 * Volcanic S7_TOP replaces Rogue BIF status registers with
+		 * JONES_IDLE and FWCORE_BOOT control.
+		 */
+		err = pvr_cr_poll_reg32(pvr_dev, VOLCANIC_CR_JONES_IDLE,
+					VOLCANIC_CR_JONES_IDLE_MASKFULL,
+					VOLCANIC_CR_JONES_IDLE_MASKFULL,
+					POLL_TIMEOUT_USEC);
+		if (err)
+			return err;
+
+		pvr_cr_write32(pvr_dev, VOLCANIC_CR_FWCORE_BOOT, 0);
+		pvr_cr_write64(pvr_dev, VOLCANIC_CR_SOFT_RESET,
+			       ROGUE_CR_SOFT_RESET_MASKFULL);
+		return 0;
+	}
 
 	if (PVR_FEATURE_VALUE(pvr_dev, layout_mars, &layout_mars_value) == 0)
 		layout_mars = layout_mars_value > 0;

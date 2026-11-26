@@ -182,9 +182,18 @@ void pvr_fw_trace_fini(struct pvr_device *pvr_dev)
 	for (u32 thread_nr = 0; thread_nr < ARRAY_SIZE(fw_trace->buffers); thread_nr++) {
 		struct pvr_fw_trace_buffer *trace_buffer = &fw_trace->buffers[thread_nr];
 
-		pvr_fw_object_unmap_and_destroy(trace_buffer->buf_obj);
+		if (trace_buffer->buf_obj) {
+			pvr_fw_object_unmap_and_destroy(trace_buffer->buf_obj);
+			trace_buffer->buf_obj = NULL;
+			trace_buffer->buf = NULL;
+			trace_buffer->tracebuf_space = NULL;
+		}
 	}
-	pvr_fw_object_unmap_and_destroy(fw_trace->tracebuf_ctrl_obj);
+	if (fw_trace->tracebuf_ctrl_obj) {
+		pvr_fw_object_unmap_and_destroy(fw_trace->tracebuf_ctrl_obj);
+		fw_trace->tracebuf_ctrl_obj = NULL;
+		fw_trace->tracebuf_ctrl = NULL;
+	}
 }
 
 /**
@@ -208,6 +217,9 @@ update_logtype(struct pvr_device *pvr_dev, u32 group_mask)
 	int idx;
 	int err;
 	int slot;
+
+	if (!fw_trace->tracebuf_ctrl)
+		return -ENODEV;
 
 	/* No change in group_mask => nothing to update. */
 	if (fw_trace->group_mask == group_mask)
@@ -450,10 +462,14 @@ static const struct seq_operations pvr_fw_trace_seq_ops = {
 static int fw_trace_open(struct inode *inode, struct file *file)
 {
 	struct pvr_fw_trace_buffer *trace_buffer = inode->i_private;
-	struct rogue_fwif_tracebuf_space *tracebuf_space =
-		trace_buffer->tracebuf_space;
+	struct rogue_fwif_tracebuf_space *tracebuf_space;
 	struct pvr_fw_trace_seq_data *trace_seq_data;
 	int err;
+
+	if (!trace_buffer || !trace_buffer->buf || !trace_buffer->tracebuf_space)
+		return -ENODEV;
+
+	tracebuf_space = trace_buffer->tracebuf_space;
 
 	trace_seq_data = kzalloc_obj(*trace_seq_data);
 	if (!trace_seq_data)

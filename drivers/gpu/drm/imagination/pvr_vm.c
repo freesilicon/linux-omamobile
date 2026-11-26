@@ -6,6 +6,7 @@
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_mmu.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_heap_config.h"
@@ -88,6 +89,31 @@ struct pvr_vm_context *pvr_vm_context_get(struct pvr_vm_context *vm_ctx)
 dma_addr_t pvr_vm_get_page_table_root_addr(struct pvr_vm_context *vm_ctx)
 {
 	return pvr_mmu_get_root_table_dma_addr(vm_ctx->mmu_ctx);
+}
+
+/**
+ * pvr_vm_dump_va() - Non-blocking dump of page-table entries for a faulting VA.
+ * @vm_ctx: Target VM context.
+ * @device_addr: Faulting device-virtual address.
+ * @tag: Short diagnostic tag for log context.
+ */
+void pvr_vm_dump_va(struct pvr_vm_context *vm_ctx, u64 device_addr,
+		    const char *tag)
+{
+	if (!vm_ctx || !vm_ctx->mmu_ctx)
+		return;
+
+	if (!mutex_trylock(&vm_ctx->lock)) {
+		dma_addr_t pc_pa = pvr_vm_get_page_table_root_addr(vm_ctx);
+
+		drm_err(from_pvr_device(vm_ctx->pvr_dev),
+			"Laguna MMU walk [%s]: va=%#llx pc_pa=%pad (vm lock busy)\n",
+			tag, device_addr, &pc_pa);
+		return;
+	}
+
+	pvr_mmu_dump_va(vm_ctx->mmu_ctx, device_addr, tag);
+	mutex_unlock(&vm_ctx->lock);
 }
 
 /**
@@ -519,11 +545,21 @@ static const struct drm_gpuvm_ops pvr_vm_gpuva_ops = {
 static void
 fw_mem_context_init(void *cpu_ptr, void *priv)
 {
-	struct rogue_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
 	struct pvr_vm_context *vm_ctx = priv;
+	dma_addr_t pc_dma_addr = pvr_vm_get_page_table_root_addr(vm_ctx);
 
-	fw_mem_ctx->pc_dev_paddr = pvr_vm_get_page_table_root_addr(vm_ctx);
-	fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+	if (vm_ctx->pvr_dev->laguna) {
+		struct pvr_laguna_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
+
+		fw_mem_ctx->pc_dev_paddr = pc_dma_addr;
+		fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+		fw_mem_ctx->pc_pm_dev_paddr = pc_dma_addr;
+	} else {
+		struct rogue_fwif_fwmemcontext *fw_mem_ctx = cpu_ptr;
+
+		fw_mem_ctx->pc_dev_paddr = pc_dma_addr;
+		fw_mem_ctx->page_cat_base_reg_set = ROGUE_FW_BIF_INVALID_PCSET;
+	}
 }
 
 /**
@@ -577,8 +613,12 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		goto err_free;
 
 	if (is_userspace_context) {
-		err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_fwmemcontext),
-					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+		size_t fw_mem_ctx_size = pvr_dev->laguna ?
+			sizeof(struct pvr_laguna_fwif_fwmemcontext) :
+			sizeof(struct rogue_fwif_fwmemcontext);
+
+		err = pvr_fw_object_create(pvr_dev, fw_mem_ctx_size,
+					   pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
 
 		if (err)

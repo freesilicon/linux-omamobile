@@ -10,6 +10,7 @@
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_job.h"
+#include "pvr_laguna.h"
 #include "pvr_queue.h"
 #include "pvr_trace.h"
 #include "pvr_vm.h"
@@ -79,6 +80,8 @@ static int get_ctx_state_size(struct pvr_device *pvr_dev, enum drm_pvr_job_type 
 	case DRM_PVR_JOB_TYPE_FRAGMENT:
 		return get_frag_ctx_state_size(pvr_dev);
 	case DRM_PVR_JOB_TYPE_COMPUTE:
+		if (pvr_dev->laguna)
+			return sizeof(struct pvr_laguna_fwif_computectx_state);
 		return sizeof(struct rogue_fwif_compute_ctx_state);
 	case DRM_PVR_JOB_TYPE_TRANSFER_FRAG:
 		return get_xfer_ctx_state_size(pvr_dev);
@@ -88,8 +91,26 @@ static int get_ctx_state_size(struct pvr_device *pvr_dev, enum drm_pvr_job_type 
 	return -EINVAL;
 }
 
-static u32 get_ctx_offset(enum drm_pvr_job_type type)
+static u32 get_ctx_offset(struct pvr_device *pvr_dev, enum drm_pvr_job_type type)
 {
+	if (pvr_dev->laguna) {
+		switch (type) {
+		case DRM_PVR_JOB_TYPE_GEOMETRY:
+			return offsetof(struct pvr_laguna_fwif_fwrendercontext,
+					geom_context);
+		case DRM_PVR_JOB_TYPE_FRAGMENT:
+			return offsetof(struct pvr_laguna_fwif_fwrendercontext,
+					frag_context);
+		case DRM_PVR_JOB_TYPE_COMPUTE:
+			return offsetof(struct pvr_laguna_fwif_fwcomputecontext,
+					cdm_context);
+		case DRM_PVR_JOB_TYPE_TRANSFER_FRAG:
+			return offsetof(struct pvr_laguna_fwif_fwtransfercontext,
+					tdm_context);
+		}
+		return 0;
+	}
+
 	switch (type) {
 	case DRM_PVR_JOB_TYPE_GEOMETRY:
 		return offsetof(struct rogue_fwif_fwrendercontext, geom_context);
@@ -356,33 +377,35 @@ pvr_queue_fence_ctx_init(struct pvr_queue_fence_ctx *fence_ctx)
 	atomic_set(&fence_ctx->seqno, 0);
 }
 
-static u32 ufo_cmds_size(u32 elem_count)
+static u32 ufo_cmds_size(const struct pvr_cccb *cccb, u32 elem_count)
 {
 	/* We can pass at most ROGUE_FWIF_CCB_CMD_MAX_UFOS per UFO-related command. */
 	u32 full_cmd_count = elem_count / ROGUE_FWIF_CCB_CMD_MAX_UFOS;
 	u32 remaining_elems = elem_count % ROGUE_FWIF_CCB_CMD_MAX_UFOS;
 	u32 size = full_cmd_count *
-		   pvr_cccb_get_size_of_cmd_with_hdr(ROGUE_FWIF_CCB_CMD_MAX_UFOS *
-						     sizeof(struct rogue_fwif_ufo));
+		   pvr_cccb_get_size_of_cmd_with_hdr_for(cccb,
+							 ROGUE_FWIF_CCB_CMD_MAX_UFOS *
+							 sizeof(struct rogue_fwif_ufo));
 
 	if (remaining_elems) {
-		size += pvr_cccb_get_size_of_cmd_with_hdr(remaining_elems *
-							  sizeof(struct rogue_fwif_ufo));
+		size += pvr_cccb_get_size_of_cmd_with_hdr_for(cccb,
+							      remaining_elems *
+							      sizeof(struct rogue_fwif_ufo));
 	}
 
 	return size;
 }
 
-static u32 job_cmds_size(struct pvr_job *job, u32 ufo_wait_count)
+static u32 job_cmds_size(const struct pvr_cccb *cccb, struct pvr_job *job, u32 ufo_wait_count)
 {
 	/*
 	 * One UFO command per native fence this job will be waiting on (unless any are
 	 * signaled by the time the job is submitted), plus a command for the job itself,
 	 * plus one UFO command for the fence signaling.
 	 */
-	return ufo_cmds_size(ufo_wait_count) +
-	       pvr_cccb_get_size_of_cmd_with_hdr(job->cmd_len) +
-	       ufo_cmds_size(1);
+	return ufo_cmds_size(cccb, ufo_wait_count) +
+	       pvr_cccb_get_size_of_cmd_with_hdr_for(cccb, job->cmd_len) +
+	       ufo_cmds_size(cccb, 1);
 }
 
 static bool
@@ -459,7 +482,8 @@ pvr_queue_get_job_cccb_fence(struct pvr_queue *queue, struct pvr_job *job)
 
 	/* Count remaining native dependencies and check if the job fits in the CCCB. */
 	native_deps_remaining = job_count_remaining_native_deps(job);
-	if (pvr_cccb_cmdseq_fits(&queue->cccb, job_cmds_size(job, native_deps_remaining))) {
+	if (pvr_cccb_cmdseq_fits(&queue->cccb,
+				 job_cmds_size(&queue->cccb, job, native_deps_remaining))) {
 		pvr_queue_fence_put(job->cccb_fence);
 		job->cccb_fence = NULL;
 		goto out_unlock;
@@ -891,6 +915,32 @@ pvr_queue_timedout_job(struct drm_sched_job *s_job)
 
 	drm_sched_stop(sched, s_job);
 
+	if (pvr_dev->laguna) {
+		pvr_laguna_dump_fw_state(pvr_dev, "job-timeout");
+		atomic_set(&queue->ctx->faulty, 1);
+		WRITE_ONCE(*queue->timeline_ufo.value,
+			   atomic_read(&queue->job_fence_ctx.seqno));
+
+		list_for_each_entry(job, &sched->pending_list, base.list) {
+			if (!dma_fence_is_signaled(job->done_fence)) {
+				dma_fence_set_error(job->done_fence, -ETIMEDOUT);
+				dma_fence_signal(job->done_fence);
+				pvr_job_release_pm_ref(job);
+				atomic_dec(&queue->in_flight_job_count);
+			}
+			job->base.s_fence->parent = dma_fence_get(job->done_fence);
+		}
+
+		mutex_lock(&pvr_dev->queues.lock);
+		list_move_tail(&queue->node, &pvr_dev->queues.idle);
+		mutex_unlock(&pvr_dev->queues.lock);
+
+		drm_sched_start(sched, 0);
+		if (pvr_laguna_needs_reset(pvr_dev))
+			pvr_laguna_schedule_restart(pvr_dev);
+		return DRM_GPU_SCHED_STAT_RESET;
+	}
+
 	/* Re-assign job parent fences. */
 	list_for_each_entry(job, &sched->pending_list, base.list) {
 		job->base.s_fence->parent = dma_fence_get(job->done_fence);
@@ -1029,7 +1079,8 @@ pvr_queue_check_job_waiting_for_cccb_space(struct pvr_queue *queue)
 	 * the drm_sched_entity.
 	 */
 	native_deps_remaining = job_count_remaining_native_deps(job);
-	if (!pvr_cccb_cmdseq_fits(&queue->cccb, job_cmds_size(job, native_deps_remaining))) {
+	if (!pvr_cccb_cmdseq_fits(&queue->cccb,
+				  job_cmds_size(&queue->cccb, job, native_deps_remaining))) {
 		job = NULL;
 		goto out_unlock;
 	}
@@ -1090,6 +1141,11 @@ static void init_fw_context(struct pvr_queue *queue, void *fw_ctx_map)
 	struct pvr_fw_object *fw_mem_ctx_obj = pvr_vm_get_fw_mem_context(ctx->vm_ctx);
 	struct rogue_fwif_fwcommoncontext *cctx_fw;
 	struct pvr_cccb *cccb = &queue->cccb;
+
+	if (ctx->pvr_dev->laguna) {
+		pvr_laguna_init_fw_common_context(queue, fw_ctx_map);
+		return;
+	}
 
 	cctx_fw = fw_ctx_map + queue->ctx_offset;
 	cctx_fw->ccbctl_fw_addr = cccb->ctrl_fw_addr;
@@ -1152,7 +1208,8 @@ int pvr_queue_job_init(struct pvr_job *job, u64 drm_client_id)
 	if (!queue)
 		return -EINVAL;
 
-	if (!pvr_cccb_cmdseq_can_fit(&queue->cccb, job_cmds_size(job, min_native_dep_count)))
+	if (!pvr_cccb_cmdseq_can_fit(&queue->cccb,
+				     job_cmds_size(&queue->cccb, job, min_native_dep_count)))
 		return -E2BIG;
 
 	err = drm_sched_job_init(&job->base, &queue->entity, 1, THIS_MODULE, drm_client_id);
@@ -1328,7 +1385,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
 		return ERR_PTR(-ENOMEM);
 
 	queue->type = type;
-	queue->ctx_offset = get_ctx_offset(type);
+	queue->ctx_offset = get_ctx_offset(pvr_dev, type);
 	queue->ctx = ctx;
 	queue->callstack_addr = args->callstack_addr;
 	sched = &queue->scheduler;
@@ -1342,7 +1399,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
 		goto err_free_queue;
 
 	err = pvr_fw_object_create(pvr_dev, ctx_state_size,
-				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+				   pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 				   reg_state_init, queue, &queue->reg_state_obj);
 	if (err)
 		goto err_cccb_fini;

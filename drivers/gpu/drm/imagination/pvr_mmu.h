@@ -95,6 +95,8 @@ struct pvr_mmu_context *pvr_mmu_context_create(struct pvr_device *pvr_dev);
 void pvr_mmu_context_destroy(struct pvr_mmu_context *ctx);
 
 dma_addr_t pvr_mmu_get_root_table_dma_addr(struct pvr_mmu_context *ctx);
+void pvr_mmu_dump_va(struct pvr_mmu_context *ctx, u64 device_addr,
+		     const char *tag);
 
 void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx);
 struct pvr_mmu_op_context *

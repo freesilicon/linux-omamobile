@@ -4,6 +4,7 @@
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_fw_startstop.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_queue.h"
 #include "pvr_rogue_fwif.h"
@@ -66,7 +67,7 @@ pvr_power_send_command(struct pvr_device *pvr_dev, struct rogue_fwif_kccb_cmd *p
 static int
 pvr_power_request_idle(struct pvr_device *pvr_dev)
 {
-	struct rogue_fwif_kccb_cmd pow_cmd;
+	struct rogue_fwif_kccb_cmd pow_cmd = { 0 };
 
 	/* Send FORCED_IDLE request to FW. */
 	pow_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_POW;
@@ -79,7 +80,7 @@ pvr_power_request_idle(struct pvr_device *pvr_dev)
 static int
 pvr_power_request_pwr_off(struct pvr_device *pvr_dev)
 {
-	struct rogue_fwif_kccb_cmd pow_cmd;
+	struct rogue_fwif_kccb_cmd pow_cmd = { 0 };
 
 	/* Send POW_OFF request to firmware. */
 	pow_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_POW;
@@ -97,13 +98,31 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 	if (!hard_reset) {
 		cancel_delayed_work_sync(&pvr_dev->watchdog.work);
 
-		err = pvr_power_request_idle(pvr_dev);
-		if (err)
-			return err;
+		if (pvr_dev->fw_dev.power_sync &&
+		    (!pvr_dev->laguna || pvr_laguna_kccb_ready(pvr_dev))) {
+			if (pvr_dev->laguna) {
+				err = pvr_power_request_pwr_off(pvr_dev);
+				if (err) {
+					drm_warn(from_pvr_device(pvr_dev),
+						 "Laguna FW pow-off ack timed out (%d); proceeding with STOP\n",
+						 err);
+				} else {
+					err = pvr_laguna_wait_pow_off(pvr_dev);
+					if (err)
+						drm_warn(from_pvr_device(pvr_dev),
+							 "Laguna FW did not reach POW_OFF (%d); proceeding with STOP\n",
+							 err);
+				}
+			} else {
+				err = pvr_power_request_idle(pvr_dev);
+				if (err)
+					return err;
 
-		err = pvr_power_request_pwr_off(pvr_dev);
-		if (err)
-			return err;
+				err = pvr_power_request_pwr_off(pvr_dev);
+				if (err)
+					return err;
+			}
+		}
 	}
 
 	if (rpm_suspend) {
@@ -112,7 +131,7 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
 	}
 
 	err = pvr_fw_stop(pvr_dev);
-	if (err && rpm_suspend)
+	if (err && rpm_suspend && !pvr_laguna_is_wedged(pvr_dev))
 		enable_irq(pvr_dev->irq);
 
 	return err;
@@ -130,15 +149,26 @@ pvr_power_fw_enable(struct pvr_device *pvr_dev, bool rpm_resume)
 	if (err)
 		goto out;
 
-	err = pvr_wait_for_fw_boot(pvr_dev);
-	if (err) {
-		drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
-		pvr_fw_stop(pvr_dev);
-		goto out;
+	if (pvr_dev->laguna) {
+		err = pvr_laguna_fw_wait_boot(pvr_dev);
+		if (err) {
+			drm_err(from_pvr_device(pvr_dev), "Laguna firmware failed to boot\n");
+			pvr_fw_stop(pvr_dev);
+			goto out;
+		}
+	} else if (pvr_dev->fw_dev.fwif_sysinit) {
+		err = pvr_wait_for_fw_boot(pvr_dev);
+		if (err) {
+			drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
+			pvr_fw_stop(pvr_dev);
+			goto out;
+		}
 	}
 
-	queue_delayed_work(pvr_dev->sched_wq, &pvr_dev->watchdog.work,
-			   msecs_to_jiffies(WATCHDOG_TIME_MS));
+	if (pvr_dev->fw_dev.fwif_osdata) {
+		queue_delayed_work(pvr_dev->sched_wq, &pvr_dev->watchdog.work,
+				   msecs_to_jiffies(WATCHDOG_TIME_MS));
+	}
 
 	return 0;
 
@@ -152,6 +182,12 @@ out:
 bool
 pvr_power_is_idle(struct pvr_device *pvr_dev)
 {
+	if (pvr_dev->laguna)
+		return pvr_laguna_power_is_idle(pvr_dev);
+
+	if (!pvr_dev->fw_dev.fwif_sysdata)
+		return true;
+
 	/*
 	 * FW power state can be out of date if a KCCB command has been submitted but the FW hasn't
 	 * started processing it yet. So also check the KCCB status.
@@ -189,7 +225,7 @@ pvr_watchdog_kccb_stalled(struct pvr_device *pvr_dev)
 
 		if (has_active_contexts) {
 			/* Send a HEALTH_CHECK command so we can verify FW is still alive. */
-			struct rogue_fwif_kccb_cmd health_check_cmd;
+			struct rogue_fwif_kccb_cmd health_check_cmd = { 0 };
 
 			health_check_cmd.cmd_type = ROGUE_FWIF_KCCB_CMD_HEALTH_CHECK;
 
@@ -419,7 +455,8 @@ pvr_power_device_resume(struct device *dev)
 	return 0;
 
 err_power_off:
-	pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
+	if (!pvr_laguna_is_wedged(pvr_dev))
+		pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
 
 err_drm_dev_exit:
 	drm_dev_exit(idx);
@@ -479,8 +516,14 @@ pvr_power_get_clear(struct pvr_device *pvr_dev)
 {
 	int err;
 
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev))
+		return -EIO;
+
 	err = pvr_power_get(pvr_dev);
 	if (err == 0)
+		return err;
+
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev))
 		return err;
 
 	drm_warn(from_pvr_device(pvr_dev),
@@ -514,21 +557,26 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 	bool queues_disabled = false;
 	int err;
 
+	if (pvr_laguna_is_wedged(pvr_dev))
+		return -EIO;
+
 	/*
 	 * Take a power reference during the reset. This should prevent any interference with the
 	 * power state during reset.
 	 */
-	WARN_ON(pvr_power_get_clear(pvr_dev));
+	err = pvr_power_get_clear(pvr_dev);
+	if (err)
+		return err;
 
 	down_write(&pvr_dev->reset_sem);
 
-	if (pvr_dev->lost) {
+	if (pvr_dev->lost || pvr_laguna_is_wedged(pvr_dev)) {
 		err = -EIO;
 		goto err_up_write;
 	}
 
 	/* Disable IRQs for the duration of the reset. */
-	if (hard_reset) {
+	if (hard_reset || pvr_dev->laguna) {
 		disable_irq(pvr_dev->irq);
 	} else {
 		/*
@@ -546,6 +594,8 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 		}
 
 		err = pvr_power_fw_disable(pvr_dev, hard_reset, false);
+		if (err && pvr_laguna_is_wedged(pvr_dev))
+			goto err_device_lost;
 		if (!err) {
 			if (hard_reset) {
 				WRITE_ONCE(pvr_dev->fw_dev.initialised, false);
@@ -555,8 +605,20 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 				if (err)
 					goto err_device_lost;
 
+				if (pvr_dev->laguna)
+					pvr_laguna_clear_hwr_flags(pvr_dev);
+
 				err = pvr_power_device_resume(from_pvr_device(pvr_dev)->dev);
 				WRITE_ONCE(pvr_dev->fw_dev.initialised, true);
+				if (err)
+					goto err_device_lost;
+			} else if (pvr_dev->laguna) {
+				err = pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
+				pvr_laguna_clear_hwr_flags(pvr_dev);
+				if (err)
+					goto err_device_lost;
+
+				err = pvr_dev->device_data->pwr_ops->power_on(pvr_dev);
 				if (err)
 					goto err_device_lost;
 			} else {
@@ -566,9 +628,10 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 					  ROGUE_FWIF_HWR_RESTART_REQUESTED);
 			}
 
-			pvr_fw_irq_clear(pvr_dev);
-
-			err = pvr_power_fw_enable(pvr_dev, false);
+			if (!err) {
+				pvr_fw_irq_clear(pvr_dev);
+				err = pvr_power_fw_enable(pvr_dev, false);
+			}
 		}
 
 		if (err && hard_reset)
@@ -660,13 +723,17 @@ int pvr_power_domains_init(struct pvr_device *pvr_dev)
 		goto out;
 	}
 
-	const struct dev_pm_domain_attach_data pd_attach_data = {
-		.pd_names = ROGUE_PD_NAMES,
-		.num_pd_names = domain_count,
-		.pd_flags = 0,
-	};
+	if (of_device_is_compatible(dev->of_node, "google,lga-gpu")) {
+		err = dev_pm_domain_attach_list(dev, NULL, &domains);
+	} else {
+		const struct dev_pm_domain_attach_data pd_attach_data = {
+			.pd_names = ROGUE_PD_NAMES,
+			.num_pd_names = domain_count,
+			.pd_flags = 0,
+		};
 
-	err = dev_pm_domain_attach_list(dev, &pd_attach_data, &domains);
+		err = dev_pm_domain_attach_list(dev, &pd_attach_data, &domains);
+	}
 	if (err < 0)
 		goto err_free_links;
 

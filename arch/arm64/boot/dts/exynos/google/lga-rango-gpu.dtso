@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Opt-in Stage G1 PowerVR Volcanic GPU overlay for Google Pixel 10 Pro Fold (rango).
+ *
+ * Disables Stage G0 gpu_stage0_probe (which shares rgx/gpu_control/pvtc/dts
+ * MMIO regions) and enables gpu_smmu (iommu-idmapped) and gpu0 (google,lga-gpu).
+ * Runtime firmware /lib/firmware/google/rgx.fw.signed must be provided offline.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&gpu_stage0_probe {
+	status = "disabled";
+};
+
+&gpu_smmu {
+	status = "okay";
+};
+
+&gpu0 {
+	status = "okay";
+};

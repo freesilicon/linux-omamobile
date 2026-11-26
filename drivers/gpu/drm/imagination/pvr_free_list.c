@@ -4,6 +4,7 @@
 #include "pvr_free_list.h"
 #include "pvr_gem.h"
 #include "pvr_hwrt.h"
+#include "pvr_laguna.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_vm.h"
 
@@ -169,7 +170,6 @@ calculate_free_list_ready_pages(struct pvr_free_list *free_list, u32 pages)
 static void
 free_list_fw_init(void *cpu_ptr, void *priv)
 {
-	struct rogue_fwif_freelist *fw_data = cpu_ptr;
 	struct pvr_free_list *free_list = priv;
 	u32 ready_pages;
 
@@ -177,18 +177,39 @@ free_list_fw_init(void *cpu_ptr, void *priv)
 	ready_pages = calculate_free_list_ready_pages(free_list,
 						      free_list->initial_num_pages);
 
-	fw_data->max_pages = free_list->max_pages;
-	fw_data->current_pages = free_list->initial_num_pages - ready_pages;
-	fw_data->grow_pages = free_list->grow_pages;
-	fw_data->ready_pages = ready_pages;
-	fw_data->freelist_id = free_list->fw_id;
-	fw_data->grow_pending = false;
-	fw_data->current_stack_top = fw_data->current_pages - 1;
-	fw_data->freelist_dev_addr = free_list->free_list_gpu_addr;
-	fw_data->current_dev_addr = (fw_data->freelist_dev_addr +
-				     ((fw_data->max_pages - fw_data->current_pages) *
-				      FREE_LIST_ENTRY_SIZE)) &
-				    ~((u64)ROGUE_BIF_PM_FREELIST_BASE_ADDR_ALIGNSIZE - 1);
+	if (free_list->pvr_dev->laguna) {
+		struct pvr_laguna_fwif_freelist *fw_data = cpu_ptr;
+
+		fw_data->max_pages = free_list->max_pages;
+		fw_data->current_pages = free_list->initial_num_pages - ready_pages;
+		fw_data->grow_pages = free_list->grow_pages;
+		fw_data->ready_pages = ready_pages;
+		fw_data->freelist_id = free_list->fw_id;
+		fw_data->grow_pending = 0;
+		fw_data->current_stack_top = fw_data->current_pages - 1;
+		fw_data->freelist_dev_addr = free_list->free_list_gpu_addr;
+		fw_data->current_dev_addr =
+			(fw_data->freelist_dev_addr +
+			 ((u64)(fw_data->max_pages - fw_data->current_pages) *
+			  FREE_LIST_ENTRY_SIZE)) &
+			~((u64)ROGUE_BIF_PM_FREELIST_BASE_ADDR_ALIGNSIZE - 1);
+	} else {
+		struct rogue_fwif_freelist *fw_data = cpu_ptr;
+
+		fw_data->max_pages = free_list->max_pages;
+		fw_data->current_pages = free_list->initial_num_pages - ready_pages;
+		fw_data->grow_pages = free_list->grow_pages;
+		fw_data->ready_pages = ready_pages;
+		fw_data->freelist_id = free_list->fw_id;
+		fw_data->grow_pending = false;
+		fw_data->current_stack_top = fw_data->current_pages - 1;
+		fw_data->freelist_dev_addr = free_list->free_list_gpu_addr;
+		fw_data->current_dev_addr =
+			(fw_data->freelist_dev_addr +
+			 ((fw_data->max_pages - fw_data->current_pages) *
+			  FREE_LIST_ENTRY_SIZE)) &
+			~((u64)ROGUE_BIF_PM_FREELIST_BASE_ADDR_ALIGNSIZE - 1);
+	}
 }
 
 static int
@@ -197,14 +218,18 @@ free_list_create_fw_structure(struct pvr_file *pvr_file,
 			      struct pvr_free_list *free_list)
 {
 	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
+	size_t fw_size = pvr_dev->laguna ?
+			 sizeof(struct pvr_laguna_fwif_freelist) :
+			 sizeof(*free_list->fw_data);
+	u64 fw_flags = pvr_dev->laguna ? 0 : PVR_BO_FW_FLAGS_DEVICE_UNCACHED;
 
 	/*
 	 * Create and map the FW structure so we can initialise it. This is not
 	 * accessed on the CPU side post-initialisation so the mapping lifetime
 	 * is only for this function.
 	 */
-	free_list->fw_data = pvr_fw_object_create_and_map(pvr_dev, sizeof(*free_list->fw_data),
-							  PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+	free_list->fw_data = pvr_fw_object_create_and_map(pvr_dev, fw_size,
+							  fw_flags,
 							  free_list_fw_init, free_list,
 							  &free_list->fw_obj);
 	if (IS_ERR(free_list->fw_data))
@@ -490,7 +515,14 @@ pvr_free_list_release(struct kref *ref_count)
 					       free_list->fw_obj, 0);
 	}
 
-	WARN_ON(err);
+	if (free_list->pvr_dev->laguna) {
+		if (err)
+			drm_warn(from_pvr_device(free_list->pvr_dev),
+				 "Laguna freelist %u cleanup failed (%d)\n",
+				 free_list->fw_id, err);
+	} else {
+		WARN_ON(err);
+	}
 
 	/* clang-format off */
 	list_for_each_safe(pos, n, &free_list->mem_block_list) {
@@ -582,10 +614,18 @@ pvr_free_list_reconstruct(struct pvr_device *pvr_dev, u32 freelist_id)
 	 */
 	free_list->current_pages -= free_list->ready_pages;
 
-	fw_data = free_list->fw_data;
-	fw_data->current_stack_top = fw_data->current_pages - 1;
-	fw_data->allocated_page_count = 0;
-	fw_data->allocated_mmu_page_count = 0;
+	if (pvr_dev->laguna) {
+		struct pvr_laguna_fwif_freelist *lfw = (void *)free_list->fw_data;
+
+		lfw->current_stack_top = lfw->current_pages - 1;
+		lfw->allocated_page_count = 0;
+		lfw->allocated_mmu_page_count = 0;
+	} else {
+		fw_data = free_list->fw_data;
+		fw_data->current_stack_top = fw_data->current_pages - 1;
+		fw_data->allocated_page_count = 0;
+		fw_data->allocated_mmu_page_count = 0;
+	}
 
 	/* Reset the state of any associated HWRTs. */
 	list_for_each_entry(hwrt_data, &free_list->hwrt_list, freelist_node) {

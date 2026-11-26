@@ -7,13 +7,16 @@
 #include "pvr_device.h"
 #include "pvr_fw.h"
 #include "pvr_gem.h"
+#include "pvr_laguna.h"
 #include "pvr_power.h"
 #include "pvr_rogue_fwif.h"
 #include "pvr_rogue_mmu_defs.h"
+#include "pvr_volcanic_defs.h"
 
 #include <drm/drm_drv.h>
 #include <drm/drm_print.h>
 #include <linux/atomic.h>
+#include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/kmemleak.h>
@@ -137,6 +140,11 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
 	/* Can't flush MMU if the firmware hasn't been initialised yet. */
 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
 		goto err_drm_dev_exit;
+
+	if (pvr_dev->laguna && !pvr_laguna_fw_ready(pvr_dev)) {
+		atomic_set(&pvr_dev->mmu_flush_cache_flags, 0);
+		goto err_drm_dev_exit;
+	}
 
 	cmd_mmu_cache_data->cache_flags =
 		atomic_xchg(&pvr_dev->mmu_flush_cache_flags, 0);
@@ -752,6 +760,7 @@ pvr_page_table_l0_entry_raw_clear(struct pvr_page_table_l0_entry_raw *entry)
 /**
  * pvr_page_flags_raw_create() - Initialize the flag bits of a raw level 0 page
  *                               table entry.
+ * @pvr_dev: Target PowerVR device.
  * @read_only: This page is read-only (see: Read Only).
  * @cache_coherent: This page does not require cache flushes (see: Cache
  *                  Coherency).
@@ -767,16 +776,38 @@ pvr_page_table_l0_entry_raw_clear(struct pvr_page_table_l0_entry_raw *entry)
  * pvr_page_table_l0_entry_raw_set() or pvr_page_table_l0_insert().
  */
 static struct pvr_page_flags_raw
-pvr_page_flags_raw_create(bool read_only, bool cache_coherent, bool slc_bypass,
+pvr_page_flags_raw_create(struct pvr_device *pvr_dev, bool read_only,
+			  bool cache_coherent, bool slc_bypass,
 			  bool pm_fw_protect)
 {
 	struct pvr_page_flags_raw flags;
 
-	flags.val.val =
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, SLC_BYPASS_CTRL, slc_bypass) |
-		PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect);
+	static_assert((VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK &
+		       ROGUE_MMUCTRL_PT_DATA_PM_META_PROTECT_EN) == 0);
+	static_assert((VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK &
+		       ~ROGUE_MMUCTRL_PAGE_4KB_RANGE_CLRMSK) == 0);
+
+	if (PVR_HAS_FEATURE(pvr_dev, mmu_version) &&
+	    pvr_dev->features.mmu_version >= 4) {
+		u64 axcache = slc_bypass ? VOLCANIC_MMUCTRL_AXCACHE_UNCACHED :
+					   VOLCANIC_MMUCTRL_AXCACHE_CACHED;
+
+		/*
+		 * MMUv4 replaces Rogue's bit 3 SLC_BYPASS_CTRL with the 4-bit
+		 * AXI4 AxCACHE attribute field in PT_DATA[61:58].
+		 */
+		flags.val.val =
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect) |
+			FIELD_PREP(VOLCANIC_MMUCTRL_PT_DATA_AXCACHE_MASK, axcache);
+	} else {
+		flags.val.val =
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, READ_ONLY, read_only) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, CC, cache_coherent) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, SLC_BYPASS_CTRL, slc_bypass) |
+			PVR_PAGE_TABLE_FIELD_PREP(0, PT, PM_META_PROTECT, pm_fw_protect);
+	}
 
 	return flags;
 }
@@ -1865,6 +1896,54 @@ dma_addr_t pvr_mmu_get_root_table_dma_addr(struct pvr_mmu_context *ctx)
 }
 
 /**
+ * pvr_mmu_dump_va() - Log raw L2/L1/L0 page-table entries for a device VA.
+ * @ctx: Target MMU context.
+ * @device_addr: Faulting device-virtual address.
+ * @tag: Short diagnostic tag for log context.
+ */
+void pvr_mmu_dump_va(struct pvr_mmu_context *ctx, u64 device_addr,
+		     const char *tag)
+{
+	struct drm_device *drm_dev = from_pvr_device(ctx->pvr_dev);
+	struct pvr_page_table_l2 *l2 = &ctx->page_table_l2;
+	struct pvr_page_table_l1 *l1 = NULL;
+	struct pvr_page_table_l0 *l0 = NULL;
+	u16 l2_idx, l1_idx, l0_idx;
+	u32 pc_val;
+	u64 pd_val = 0, pt_val = 0;
+	dma_addr_t pc_pa = l2->backing_page.dma_addr;
+	dma_addr_t pd_pa = 0, pt_pa = 0;
+
+	if (device_addr >= PVR_PAGE_TABLE_ADDR_SPACE_SIZE) {
+		drm_err(drm_dev,
+			"Laguna MMU walk [%s]: va=%#llx out of range (pc_pa=%pad)\n",
+			tag, device_addr, &pc_pa);
+		return;
+	}
+
+	l2_idx = pvr_page_table_l2_idx(device_addr);
+	l1_idx = pvr_page_table_l1_idx(device_addr);
+	l0_idx = pvr_page_table_l0_idx(device_addr);
+
+	pc_val = READ_ONCE(pvr_page_table_l2_get_entry_raw(l2, l2_idx)->val);
+	l1 = l2->entries[l2_idx];
+	if (l1) {
+		pd_pa = l1->backing_page.dma_addr;
+		pd_val = READ_ONCE(pvr_page_table_l1_get_entry_raw(l1, l1_idx)->val);
+		l0 = l1->entries[l1_idx];
+		if (l0) {
+			pt_pa = l0->backing_page.dma_addr;
+			pt_val = READ_ONCE(pvr_page_table_l0_get_entry_raw(l0, l0_idx)->val);
+		}
+	}
+
+	drm_err(drm_dev,
+		"Laguna MMU walk [%s]: va=%#llx pc_pa=%pad pc[%u]=%#x pd_pa=%pad pd[%u]=%#llx pt_pa=%pad pt[%u]=%#llx\n",
+		tag, device_addr, &pc_pa, l2_idx, pc_val, &pd_pa, l1_idx,
+		pd_val, &pt_pa, l0_idx, pt_val);
+}
+
+/**
  * pvr_page_table_l1_alloc() - Allocate a l1 page_table object.
  * @ctx: MMU context of owning VM context.
  *
@@ -2599,7 +2678,8 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 
 	memcpy(&ptr_copy, &op_ctx->curr_page, sizeof(ptr_copy));
 
-	flags_raw = pvr_page_flags_raw_create(false, false,
+	flags_raw = pvr_page_flags_raw_create(op_ctx->mmu_ctx->pvr_dev,
+					      false, false,
 					      flags & DRM_PVR_BO_BYPASS_DEVICE_CACHE,
 					      flags & DRM_PVR_BO_PM_FW_PROTECT);
 

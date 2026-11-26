@@ -8,6 +8,7 @@ config DRM_POWERVR
 	depends on MMU
 	depends on PM
 	depends on POWER_SEQUENCING || !POWER_SEQUENCING
+	depends on TRUSTY_VIRTIO_IPC || !TRUSTY_VIRTIO_IPC
 	select DRM_EXEC
 	select DRM_GEM_SHMEM_HELPER
 	select DRM_SCHED

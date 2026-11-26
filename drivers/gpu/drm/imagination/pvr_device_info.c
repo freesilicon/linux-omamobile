@@ -4,6 +4,7 @@
 #include "pvr_device.h"
 #include "pvr_device_info.h"
 #include "pvr_rogue_fwif_dev_info.h"
+#include "pvr_volcanic_defs.h"
 
 #include <drm/drm_print.h>
 
@@ -26,8 +27,12 @@ static const uintptr_t quirks_mapping[] = {
 	QUIRK_MAPPING(62269),
 	QUIRK_MAPPING(63142),
 	QUIRK_MAPPING(63553),
+	QUIRK_MAPPING(65104),
 	QUIRK_MAPPING(66011),
+	QUIRK_MAPPING(69700),
 	QUIRK_MAPPING(71242),
+	QUIRK_MAPPING(74812),
+	QUIRK_MAPPING(77899),
 };
 
 #undef QUIRK_MAPPING
@@ -252,4 +257,111 @@ int pvr_device_info_set_features(struct pvr_device *pvr_dev, const u64 *features
 	}
 
 	return 0;
+}
+
+struct pvr_volcanic_bvnc_entry {
+	u64 packed_bvnc;
+	struct pvr_device_features features;
+	struct pvr_device_quirks quirks;
+};
+
+static const struct pvr_volcanic_bvnc_entry pvr_volcanic_bvnc_table[] = {
+	{
+		/* Tensor G5 (Laguna) PowerVR Volcanic DXT-48-1536 (71.2.2448.1212) */
+		.packed_bvnc = PVR_VOLCANIC_DXT_48_1536_BVNC,
+		.features = {
+			.is_volcanic = true,
+			.has_cdm_control_stream_format = true,
+			.has_common_store_size_in_dwords = true,
+			.has_compute = true,
+			.has_compute_overlap = true,
+			.has_coreid_per_os = true,
+			.has_fbcdc = true,
+			.has_fbcdc_algorithm = true,
+			.has_fbcdc_architecture = true,
+			.has_fbc_max_default_descriptors = true,
+			.has_fbc_max_large_descriptors = true,
+			.has_gpu_virtualisation = true,
+			.has_host_security_version = true,
+			.has_irq_per_os = true,
+			.has_isp_max_tiles_in_flight = true,
+			.has_max_partitions = true,
+			.has_mmu_version = true,
+			.has_num_clusters = true,
+			.has_num_isp_ipp_pipes = true,
+			.has_num_osids = true,
+			.has_num_raster_pipes = true,
+			.has_num_spus = true,
+			.has_pbvnc_coreid_reg = true,
+			.has_phys_bus_width = true,
+			.has_ray_tracing_arch = true,
+			.has_riscv_fw_processor = true,
+			.has_s7_top_infrastructure = true,
+			.has_slc_banks = true,
+			.has_slc_cache_line_size_bits = true,
+			.has_slc_size_in_kilobytes = true,
+			.has_slc_vivt = true,
+			.has_sys_bus_secure_reset = true,
+			.has_tdm_control_stream_format = true,
+			.has_tile_size_x = true,
+			.has_tile_size_y = true,
+			.has_vdm_object_level_lls = true,
+			.has_virtual_address_space_bits = true,
+
+			.cdm_control_stream_format = 5,
+			.common_store_size_in_dwords = 2560U * 4U * 4U,
+			.fbc_max_default_descriptors = 2048,
+			.fbc_max_large_descriptors = 32,
+			.fbcdc = 5,
+			.fbcdc_algorithm = 5,
+			.fbcdc_architecture = 6,
+			.host_security_version = 4,
+			.isp_max_tiles_in_flight = 24,
+			.max_partitions = 16,
+			.mmu_version = 4,
+			.num_clusters = 6,
+			.num_isp_ipp_pipes = 24,
+			.num_osids = 8,
+			.num_raster_pipes = 2,
+			.num_spus = 2,
+			.phys_bus_width = 40,
+			.ray_tracing_arch = 3,
+			.slc_banks = 6,
+			.slc_cache_line_size_bits = 1024,
+			.slc_size_in_kilobytes = 1536,
+			.tdm_control_stream_format = 3,
+			.tile_size_x = 32,
+			.tile_size_y = 32,
+			.virtual_address_space_bits = 40,
+		},
+		.quirks = {
+			.has_brn65104 = true,
+			.has_brn69700 = true,
+			.has_brn74812 = true,
+			.has_brn77899 = true,
+		},
+	},
+};
+
+/**
+ * pvr_device_info_init_volcanic() - Populate built-in Volcanic BVNC features and BRNs
+ * @pvr_dev: Target PowerVR device with &pvr_device.gpu_id already decoded.
+ *
+ * Returns:
+ *  * 0 if &pvr_device.gpu_id matched a known Volcanic BVNC entry, or
+ *  * -%ENODEV if no Volcanic entry exists for &pvr_device.gpu_id.
+ */
+int pvr_device_info_init_volcanic(struct pvr_device *pvr_dev)
+{
+	u64 packed_bvnc = pvr_gpu_id_to_packed_bvnc(&pvr_dev->gpu_id);
+
+	for (size_t i = 0; i < ARRAY_SIZE(pvr_volcanic_bvnc_table); i++) {
+		if (pvr_volcanic_bvnc_table[i].packed_bvnc == packed_bvnc) {
+			pvr_dev->features = pvr_volcanic_bvnc_table[i].features;
+			pvr_dev->quirks = pvr_volcanic_bvnc_table[i].quirks;
+			return 0;
+		}
+	}
+
+	return -ENODEV;
 }
