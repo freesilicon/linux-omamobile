@@ -58,6 +58,7 @@ struct hci_lga_aoc {
 
 	struct task_struct *rx_task;
 	struct mutex tx_lock; /* serializes TX frames on the AoC channel */
+	struct mutex rx_lock; /* protects rx_skb reassembly against flush() */
 	struct sk_buff *rx_skb;
 	size_t rx_hdr_len;
 	size_t rx_expect_len;
@@ -65,6 +66,7 @@ struct hci_lga_aoc {
 	struct gpio_desc *bt_shutdown_gpio;
 	struct gpio_desc *bt_ble_dbo_gpio;
 
+	bool use_aocc_framing;
 	u32 channel_id;
 	size_t max_msg_len;
 	size_t max_payload;
@@ -76,7 +78,7 @@ module_param(service_name, charp, 0444);
 MODULE_PARM_DESC(service_name, "AoC IPC service name (default: com.google.bt)");
 
 static bool aocc_framing = true;
-module_param(aocc_framing, bool, 0644);
+module_param(aocc_framing, bool, 0444);
 MODULE_PARM_DESC(aocc_framing,
 		 "Use 4-byte AoC channel mux header and open/close control messages");
 
@@ -127,7 +129,7 @@ static int hci_lga_aoc_send_chunk(struct hci_lga_aoc *bt, const u8 *data,
 		return -EMSGSIZE;
 
 	mutex_lock(&bt->tx_lock);
-	if (aocc_framing) {
+	if (bt->use_aocc_framing) {
 		__le32 hdr = cpu_to_le32(bt->channel_id & LGA_AOCC_CHAN_MASK);
 
 		memcpy(bt->tx_buf, &hdr, LGA_AOCC_HDR_SIZE);
@@ -146,12 +148,19 @@ static int hci_lga_aoc_send_chunk(struct hci_lga_aoc *bt, const u8 *data,
 	return ret < 0 ? (int)ret : 0;
 }
 
-static void hci_lga_aoc_rx_reset(struct hci_lga_aoc *bt)
+static void hci_lga_aoc_rx_reset_locked(struct hci_lga_aoc *bt)
 {
 	kfree_skb(bt->rx_skb);
 	bt->rx_skb = NULL;
 	bt->rx_hdr_len = 0;
 	bt->rx_expect_len = 0;
+}
+
+static void hci_lga_aoc_rx_reset(struct hci_lga_aoc *bt)
+{
+	mutex_lock(&bt->rx_lock);
+	hci_lga_aoc_rx_reset_locked(bt);
+	mutex_unlock(&bt->rx_lock);
 }
 
 static size_t hci_lga_aoc_pkt_hdr_len(u8 pkt_type)
@@ -194,8 +203,10 @@ static void hci_lga_aoc_rx_bytes(struct hci_lga_aoc *bt, const u8 *data,
 	hdev->stat.byte_rx += count;
 
 	while (count > 0) {
+		struct sk_buff *ready_skb = NULL;
 		size_t need, take;
 
+		mutex_lock(&bt->rx_lock);
 		if (!bt->rx_skb) {
 			u8 pkt_type = *data++;
 			size_t hdr_len = hci_lga_aoc_pkt_hdr_len(pkt_type);
@@ -206,6 +217,7 @@ static void hci_lga_aoc_rx_bytes(struct hci_lga_aoc *bt, const u8 *data,
 							"unknown H4 packet type %#02x",
 							pkt_type);
 				hdev->stat.err_rx++;
+				mutex_unlock(&bt->rx_lock);
 				continue;
 			}
 
@@ -213,6 +225,7 @@ static void hci_lga_aoc_rx_bytes(struct hci_lga_aoc *bt, const u8 *data,
 						  GFP_KERNEL);
 			if (!bt->rx_skb) {
 				hdev->stat.err_rx++;
+				mutex_unlock(&bt->rx_lock);
 				return;
 			}
 
@@ -227,7 +240,8 @@ static void hci_lga_aoc_rx_bytes(struct hci_lga_aoc *bt, const u8 *data,
 			bt_dev_err(hdev, "oversized H4 frame (%zu bytes)",
 				   bt->rx_skb->len + take);
 			hdev->stat.err_rx++;
-			hci_lga_aoc_rx_reset(bt);
+			hci_lga_aoc_rx_reset_locked(bt);
+			mutex_unlock(&bt->rx_lock);
 			return;
 		}
 
@@ -248,19 +262,22 @@ static void hci_lga_aoc_rx_bytes(struct hci_lga_aoc *bt, const u8 *data,
 				bt_dev_err(hdev, "invalid H4 payload length %zu",
 					   plen);
 				hdev->stat.err_rx++;
-				hci_lga_aoc_rx_reset(bt);
+				hci_lga_aoc_rx_reset_locked(bt);
+				mutex_unlock(&bt->rx_lock);
 				continue;
 			}
 		}
 
 		if (bt->rx_skb->len == bt->rx_expect_len) {
-			struct sk_buff *skb = bt->rx_skb;
-
+			ready_skb = bt->rx_skb;
 			bt->rx_skb = NULL;
 			bt->rx_hdr_len = 0;
 			bt->rx_expect_len = 0;
-			hci_recv_frame(hdev, skb);
 		}
+		mutex_unlock(&bt->rx_lock);
+
+		if (ready_skb)
+			hci_recv_frame(hdev, ready_skb);
 	}
 }
 
@@ -298,7 +315,7 @@ static int hci_lga_aoc_rx_thread(void *arg)
 			continue;
 		}
 
-		if (aocc_framing) {
+		if (bt->use_aocc_framing) {
 			u32 hdr, rx_chan;
 
 			if ((size_t)n < LGA_AOCC_HDR_SIZE) {
@@ -340,6 +357,18 @@ static int hci_lga_aoc_rx_thread(void *arg)
 	return 0;
 }
 
+static void hci_lga_aoc_latch_ble_dbo(struct hci_lga_aoc *bt)
+{
+	if (!bt->bt_ble_dbo_gpio)
+		return;
+
+	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 0);
+	usleep_range(1000, 2000);
+	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 1);
+	usleep_range(1000, 2000);
+	gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 0);
+}
+
 static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 {
 	struct gpio_desc *gp;
@@ -365,13 +394,12 @@ static void hci_lga_aoc_power_on(struct hci_lga_aoc *bt)
 		bt->bt_shutdown_gpio = gp;
 	}
 
-	if (bt->bt_ble_dbo_gpio)
-		gpiod_set_value_cansleep(bt->bt_ble_dbo_gpio, 1);
-
 	if (bt->bt_shutdown_gpio) {
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 0);
+		hci_lga_aoc_latch_ble_dbo(bt);
 		msleep(50);
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 1);
+		hci_lga_aoc_latch_ble_dbo(bt);
 		msleep(100);
 	}
 }
@@ -380,6 +408,7 @@ static void hci_lga_aoc_power_off(struct hci_lga_aoc *bt)
 {
 	if (bt->bt_shutdown_gpio) {
 		gpiod_set_value_cansleep(bt->bt_shutdown_gpio, 0);
+		hci_lga_aoc_latch_ble_dbo(bt);
 		gpiod_put(bt->bt_shutdown_gpio);
 		bt->bt_shutdown_gpio = NULL;
 	}
@@ -416,7 +445,7 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 		return ret;
 	}
 
-	if (aocc_framing) {
+	if (bt->use_aocc_framing) {
 		ret = hci_lga_aoc_send_ctrl(bt, LGA_AOCC_CMD_OPEN_CHANNEL,
 					    bt->channel_id);
 		if (ret) {
@@ -431,7 +460,8 @@ static int hci_lga_aoc_open(struct hci_dev *hdev)
 	}
 
 	bt_dev_info(hdev, "opened AoC service '%s' (idx=%u chan=%u framing=%u)",
-		    bt->svc.name, bt->svc.index, bt->channel_id, aocc_framing);
+		    bt->svc.name, bt->svc.index, bt->channel_id,
+		    bt->use_aocc_framing);
 	return 0;
 }
 
@@ -439,7 +469,8 @@ static int hci_lga_aoc_close(struct hci_dev *hdev)
 {
 	struct hci_lga_aoc *bt = hci_get_drvdata(hdev);
 
-	if (aocc_framing && bt->channel_id && lga_aoc_is_online(bt->aoc_dev))
+	if (bt->use_aocc_framing && bt->channel_id &&
+	    lga_aoc_is_online(bt->aoc_dev))
 		hci_lga_aoc_send_ctrl(bt, LGA_AOCC_CMD_CLOSE_CHANNEL,
 				      bt->channel_id);
 
@@ -543,6 +574,7 @@ static int hci_lga_aoc_attach_locked(void)
 	struct lga_aoc_service_info svc;
 	struct hci_lga_aoc *bt;
 	struct hci_dev *hdev;
+	bool use_framing = aocc_framing;
 	size_t max_msg, hdr_overhead;
 	int ret;
 
@@ -577,7 +609,7 @@ static int hci_lga_aoc_attach_locked(void)
 			max_msg = min(max_msg, up_msg);
 	}
 
-	hdr_overhead = aocc_framing ? LGA_AOCC_HDR_SIZE : 0;
+	hdr_overhead = use_framing ? LGA_AOCC_HDR_SIZE : 0;
 	if (max_msg <= hdr_overhead + 1U) {
 		dev_err(aoc_dev, "AoC service '%s' message size %zu too small\n",
 			svc.name, max_msg);
@@ -607,9 +639,11 @@ static int hci_lga_aoc_attach_locked(void)
 	}
 
 	mutex_init(&bt->tx_lock);
+	mutex_init(&bt->rx_lock);
 	bt->aoc_dev = aoc_dev;
 	bt->hdev = hdev;
 	bt->svc = svc;
+	bt->use_aocc_framing = use_framing;
 	bt->max_msg_len = max_msg;
 	bt->max_payload = max_msg - hdr_overhead;
 

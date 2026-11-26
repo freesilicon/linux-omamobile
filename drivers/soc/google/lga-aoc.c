@@ -1111,7 +1111,8 @@ static bool lga_aoc_can_read_locked(struct lga_aoc *aoc, u32 service_idx)
 	return tx != rx;
 }
 
-static bool lga_aoc_can_write_locked(struct lga_aoc *aoc, u32 service_idx)
+static bool lga_aoc_can_write_locked(struct lga_aoc *aoc, u32 service_idx,
+				     size_t min_bytes)
 {
 	struct lga_aoc_ipc_service_hdr *hdr;
 	struct lga_aoc_ipc_region *reg;
@@ -1131,12 +1132,31 @@ static bool lga_aoc_can_write_locked(struct lga_aoc *aoc, u32 service_idx)
 	if (!slots || !size)
 		return false;
 
-	if (type == LGA_AOC_SVC_RING)
-		return true;
-
 	tx = le32_to_cpu(READ_ONCE(reg->tx));
 	rx = le32_to_cpu(READ_ONCE(reg->rx));
+
+	if (type == LGA_AOC_SVC_RING) {
+		size_t avail = size - min_t(size_t, (u32)(tx - rx), size);
+
+		return avail >= min_bytes;
+	}
+
 	return (u32)(tx - rx) < slots;
+}
+
+static bool lga_aoc_ipc_can_write_len(struct device *dev, u32 service_idx,
+				      size_t min_bytes)
+{
+	struct lga_aoc *aoc = dev_get_drvdata(dev);
+	bool ready;
+
+	if (!aoc)
+		return false;
+
+	mutex_lock(&aoc->lock);
+	ready = lga_aoc_can_write_locked(aoc, service_idx, min_bytes);
+	mutex_unlock(&aoc->lock);
+	return ready;
 }
 
 bool lga_aoc_ipc_can_read(struct device *dev, u32 service_idx)
@@ -1156,16 +1176,7 @@ EXPORT_SYMBOL_GPL(lga_aoc_ipc_can_read);
 
 bool lga_aoc_ipc_can_write(struct device *dev, u32 service_idx)
 {
-	struct lga_aoc *aoc = dev_get_drvdata(dev);
-	bool ready;
-
-	if (!aoc)
-		return false;
-
-	mutex_lock(&aoc->lock);
-	ready = lga_aoc_can_write_locked(aoc, service_idx);
-	mutex_unlock(&aoc->lock);
-	return ready;
+	return lga_aoc_ipc_can_write_len(dev, service_idx, 1U);
 }
 EXPORT_SYMBOL_GPL(lga_aoc_ipc_can_write);
 
@@ -1232,6 +1243,10 @@ ssize_t lga_aoc_ipc_write(struct device *dev, u32 service_idx,
 		size_t avail = size - min_t(size_t, (u32)(tx - rx), size);
 		size_t first;
 
+		if (len > size) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
 		if (len > avail) {
 			ret = -ENOSPC;
 			goto out;
@@ -1287,8 +1302,9 @@ ssize_t lga_aoc_ipc_write_timeout(struct device *dev, u32 service_idx,
 
 		wret = wait_event_interruptible_timeout(aoc->ipc_wq,
 							!lga_aoc_is_online(dev) ||
-							lga_aoc_ipc_can_write(dev,
-									      service_idx),
+							lga_aoc_ipc_can_write_len(dev,
+										  service_idx,
+										  len),
 							rem);
 		if (wret < 0)
 			return wret;
