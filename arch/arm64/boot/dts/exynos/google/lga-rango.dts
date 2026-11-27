@@ -196,9 +196,6 @@
 		reset-gpios = <&da9188_gpio 0x12 GPIO_ACTIVE_LOW>;
 		interrupt-parent = <&pinctrl_aoc>;
 		interrupts = <0x42 IRQ_TYPE_LEVEL_LOW>;
-		touchscreen-size-x = <2076>;
-		touchscreen-size-y = <2152>;
-		touchscreen-inverted-x;
 	};
 };
 
