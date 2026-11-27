@@ -442,7 +442,7 @@ static int fst2_read_sysinfo(struct fst2_ts *ts)
 	return 0;
 }
 
-static void fst2_process_event(struct fst2_ts *ts, const u8 *evt)
+static bool fst2_process_event(struct fst2_ts *ts, const u8 *evt)
 {
 	u8 type = evt[0];
 	unsigned int tid = evt[1] >> 4;
@@ -452,11 +452,11 @@ static void fst2_process_event(struct fst2_ts *ts, const u8 *evt)
 	switch (type) {
 	case FST2_EVT_NOEVENT:
 	case FST2_EVT_TOUCH_HEADER:
-		return;
+		return false;
 	case FST2_EVT_ENTER_POINT:
 	case FST2_EVT_MOTION_POINT:
 		if (tid >= FST2_MAX_SLOTS)
-			return;
+			return false;
 		if (ts->evt_size == FST2_FIFO_16B_SIZE) {
 			x = get_unaligned_le16(&evt[2]);
 			y = get_unaligned_le16(&evt[4]);
@@ -481,16 +481,16 @@ static void fst2_process_event(struct fst2_ts *ts, const u8 *evt)
 		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR, major);
 		input_report_abs(ts->input, ABS_MT_TOUCH_MINOR, minor);
 		input_report_abs(ts->input, ABS_MT_PRESSURE, z);
-		return;
+		return true;
 	case FST2_EVT_LEAVE_POINT:
 		if (tid >= FST2_MAX_SLOTS)
-			return;
+			return false;
 		input_mt_slot(ts->input, tid);
 		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, false);
-		return;
+		return true;
 	default:
 		dev_dbg(&ts->spi->dev, "unhandled event 0x%02x\n", type);
-		return;
+		return false;
 	}
 }
 
@@ -520,8 +520,7 @@ static int fst2_drain_events(struct fst2_ts *ts)
 
 			if (evt[0] == FST2_EVT_NOEVENT)
 				break;
-			fst2_process_event(ts, evt);
-			synced = true;
+			synced |= fst2_process_event(ts, evt);
 		}
 	} else {
 		for (i = 0; i < FST2_FIFO_MAX_EVENTS; i++) {
@@ -531,8 +530,7 @@ static int fst2_drain_events(struct fst2_ts *ts)
 				return ret;
 			if (buf[0] == FST2_EVT_NOEVENT)
 				break;
-			fst2_process_event(ts, buf);
-			synced = true;
+			synced |= fst2_process_event(ts, buf);
 		}
 	}
 
@@ -580,10 +578,13 @@ static int fst2_register_input(struct fst2_ts *ts)
 	u32 pressure_max;
 	int ret;
 
-	if (device_property_read_u32(dev, "touchscreen-size-x", &ts->size_x))
+	if (ts->scr_x >= 2 && ts->scr_y >= 2) {
 		ts->size_x = ts->scr_x;
-	if (device_property_read_u32(dev, "touchscreen-size-y", &ts->size_y))
 		ts->size_y = ts->scr_y;
+	} else {
+		device_property_read_u32(dev, "touchscreen-size-x", &ts->size_x);
+		device_property_read_u32(dev, "touchscreen-size-y", &ts->size_y);
+	}
 
 	if (ts->size_x < 2 || ts->size_y < 2)
 		return dev_err_probe(dev, -EINVAL,
@@ -604,9 +605,19 @@ static int fst2_register_input(struct fst2_ts *ts)
 	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
 	input_set_abs_params(input, ABS_MT_PRESSURE, 0, pressure_max, 0, 0);
 	touchscreen_parse_properties(input, true, &ts->prop);
+	if (ts->scr_x >= 2 && ts->scr_y >= 2) {
+		unsigned int x_max = ts->scr_x - 1;
+		unsigned int y_max = ts->scr_y - 1;
 
-	ret = input_mt_init_slots(input, FST2_MAX_SLOTS,
-				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+		ts->prop.max_x = x_max;
+		ts->prop.max_y = y_max;
+		if (ts->prop.swap_x_y)
+			swap(x_max, y_max);
+		input_abs_set_max(input, ABS_MT_POSITION_X, x_max);
+		input_abs_set_max(input, ABS_MT_POSITION_Y, y_max);
+	}
+
+	ret = input_mt_init_slots(input, FST2_MAX_SLOTS, INPUT_MT_DIRECT);
 	if (ret)
 		return ret;
 
@@ -678,9 +689,10 @@ static int fst2_probe(struct spi_device *spi)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to enable active scan\n");
 
-	dev_info(dev, "FST2 chip %02x%02x rev 0x%02x API %u.%u (%ux%u, %uB evt)\n",
+	dev_info(dev,
+		 "FST2 chip %02x%02x rev 0x%02x API %u.%u (scr=%ux%u, %ux%u, %uB evt)\n",
 		 id[0], id[1], ts->chip_rev, ts->api_major, ts->api_minor,
-		 ts->size_x, ts->size_y, ts->evt_size);
+		 ts->scr_x, ts->scr_y, ts->size_x, ts->size_y, ts->evt_size);
 
 	if (spi->irq > 0) {
 		ret = devm_request_threaded_irq(dev, spi->irq, NULL,
