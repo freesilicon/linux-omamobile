@@ -63,6 +63,10 @@ static int lga_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 	int ret, status;
 
 	ret = cpm_send_message(sensor->tmu->client, &req);
+	if (ret == -ENODATA) {
+		*temp = THERMAL_TEMP_INVALID;
+		return 0;
+	}
 	if (ret)
 		return ret;
 
