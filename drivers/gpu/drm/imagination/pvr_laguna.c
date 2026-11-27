@@ -40,6 +40,7 @@
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -58,6 +59,11 @@
 
 /* Core-logic power-on/off CSRs (verified in Stage G0 probe on mustang/rango). */
 #define PVR_LAGUNA_GPU_CTRL_POWER_OFF_ACK	BIT(0)
+
+static unsigned int laguna_cdm_tasks_stride = 2048U;
+module_param_named(cdm_tasks_stride, laguna_cdm_tasks_stride, uint, 0644);
+MODULE_PARM_DESC(cdm_tasks_stride,
+		 "Volcanic CDM per-workgroup local/common-store task stride in bytes (default 2048; 0 disables)");
 #define PVR_LAGUNA_GPU_CTRL_POWER_GATE_ACK	BIT(1)
 #define PVR_LAGUNA_GPU_CTRL_ACK_MASK		(PVR_LAGUNA_GPU_CTRL_POWER_OFF_ACK | \
 						 PVR_LAGUNA_GPU_CTRL_POWER_GATE_ACK)
@@ -2010,6 +2016,7 @@ int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
 	struct pvr_laguna_data *laguna = job->pvr_dev->laguna;
 	const struct rogue_fwif_cmd_compute *src = job->cmd;
 	struct pvr_laguna_fwif_cmd_cdm *dst;
+	u32 local_mem_bytes;
 
 	if (!laguna || !src || job->cmd_len < sizeof(*src))
 		return -EINVAL;
@@ -2052,7 +2059,17 @@ int pvr_laguna_translate_cmd_compute(struct pvr_job *job)
 	 */
 	dst->flags |= PVR_LAGUNA_CDM_FLAG_DIRECT_STREAM;
 
-	dst->max_num_temp_regions = src->num_temp_regions;
+	local_mem_bytes = READ_ONCE(laguna_cdm_tasks_stride);
+	if (local_mem_bytes > 0) {
+		u32 max_wgs = local_mem_bytes >= 16384U ? 1U :
+			      min_t(u32, 61U, 16384U / local_mem_bytes);
+
+		dst->usc_tasks_stride = local_mem_bytes;
+		dst->max_num_temp_regions = max_wgs;
+	} else {
+		dst->usc_tasks_stride = 0;
+		dst->max_num_temp_regions = src->num_temp_regions;
+	}
 
 	WRITE_ONCE(laguna->last_cdm_cs_base, dst->regs.cdm_ctrl_stream_base);
 	WRITE_ONCE(laguna->last_cdm_ctx_state_base,
